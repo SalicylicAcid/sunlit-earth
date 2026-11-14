@@ -125,6 +125,9 @@ pub fn resolve(
             effective.eumetsat,
             cache_dir.map(std::path::Path::to_path_buf),
         )),
+        CloudSourceMode::Gibs => Arc::new(super::gibs::GibsCloudSource::new(
+            cache_dir.map(std::path::Path::to_path_buf),
+        )),
     }
 }
 
@@ -177,6 +180,20 @@ impl CloudTarget {
         Self {
             cache_key: key,
             wait: CloudWait::LongFetch,
+        }
+    }
+
+    /// Identity of a native GIBS round: the layer and the map size, hashed
+    /// the same way. The daily product has no processing parameters.
+    pub(crate) fn gibs(identity: &str) -> Self {
+        use std::fmt::Write;
+        let mut key = "clouds_cache_gibs_".to_owned();
+        for byte in Sha256::digest(identity.as_bytes()) {
+            let _ = write!(key, "{byte:02x}");
+        }
+        Self {
+            cache_key: key,
+            wait: CloudWait::Existing,
         }
     }
 }

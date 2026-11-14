@@ -443,7 +443,7 @@ fn decode_png(body: &[u8], px: u32) -> Result<GrayMap, String> {
 }
 
 /// Why a hemisphere fetch failed, and whether trying again can help.
-enum FetchError {
+pub(crate) enum FetchError {
     /// A transport failure, a 5xx, a 429, or a body read that died: worth
     /// another attempt within the budget.
     Transient(String, Option<Duration>),

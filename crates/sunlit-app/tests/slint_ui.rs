@@ -9866,6 +9866,25 @@ fn test_cloud_source_rows_follow_the_draft_mode() {
         &window,
         "MainWindow::cloud-floor-slider"
     ));
+    // GIBS: neither the URL row nor the IR parameters apply to it.
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    window.set_cloud_source_draft(draft);
+    assert!(!url_row(&window));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
+
+    // GIBS: neither the URL row nor the IR parameters apply to it.
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    window.set_cloud_source_draft(draft);
+    assert!(!url_row(&window));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
 }
 
 #[test]
@@ -9916,6 +9935,32 @@ fn test_an_invalid_draft_is_refused_entirely() {
     approx::assert_relative_eq!(window.get_cloud_source().floor, 60.0);
     // The draft survives too: refusing is not editing behind the user's back.
     approx::assert_relative_eq!(window.get_cloud_source_draft().floor, 200.0);
+}
+
+#[test]
+fn test_a_gibs_draft_switches_and_saves_the_gibs_mode() {
+    let SourceWindow { window, link, sent } = create_source_window();
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    window.set_cloud_source_draft(draft.clone());
+    window.invoke_apply_cloud_source(draft.clone());
+
+    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    let switched = sent
+        .iter()
+        .find_map(|command| match command {
+            sunlit_core::engine::EngineCommand::SetCloudSource(config) => Some(config),
+            _ => None,
+        })
+        .expect("the apply switches the engine");
+    assert_eq!(switched.mode, sunlit_core::config::CloudSourceMode::Gibs);
+    assert_eq!(window.get_cloud_source().mode, 2);
+    let config = ui_callbacks::read_config_from_window(&window, &link);
+    assert_eq!(
+        config.cloud_source.mode,
+        sunlit_core::config::CloudSourceMode::Gibs,
+        "a save reads the applied GIBS mode"
+    );
 }
 
 /// The valid apply switches the engine, pushes the applied value and reads

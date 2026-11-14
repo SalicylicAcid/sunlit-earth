@@ -909,6 +909,7 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
     match config.mode {
         config::CloudSourceMode::Eumetsat => build(1),
         config::CloudSourceMode::Remote => build(0),
+        config::CloudSourceMode::Gibs => build(2),
     }
 }
 
@@ -927,10 +928,10 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
         blur: f64::from(settings.blur),
     };
     config::CloudSourceConfig {
-        mode: if settings.mode == 1 {
-            config::CloudSourceMode::Eumetsat
-        } else {
-            config::CloudSourceMode::Remote
+        mode: match settings.mode {
+            1 => config::CloudSourceMode::Eumetsat,
+            2 => config::CloudSourceMode::Gibs,
+            _ => config::CloudSourceMode::Remote,
         },
         remote_url: settings.remote_url.to_string(),
         eumetsat,

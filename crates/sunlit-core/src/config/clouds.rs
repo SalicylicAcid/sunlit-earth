@@ -14,6 +14,7 @@ pub enum CloudSourceMode {
     #[default]
     Remote,
     Eumetsat,
+    Gibs,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
