@@ -1,7 +1,20 @@
 """Shared image processing functions for cloud imagery."""
 
+import io
+
 import numpy as np
+from PIL import Image
 from scipy.ndimage import gaussian_filter
+
+
+def decode_grayscale(image_data: bytes) -> np.ndarray:
+    """Decode image bytes (JPEG, PNG, ...) into a 2D float32 array in [0, 1].
+
+    :param image_data: Raw image file bytes.
+    :returns: 2D float32 array with values in [0, 1].
+    """
+    img = Image.open(io.BytesIO(image_data)).convert("L")
+    return np.asarray(img).astype(np.float32) / 255.0
 
 
 def apply_levels(

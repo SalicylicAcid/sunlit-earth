@@ -4,14 +4,18 @@ Downloads the pre-composited equirectangular greyscale cloud JPEG from
 clouds.matteason.co.uk and applies post-processing (levels, blur).
 """
 
-import io
 import urllib.request
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from cloud_fetch.processing import apply_blur, apply_levels, float_to_uint8
+from cloud_fetch.processing import (
+    apply_blur,
+    apply_levels,
+    decode_grayscale,
+    float_to_uint8,
+)
 
 SOURCE_URL = "https://clouds.matteason.co.uk/images/8192x4096/clouds.jpg"
 
@@ -30,16 +34,6 @@ def download_cloud_image(url: str = SOURCE_URL) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "SunlitEarth/1.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read()
-
-
-def decode_grayscale(jpeg_data: bytes) -> np.ndarray:
-    """Decode JPEG bytes into a 2D float32 array in [0, 1].
-
-    :param jpeg_data: Raw JPEG bytes.
-    :returns: 2D float32 array with values in [0, 1].
-    """
-    img = Image.open(io.BytesIO(jpeg_data)).convert("L")
-    return np.asarray(img).astype(np.float32) / 255.0
 
 
 def fetch_matteason(

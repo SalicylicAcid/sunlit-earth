@@ -16,6 +16,7 @@ class TestHelpOutput:
         assert result.exit_code == 0
         assert "matteason" in result.output
         assert "gmgsi" in result.output
+        assert "eumetsat" in result.output
 
     def test_matteason_help(self) -> None:
         result = runner.invoke(app, ["matteason", "--help"])
@@ -145,6 +146,70 @@ class TestGmgsi:
             assert result.exit_code != 0
 
 
+class TestEumetsat:
+    def test_default_values(self, tmp_path: Path) -> None:
+        with patch("cloud_fetch.main.fetch_eumetsat") as mock:
+            result = runner.invoke(app, ["eumetsat", "--output-dir", str(tmp_path)])
+            assert result.exit_code == 0
+            mock.assert_called_once()
+            kwargs = mock.call_args.kwargs
+            assert kwargs["size"] == 4096
+            assert kwargs["floor"] == 100
+            assert kwargs["ceiling"] == 180
+            assert kwargs["gamma"] == 1.0
+            assert kwargs["blur"] == 0.0
+            assert kwargs["quality"] == 88
+            assert kwargs["timeout"] == 900
+            assert kwargs["all_sizes"] is False
+            assert kwargs["raw"] is False
+
+    def test_custom_values(self, tmp_path: Path) -> None:
+        with patch("cloud_fetch.main.fetch_eumetsat") as mock:
+            result = runner.invoke(
+                app,
+                [
+                    "eumetsat",
+                    "--output-dir",
+                    str(tmp_path),
+                    "--size",
+                    "2048",
+                    "--floor",
+                    "80",
+                    "--ceiling",
+                    "200",
+                    "--gamma",
+                    "0.8",
+                    "--blur",
+                    "1.5",
+                    "--quality",
+                    "92",
+                    "--timeout",
+                    "300",
+                    "--all-sizes",
+                    "--raw",
+                ],
+            )
+            assert result.exit_code == 0
+            kwargs = mock.call_args.kwargs
+            assert kwargs["size"] == 2048
+            assert kwargs["floor"] == 80
+            assert kwargs["ceiling"] == 200
+            assert kwargs["gamma"] == 0.8
+            assert kwargs["blur"] == 1.5
+            assert kwargs["quality"] == 92
+            assert kwargs["timeout"] == 300
+            assert kwargs["all_sizes"] is True
+            assert kwargs["raw"] is True
+
+    def test_pipeline_error_exits_nonzero(self, tmp_path: Path) -> None:
+        with patch(
+            "cloud_fetch.main.fetch_eumetsat",
+            side_effect=RuntimeError("WMS error"),
+        ):
+            result = runner.invoke(app, ["eumetsat", "--output-dir", str(tmp_path)])
+            assert result.exit_code != 0
+
+
 class TestValidation:
     def test_floor_too_low(self) -> None:
         result = runner.invoke(app, ["matteason", "--floor", "-1"])
@@ -198,3 +263,23 @@ class TestValidation:
                 ],
             )
             assert result.exit_code != 0
+
+    def test_eumetsat_size_too_small(self) -> None:
+        result = runner.invoke(app, ["eumetsat", "--size", "100"])
+        assert result.exit_code != 0
+
+    def test_eumetsat_size_too_large(self) -> None:
+        result = runner.invoke(app, ["eumetsat", "--size", "5000"])
+        assert result.exit_code != 0
+
+    def test_eumetsat_quality_zero(self) -> None:
+        result = runner.invoke(app, ["eumetsat", "--quality", "0"])
+        assert result.exit_code != 0
+
+    def test_eumetsat_quality_over_hundred(self) -> None:
+        result = runner.invoke(app, ["eumetsat", "--quality", "101"])
+        assert result.exit_code != 0
+
+    def test_eumetsat_timeout_zero(self) -> None:
+        result = runner.invoke(app, ["eumetsat", "--timeout", "0"])
+        assert result.exit_code != 0

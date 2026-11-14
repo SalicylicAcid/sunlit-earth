@@ -5,6 +5,30 @@ from typing import Annotated
 
 import typer
 
+from cloud_fetch.eumetsat import (
+    DEFAULT_BLUR_SIGMA as EUM_DEFAULT_BLUR,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_CEILING as EUM_DEFAULT_CEILING,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_FLOOR as EUM_DEFAULT_FLOOR,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_GAMMA as EUM_DEFAULT_GAMMA,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_QUALITY as EUM_DEFAULT_QUALITY,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_SIZE as EUM_DEFAULT_SIZE,
+)
+from cloud_fetch.eumetsat import (
+    DEFAULT_TIMEOUT as EUM_DEFAULT_TIMEOUT,
+)
+from cloud_fetch.eumetsat import (
+    fetch_eumetsat,
+)
 from cloud_fetch.gmgsi import (
     DEFAULT_BLUR_SIGMA as GMGSI_DEFAULT_BLUR,
 )
@@ -65,6 +89,26 @@ def _validate_gamma(value: float) -> float:
 def _validate_blur(value: float) -> float:
     if value < 0:
         raise typer.BadParameter("Blur sigma must be non-negative.")
+    return value
+
+
+def _validate_size(value: int) -> int:
+    if value < 256 or value > 4096:
+        raise typer.BadParameter(
+            "Size must be between 256 and 4096 pixels per hemisphere."
+        )
+    return value
+
+
+def _validate_quality(value: int) -> int:
+    if value < 1 or value > 100:
+        raise typer.BadParameter("Quality must be between 1 and 100.")
+    return value
+
+
+def _validate_timeout(value: int) -> int:
+    if value < 1:
+        raise typer.BadParameter("Timeout must be at least one second.")
     return value
 
 
@@ -209,6 +253,107 @@ def gmgsi(
             ceiling=ceiling,
             gamma=gamma,
             blur=blur,
+            raw=raw,
+        )
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+
+@app.command()
+def eumetsat(
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            help="Directory for output JPEG (default: current directory).",
+            resolve_path=True,
+        ),
+    ] = _DEFAULT_OUTPUT_DIR,
+    size: Annotated[
+        int,
+        typer.Option(
+            "--size",
+            help="Pixels per hemisphere; the main output is (2x this) wide.",
+            callback=_validate_size,
+        ),
+    ] = EUM_DEFAULT_SIZE,
+    floor: Annotated[
+        int,
+        typer.Option(
+            "--floor",
+            help="Levels black point, 0-255.",
+            callback=_validate_floor,
+        ),
+    ] = EUM_DEFAULT_FLOOR,
+    ceiling: Annotated[
+        int,
+        typer.Option(
+            "--ceiling",
+            help="Levels white point, 0-255.",
+            callback=_validate_ceiling,
+        ),
+    ] = EUM_DEFAULT_CEILING,
+    gamma: Annotated[
+        float,
+        typer.Option(
+            "--gamma",
+            help="Coverage curve exponent (v ** gamma, < 1 brightens midtones).",
+            callback=_validate_gamma,
+        ),
+    ] = EUM_DEFAULT_GAMMA,
+    blur: Annotated[
+        float,
+        typer.Option(
+            "--blur",
+            help="Gaussian blur sigma in pixels.",
+            callback=_validate_blur,
+        ),
+    ] = EUM_DEFAULT_BLUR,
+    quality: Annotated[
+        int,
+        typer.Option(
+            "--quality",
+            help="JPEG quality, 1-100.",
+            callback=_validate_quality,
+        ),
+    ] = EUM_DEFAULT_QUALITY,
+    timeout: Annotated[
+        int,
+        typer.Option(
+            "--timeout",
+            help="Seconds per WMS request.",
+            callback=_validate_timeout,
+        ),
+    ] = EUM_DEFAULT_TIMEOUT,
+    all_sizes: Annotated[
+        bool,
+        typer.Option(
+            "--all-sizes",
+            help="Also save the two downscaled variants of the main map.",
+        ),
+    ] = False,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help="Also save the unprocessed stitched image.",
+        ),
+    ] = False,
+) -> None:
+    """Fetch the EUMETSAT global IR cloud layer and build a coverage map."""
+    try:
+        fetch_eumetsat(
+            output_dir=output_dir,
+            size=size,
+            floor=floor,
+            ceiling=ceiling,
+            gamma=gamma,
+            blur=blur,
+            quality=quality,
+            timeout=timeout,
+            all_sizes=all_sizes,
             raw=raw,
         )
     except Exception as e:
