@@ -57,6 +57,28 @@ pub(crate) const TRIM_SMOOTH_HALF: usize = 24;
 pub(crate) const TRIM_FALLBACK: f64 = 0.09;
 /// Quality of the derived grayscale JPEG, as the generator's default.
 pub(crate) const JPEG_QUALITY: u8 = 88;
+/// How often a download refreshes its progress line: often enough to look
+/// alive, rare enough that the status event stays a rarity.
+const DOWNLOAD_REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// Bytes as a one-decimal MiB figure, the unit every cloud map is measured
+/// in.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a byte count is far inside the f64 mantissa"
+)]
+fn mib(bytes: usize) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// A transfer speed in the unit that reads best for it.
+fn speed_text(bytes_per_second: f64) -> String {
+    if bytes_per_second >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB/s", bytes_per_second / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KiB/s", bytes_per_second / 1024.0)
+    }
+}
 
 /// One WMS request at most, however slow the service is today.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
@@ -465,6 +487,10 @@ pub struct EumetsatCloudSource {
     /// What the round is doing right now, for the UI's source status: set at
     /// the pipeline's visible phases and cleared once the map is ready.
     phase: Mutex<String>,
+    /// Each hemisphere's download line (bytes, speed, percent), written by the
+    /// two fetch threads and composed into the status as they move. One slot
+    /// per hemisphere, in [`HEMISPHERES`] order.
+    progress: Mutex<[Option<String>; 2]>,
     agent: ureq::Agent,
 }
 
@@ -536,6 +562,7 @@ impl EumetsatCloudSource {
             first_fetch: AtomicBool::new(true),
             retry_delays: RETRY_DELAYS,
             phase: Mutex::new(String::new()),
+            progress: Mutex::new([None, None]),
             agent,
         }
     }
@@ -549,9 +576,22 @@ impl EumetsatCloudSource {
         format!("{LAYER}|{px}")
     }
 
-    /// Set the round's visible phase; an empty string clears it.
+    /// Set the round's visible phase; an empty string clears it. The download
+    /// progress lines belong to the download phase and go with it.
     fn set_phase(&self, phase: &str) {
         phase.clone_into(&mut self.phase.lock().unwrap_or_else(PoisonError::into_inner));
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = [None, None];
+    }
+
+    /// Set one hemisphere's download line. The slots are per hemisphere, in
+    /// [`HEMISPHERES`] order, so the two parallel fetch threads never fight
+    /// over one string; the status composes the phase and both lines when it
+    /// is read.
+    fn set_progress(&self, index: usize, line: &str) {
+        let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = progress.get_mut(index) {
+            slot.replace(line.to_owned());
+        }
     }
 
     fn px(&self) -> u32 {
@@ -571,6 +611,7 @@ impl EumetsatCloudSource {
     fn fetch_hemisphere(
         &self,
         name: &str,
+        index: usize,
         bbox: &str,
         px: u32,
         deadline: Instant,
@@ -582,10 +623,11 @@ impl EumetsatCloudSource {
                     "EUMETSAT {name} hemisphere: the round budget is spent before attempt {attempt}"
                 ));
             }
-            self.set_phase(&format!(
-                "downloading the {name} hemisphere (attempt {attempt}/{MAX_ATTEMPTS})"
-            ));
-            match self.request_hemisphere(&url, px, MAX_BODY_BYTES) {
+            self.set_progress(
+                index,
+                &format!("{name} (attempt {attempt}/{MAX_ATTEMPTS}): connecting"),
+            );
+            match self.request_hemisphere(name, index, &url, px, MAX_BODY_BYTES) {
                 Ok(pair) => return Ok(pair),
                 // A permanent refusal or an invalid image: repeating this
                 // round verbatim cannot help, the next scheduled one may.
@@ -606,6 +648,14 @@ impl EumetsatCloudSource {
                         ));
                     }
                     info!(attempt, hemisphere = name, delay = ?delay, "retrying the EUMETSAT hemisphere");
+                    self.set_progress(
+                        index,
+                        &format!(
+                            "{name} (attempt {}/{MAX_ATTEMPTS}): retrying in {}s",
+                            attempt + 1,
+                            delay.as_secs()
+                        ),
+                    );
                     std::thread::sleep(delay);
                 }
             }
@@ -613,9 +663,12 @@ impl EumetsatCloudSource {
         unreachable!("every loop path returns")
     }
 
-    /// One attempt of one hemisphere: request, classify, read, validate.
+    /// One attempt of one hemisphere: request, classify, read with live
+    /// progress, validate.
     fn request_hemisphere(
         &self,
+        name: &str,
+        index: usize,
         url: &str,
         px: u32,
         max_body: u64,
@@ -645,17 +698,79 @@ impl EumetsatCloudSource {
                 "the service answered {content_type:?}, not an image"
             )));
         }
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(max_body)
-            .read_to_vec()
-            .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => {
+        // Read incrementally and report the round's progress as it moves:
+        // bytes and speed while the length is unknown, a percent beside them
+        // once Content-Length says how big the map is.
+        let total = response
+            .headers()
+            .get("Content-Length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let mut reader = response.body_mut().with_config().limit(max_body).reader();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the capacity is clamped to 64 MiB before the narrowing cast"
+        )]
+        let capacity = total.map_or(1 << 20, |n| (n as usize).min(64 << 20));
+        let mut body = Vec::with_capacity(capacity);
+        let request_started = Instant::now();
+        let mut last_report = Instant::now();
+        loop {
+            use std::io::Read as _;
+            // One read call's worth of the map: big enough that the 500 ms
+            // progress tick sees movement, small enough for the stack.
+            #[expect(
+                clippy::large_stack_arrays,
+                reason = "64 KiB is the chunk a download reads in, on a worker thread"
+            )]
+            let mut chunk = [0u8; 64 * 1024];
+            let read = reader.read(&mut chunk).map_err(|e: std::io::Error| {
+                let over_limit = e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+                    .is_some_and(|err| matches!(err, ureq::Error::BodyExceedsLimit(_)));
+                if over_limit {
                     FetchError::Permanent(format!("the response exceeds the {max_body} byte cap"))
+                } else {
+                    FetchError::Transient(format!("body read: {e}"), None)
                 }
-                other => FetchError::Transient(format!("body read: {other}"), None),
             })?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+            if last_report.elapsed() >= DOWNLOAD_REPORT_EVERY {
+                last_report = Instant::now();
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a byte count is far inside the f64 mantissa"
+                )]
+                let speed = body.len() as f64 / request_started.elapsed().as_secs_f64();
+                let line = match total.filter(|&total| total > 0) {
+                    Some(total) => {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "a byte count is far inside the f64 mantissa"
+                        )]
+                        let percent = body.len() as f64 / total as f64 * 100.0;
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "the length header was parsed from bytes the cap bounds"
+                        )]
+                        let total = total as usize;
+                        format!(
+                            "{name}: {} of {} ({}) — {:.0}%",
+                            mib(body.len()),
+                            mib(total),
+                            speed_text(speed),
+                            percent
+                        )
+                    }
+                    None => format!("{name}: {} ({})", mib(body.len()), speed_text(speed)),
+                };
+                self.set_progress(index, &line);
+            }
+        }
         let map = decode_png(&body, px).map_err(FetchError::Permanent)?;
         Ok((body, map))
     }
@@ -668,7 +783,15 @@ impl CloudSource for EumetsatCloudSource {
 
     fn status(&self) -> Option<String> {
         let phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
-        (!phase.is_empty()).then(|| phase.clone())
+        let progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        let parts: Vec<&str> = progress.iter().flatten().map(String::as_str).collect();
+        if parts.is_empty() {
+            (!phase.is_empty()).then(|| phase.clone())
+        } else if phase.is_empty() {
+            Some(parts.join(" · "))
+        } else {
+            Some(format!("{phase} — {}", parts.join(" · ")))
+        }
     }
 
     fn prepare(&self, resolution: u32) -> CloudTarget {
@@ -719,10 +842,12 @@ impl CloudSource for EumetsatCloudSource {
         // to processing, so no half a map is ever stitched to history.
         self.set_phase("downloading the two hemispheres");
         let (west, east) = std::thread::scope(|scope| {
-            let west = scope
-                .spawn(|| self.fetch_hemisphere(HEMISPHERES[0].0, HEMISPHERES[0].1, px, deadline));
-            let east = scope
-                .spawn(|| self.fetch_hemisphere(HEMISPHERES[1].0, HEMISPHERES[1].1, px, deadline));
+            let west = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[0].0, 0, HEMISPHERES[0].1, px, deadline)
+            });
+            let east = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[1].0, 1, HEMISPHERES[1].1, px, deadline)
+            });
             (west.join(), east.join())
         });
         let west = west.map_err(|_| "the west hemisphere's fetch panicked".to_owned())?;
@@ -1258,7 +1383,7 @@ mod tests {
         let (agent, calls) = stub_agent(|_| Ok(png_response(16, 128)));
         source.agent = agent;
         let url = build_wms_url("-90,-180,90,0", 16);
-        let Err(error) = source.request_hemisphere(&url, 16, 8) else {
+        let Err(error) = source.request_hemisphere("west", 0, &url, 16, 8) else {
             panic!("a body past the cap was read");
         };
         let FetchError::Permanent(message) = error else {
@@ -1276,7 +1401,7 @@ mod tests {
         let spent = Instant::now()
             .checked_sub(Duration::from_mins(1))
             .expect("a minute ago is representable");
-        let Err(error) = source.fetch_hemisphere("west", "-90,-180,90,0", 16, spent) else {
+        let Err(error) = source.fetch_hemisphere("west", 0, "-90,-180,90,0", 16, spent) else {
             panic!("an exhausted budget fetched anyway");
         };
         assert!(error.contains("budget"), "{error}");
@@ -1302,7 +1427,7 @@ mod tests {
         source.agent = agent;
         let started = Instant::now();
         let (_, map) = source
-            .fetch_hemisphere("west", "-90,-180,90,0", 16, started + ROUND_BUDGET)
+            .fetch_hemisphere("west", 0, "-90,-180,90,0", 16, started + ROUND_BUDGET)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "retried once");
         assert!(
@@ -1325,7 +1450,13 @@ mod tests {
         });
         source.agent = agent;
         let (_, map) = source
-            .fetch_hemisphere("west", "-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
+            .fetch_hemisphere(
+                "west",
+                0,
+                "-90,-180,90,0",
+                16,
+                Instant::now() + ROUND_BUDGET,
+            )
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(map.width(), 16);
@@ -1374,9 +1505,13 @@ mod tests {
             let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
             let (agent, calls) = stub_agent(make);
             source.agent = agent;
-            let Err(error) =
-                source.fetch_hemisphere("west", "-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
-            else {
+            let Err(error) = source.fetch_hemisphere(
+                "west",
+                0,
+                "-90,-180,90,0",
+                16,
+                Instant::now() + ROUND_BUDGET,
+            ) else {
                 panic!("{label} produced a map");
             };
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{label} retried");
@@ -1655,6 +1790,41 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "the round waited on the barrier, so the fetches were sequential: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn the_status_composes_the_phase_and_the_download_lines() {
+        let source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        assert_eq!(source.status(), None, "an idle source says nothing");
+        source.set_phase("downloading the two hemispheres");
+        assert_eq!(
+            source.status().as_deref(),
+            Some("downloading the two hemispheres")
+        );
+        source.set_progress(0, "west: 1.2 of 2.8 MiB (450 KiB/s) — 43%");
+        assert_eq!(
+            source.status().as_deref(),
+            Some("downloading the two hemispheres — west: 1.2 of 2.8 MiB (450 KiB/s) — 43%")
+        );
+        source.set_progress(1, "east: 0.3 of 2.8 MiB (120 KiB/s) — 11%");
+        let status = source.status().expect("both lines are up");
+        assert!(status.contains("west: 1.2"), "{status}");
+        assert!(status.contains("east: 0.3"), "{status}");
+        // A phase change ends the download lines with it.
+        source.set_phase("processing locally");
+        assert_eq!(
+            source.status().as_deref(),
+            Some("processing locally"),
+            "stale download lines must not survive into the next phase"
+        );
+    }
+
+    #[test]
+    fn the_transfer_figures_use_the_units_that_read_best() {
+        assert_eq!(mib(0), "0.0 MiB");
+        assert_eq!(mib(2_811_907), "2.7 MiB");
+        assert_eq!(speed_text(300.0 * 1024.0), "300 KiB/s");
+        assert_eq!(speed_text(2.4 * 1024.0 * 1024.0), "2.4 MiB/s");
     }
 
     #[test]
