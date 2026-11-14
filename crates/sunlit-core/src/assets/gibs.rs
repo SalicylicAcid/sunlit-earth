@@ -39,7 +39,10 @@ pub(crate) const LAYER: &str = "MODIS_Terra_Cloud_Fraction_Day";
 /// Quality of the derived grayscale JPEG, matching the other sources.
 const JPEG_QUALITY: u8 = 88;
 /// The processing algorithm's version, stored in the derived map's metadata.
-const ALGORITHM_VERSION: u32 = 2;
+const ALGORITHM_VERSION: u32 = 3;
+/// The no-data sentinel a converted map carries where the satellite's swath
+/// missed, and what [`fill_line`] treats as a gap to bridge.
+const NO_DATA: f32 = -1.0;
 
 /// One WMS request at most.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
@@ -358,11 +361,9 @@ impl GibsCloudSource {
             width,
             decoded.height(),
             &mut pixels,
-            // Row runs up to 12% of the width; the column pass then bridges
-            // what remains up to 25% of the height. Longer runs are regions
-            // the satellite never saw today and stay clear sky.
+            // Row runs up to 12% of the width are bridged; longer runs are
+            // regions the satellite never saw today and stay clear sky.
             width as usize / 8,
-            decoded.height() as usize / 4,
         );
         blur_f32(&pixels, width, decoded.height(), f64::from(width) / 1024.0);
         let filled = GrayMap::new(width, decoded.height(), pixels).expect("the filled rectangle");
@@ -410,7 +411,7 @@ pub(crate) fn rgba_to_gray(img: &image::RgbaImage, width: u32) -> Result<GrayMap
             if p.0[3] == 255 {
                 f32::from(p.0[0]) / 255.0
             } else {
-                0.0
+                NO_DATA
             }
         })
         .collect();
@@ -521,33 +522,38 @@ fn fill_line(values: &[f32], run_max: usize) -> Vec<f32> {
 /// along their row, the remainder along their column, and what no pass
 /// reaches — a region the satellite never saw today — is cleared to clear
 /// sky afterwards.
-fn fill_gaps(width: u32, height: u32, pixels: &mut [f32], run_row: usize, run_column: usize) {
+fn fill_gaps(width: u32, height: u32, pixels: &mut [f32], run_row: usize) {
     let (w, h) = (width as usize, height as usize);
-    // No-data pixels carry the negative sentinel through the fill passes.
-    for pixel in pixels.iter_mut() {
-        *pixel = -1.0 - *pixel;
-    }
-    let mut line = vec![0.0f32; w];
+    // No-data pixels carry the [`NO_DATA`] sentinel through the fill pass.
+    // A row that is mostly sentinel is a polar band the satellite barely
+    // saw: bridging there stretches single sightings across hundreds of
+    // pixels, and a column pass would smear mid-latitude values into the
+    // polar band vertically, so both are left alone — such lines keep their
+    // sightings, and their sentinels clear to cloudless sky at the end. The
+    // orbit tracks the slits follow run pole to pole, so a row crossing one
+    // sees a short run: the row pass is the one that bridges them.
     for y in 0..h {
-        line.copy_from_slice(&pixels[y * w..(y + 1) * w]);
-        let filled = fill_line(&line, run_row);
-        pixels[y * w..(y + 1) * w].copy_from_slice(&filled);
-    }
-    let mut column = vec![0.0f32; h];
-    for x in 0..w {
-        for y in 0..h {
-            column[y] = pixels[y * w + x];
+        let line = &mut pixels[y * w..(y + 1) * w];
+        if valid_fraction(line) < 0.5 {
+            continue;
         }
-        let filled = fill_line(&column, run_column);
-        for y in 0..h {
-            pixels[y * w + x] = filled[y];
-        }
+        let filled = fill_line(line, run_row);
+        line.copy_from_slice(&filled);
     }
     for pixel in pixels.iter_mut() {
         if *pixel < 0.0 {
             *pixel = 0.0;
         }
     }
+}
+
+/// The share of a line's pixels the satellite actually saw.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a pixel count is far inside the f32 mantissa"
+)]
+fn valid_fraction(line: &[f32]) -> f32 {
+    line.iter().filter(|&&v| v >= 0.0).count() as f32 / line.len() as f32
 }
 
 fn progress_line(body: &[u8], total: Option<u64>, started: &Instant) -> String {
@@ -731,9 +737,13 @@ mod tests {
         let raw = sample_map();
         let map = decode_png(&raw, 16).expect("the map decodes");
         assert_eq!(map.width(), 16);
-        // Opaque: the red channel's fraction. Transparent: clear sky.
+        // Opaque: the red channel's fraction. Transparent: the no-data
+        // sentinel the gap fill bridges.
         approx::assert_relative_eq!(map.pixels()[0], 200.0 / 255.0);
-        approx::assert_relative_eq!(map.pixels()[8], 0.0);
+        assert!(
+            map.pixels()[8] == NO_DATA,
+            "the sentinel survives the decode"
+        );
         // The left half stays opaque on the last row.
         approx::assert_relative_eq!(map.pixels()[7 * 16], 200.0 / 255.0);
     }
@@ -801,6 +811,70 @@ mod tests {
             "the stored map and its derivation are current"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fill_gaps_bridges_short_runs_and_clears_long_ones() {
+        // One row: a 3-px gap (bridged) and a 10-px gap (kept, cleared),
+        // separated by a valid pixel so the two runs are distinct.
+        let mut pixels = vec![NO_DATA; 32 * 8];
+        for y in 0..8 {
+            for x in 0..32 {
+                pixels[y * 32 + x] = if x < 4 {
+                    0.2
+                } else if x < 7 {
+                    NO_DATA
+                } else if x < 8 {
+                    0.5
+                } else if x < 18 {
+                    NO_DATA
+                } else {
+                    0.8
+                };
+            }
+        }
+        fill_gaps(32, 8, &mut pixels, 32 / 8);
+        // The 3-px gap between 0.2 and 0.5 is bridged; the 10-px gap (run_max
+        // 4) is cleared sky, not streaked across.
+        approx::assert_relative_eq!(pixels[0], 0.2);
+        let bridged = &pixels[4..7];
+        assert!(
+            bridged[0] > 0.2 && bridged[2] < 0.5,
+            "the short run is interpolated: {bridged:?}"
+        );
+        assert!(
+            pixels[8..18].iter().all(|&v| v == 0.0),
+            "the long run is clear sky"
+        );
+        approx::assert_relative_eq!(pixels[18], 0.8);
+        assert!(
+            pixels.iter().all(|&v| v.is_finite() && v >= 0.0),
+            "no sentinel survives the fill"
+        );
+    }
+
+    #[test]
+    fn a_mostly_empty_line_is_not_filled() {
+        // A polar band: 90% sentinel, two sightings far apart. Bridging them
+        // would streak the pair across the band, so the line keeps its
+        // sightings and its sentinels clear.
+        let mut row = vec![NO_DATA; 32];
+        row[2] = 0.4;
+        row[20] = 0.9;
+        let mut pixels = vec![0.5f32; 32 * 8];
+        pixels[..32].copy_from_slice(&row);
+        fill_gaps(32, 8, &mut pixels, 32 / 8);
+        // Row 0 is 6% valid — untouched: its sentinels clear, its two
+        // sightings stay.
+        // The sightings survive bit-exact: the line was skipped, not written.
+        assert_eq!(pixels[2].to_bits(), 0.4f32.to_bits());
+        assert_eq!(pixels[20].to_bits(), 0.9f32.to_bits());
+        assert!(
+            pixels[0] == 0.0 && pixels[10] == 0.0 && pixels[30] == 0.0,
+            "the skipped row's sentinels clear"
+        );
+        // The fully valid rows are untouched (nothing to fill).
+        assert_eq!(pixels[32].to_bits(), 0.5f32.to_bits());
     }
 
     #[test]

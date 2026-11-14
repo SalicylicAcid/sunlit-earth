@@ -673,7 +673,7 @@ impl EumetsatCloudSource {
                 );
                 match self.fetch_tile(name, index, bbox, row, col, tiles, tile_px, deadline) {
                     Ok(tile) => {
-                        paste_tile(&mut canvas, px, &tile, row, col, tile_px);
+                        paste_tile(&mut canvas, px, &tile, row, col, tile_px, tiles);
                         done += 1;
                         self.set_progress(index, &format!("{name}: {done}/{total} tiles"));
                     }
@@ -1199,10 +1199,23 @@ fn sub_bbox(bbox: &str, row: u32, col: u32, tiles: u32) -> String {
 }
 
 /// Paste a tile's pixels into the canvas at its grid position.
-fn paste_tile(canvas: &mut [f32], px: u32, tile: &GrayMap, row: u32, col: u32, tile_px: u32) {
+fn paste_tile(
+    canvas: &mut [f32],
+    px: u32,
+    tile: &GrayMap,
+    row: u32,
+    col: u32,
+    tile_px: u32,
+    tiles: u32,
+) {
     let (w, h) = (px as usize, tile_px as usize);
     let x0 = col as usize * h;
-    let y0 = row as usize * h;
+    // Tile rows count from the bbox's min_lat — south for both hemispheres —
+    // while the canvas counts from its top, north: tile row 0 is the bottom
+    // band, so its offset counts from the other end. Measured against the
+    // service: a tile's top row is its max_lat edge, where the polar blind
+    // zone sits.
+    let y0 = (tiles - 1 - row) as usize * h;
     for y in 0..h {
         let dst = (y0 + y) * w + x0;
         canvas[dst..dst + h].copy_from_slice(&tile.pixels()[y * h..(y + 1) * h]);
@@ -2074,15 +2087,17 @@ mod tests {
             .expect("the tiled hemisphere arrives");
         assert_eq!(calls.load(Ordering::SeqCst), 4, "a 2x2 grid of tiles");
         // Tile (row, col) fills 100 + 40*row + 40*col, and each tile is
-        // 512 px, so the first pixel of each quadrant names the tile that
-        // owns it.
+        // 512 px. Tile rows count from the bbox's min_lat — south — while
+        // the canvas counts from its top, north: tile row 0 lands at the
+        // BOTTOM of the canvas, so the first pixel of each quadrant names
+        // the tile that owns it, with rows swapped.
         let expected = |row: usize, col: usize| {
             f32::from(u8::try_from(100 + 40 * row + 40 * col).unwrap_or(255)) / 255.0
         };
-        approx::assert_relative_eq!(map.pixels()[0], expected(0, 0));
-        approx::assert_relative_eq!(map.pixels()[512], expected(0, 1));
-        approx::assert_relative_eq!(map.pixels()[512 * 1024], expected(1, 0));
-        approx::assert_relative_eq!(map.pixels()[512 * 1024 + 512], expected(1, 1));
+        approx::assert_relative_eq!(map.pixels()[0], expected(1, 0));
+        approx::assert_relative_eq!(map.pixels()[512], expected(1, 1));
+        approx::assert_relative_eq!(map.pixels()[512 * 1024], expected(0, 0));
+        approx::assert_relative_eq!(map.pixels()[512 * 1024 + 512], expected(0, 1));
     }
 
     #[test]
@@ -2106,7 +2121,8 @@ mod tests {
             .expect("the second pass recovers the failed tile");
         // Three other tiles once, the failed one four times.
         assert_eq!(calls.load(Ordering::SeqCst), 7);
-        approx::assert_relative_eq!(map.pixels()[512], 140.0 / 255.0);
+        // Tile (0,1) is the bottom-right quadrant now the rows are north-up.
+        approx::assert_relative_eq!(map.pixels()[512 * 1024 + 512], 140.0 / 255.0);
     }
 
     #[test]
