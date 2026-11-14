@@ -57,6 +57,14 @@ pub(crate) const TRIM_SMOOTH_HALF: usize = 24;
 pub(crate) const TRIM_FALLBACK: f64 = 0.09;
 /// Quality of the derived grayscale JPEG, as the generator's default.
 pub(crate) const JPEG_QUALITY: u8 = 88;
+/// One WMS tile's side in pixels. A hemisphere is fetched as a grid of this
+/// size: the service renders each request on the fly and a long-lived
+/// connection for a 9 MB hemisphere dies mid-transfer on a flaky link, which
+/// costs the whole round. A 512 px tile is ~230 KB and lands in seconds, so
+/// completed tiles accumulate and only the failed ones retry. The service's
+/// rate limiter delays excess requests by a second rather than refusing
+/// them, so the grid's extra requests are tolerated.
+pub(crate) const TILE_PX: u32 = 512;
 /// How often a download refreshes its progress line: often enough to look
 /// alive, rare enough that the status event stays a rarity.
 const DOWNLOAD_REPORT_EVERY: Duration = Duration::from_millis(500);
@@ -84,8 +92,11 @@ fn speed_text(bytes_per_second: f64) -> String {
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// TCP/TLS handshake cap, so a dead endpoint is known in seconds.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// One whole round (both hemispheres and their retries) at most.
-const ROUND_BUDGET: Duration = Duration::from_mins(15);
+/// One whole round (both hemispheres, their tile grids and the retries) at
+/// most. The tiled fetch spends the same total render time as one large
+/// request would, spread over many small requests, and a slow link adds
+/// retries on top.
+const ROUND_BUDGET: Duration = Duration::from_mins(25);
 /// Attempts per hemisphere for transient failures, within the budget.
 const MAX_ATTEMPTS: u32 = 3;
 /// Backoff between attempts of one hemisphere: 10 s, then 20 s. A Retry-After
@@ -549,6 +560,13 @@ pub(crate) fn hemisphere_px(resolution: u32) -> u32 {
     cloud_variant(resolution).1
 }
 
+/// How many tiles one side of a hemisphere is split into: the largest grid
+/// whose tiles stay at or under [`TILE_PX`], and one tile for a size below
+/// it.
+pub(crate) fn tiles_per_side(px: u32) -> u32 {
+    (px / TILE_PX).max(1)
+}
+
 impl EumetsatCloudSource {
     pub fn new(settings: EumetsatSettings, cache_dir: Option<std::path::PathBuf>) -> Self {
         let user_agent = format!("sunlit.earth/{}", env!("CARGO_PKG_VERSION"));
@@ -610,13 +628,19 @@ impl EumetsatCloudSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Fetch one hemisphere with up to [`MAX_ATTEMPTS`] tries, transient
-    /// failures backed off and a Retry-After honored within `deadline`.
+    /// Fetch one hemisphere as a grid of [`TILE_PX`] tiles.
     ///
-    /// Returns the response's raw bytes — what the raw pair stores and its
-    /// manifest hashes — beside the decoded map. No attempt starts after
-    /// `deadline`; a request already in flight ends when it ends, and the
-    /// next attempt then sees the exhausted budget.
+    /// The service renders each request on the fly and does not support
+    /// HTTP range requests (measured: a Range header is answered with the
+    /// full 200 body), so a transfer that dies mid-body cannot be resumed
+    /// against the server. Small tiles make that survivable: a completed
+    /// tile is kept, only the failed ones are retried — first within their
+    /// own attempt budget, then in a second pass over whatever is left.
+    /// Tiles that no pass reaches fail the round; the worker's backoff
+    /// starts a fresh one.
+    ///
+    /// Returns the stitched hemisphere re-encoded as PNG — what the raw pair
+    /// stores — beside the decoded map. No tile starts after `deadline`.
     fn fetch_hemisphere(
         &self,
         name: &str,
@@ -625,46 +649,117 @@ impl EumetsatCloudSource {
         px: u32,
         deadline: Instant,
     ) -> Result<(Vec<u8>, GrayMap), String> {
-        let url = build_wms_url(bbox, px);
-        for attempt in 1..=MAX_ATTEMPTS {
-            if Instant::now() >= deadline {
+        let tiles = tiles_per_side(px);
+        let tile_px = px / tiles;
+        let total = (tiles * tiles) as usize;
+        let mut canvas = vec![0.0f32; (px * px) as usize];
+        let mut remaining: Vec<(u32, u32)> = {
+            let coords = |i: u32| (0..i).flat_map(move |r| (0..i).map(move |c| (r, c)));
+            coords(tiles).collect()
+        };
+        let mut done = 0usize;
+        for pass in 1..=2 {
+            let mut failed = Vec::new();
+            for &(row, col) in &remaining {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "EUMETSAT {name} hemisphere: the round budget is spent with                          {}/{total} tiles unfetched",
+                        total - done
+                    ));
+                }
+                self.set_progress(
+                    index,
+                    &format!("{name}: {done}/{total} tiles (pass {pass}, attempting {row},{col})"),
+                );
+                match self.fetch_tile(name, index, bbox, row, col, tiles, tile_px, deadline) {
+                    Ok(tile) => {
+                        paste_tile(&mut canvas, px, &tile, row, col, tile_px);
+                        done += 1;
+                        self.set_progress(index, &format!("{name}: {done}/{total} tiles"));
+                    }
+                    Err(FetchError::Permanent(message)) => {
+                        return Err(format!("EUMETSAT {name} hemisphere: {message}"));
+                    }
+                    Err(FetchError::Transient(message, _)) => failed.push((row, col, message)),
+                }
+            }
+            if failed.is_empty() {
+                let map = GrayMap::new(px, px, canvas).expect("the tiled rectangle");
+                let png = encode_png(&map);
+                return Ok((png, map));
+            }
+            if pass == 2 {
+                let names: Vec<String> = failed
+                    .iter()
+                    .map(|(r, c, m)| format!("({r},{c}): {m}"))
+                    .collect();
                 return Err(format!(
-                    "EUMETSAT {name} hemisphere: the round budget is spent before attempt {attempt}"
+                    "EUMETSAT {name} hemisphere: {}/{} tiles failed after both passes: {}",
+                    failed.len(),
+                    total,
+                    names.join("; ")
                 ));
             }
-            self.set_progress(
-                index,
-                &format!("{name} (attempt {attempt}/{MAX_ATTEMPTS}): connecting"),
-            );
-            match self.request_hemisphere(name, index, &url, px, MAX_BODY_BYTES) {
-                Ok(pair) => return Ok(pair),
-                // A permanent refusal or an invalid image: repeating this
-                // round verbatim cannot help, the next scheduled one may.
+            remaining = failed.iter().map(|(r, c, _)| (*r, *c)).collect();
+        }
+        unreachable!("both passes return")
+    }
+
+    /// One tile with its own attempt budget: transient failures retried with
+    /// the round's backoff and a Retry-After honored; a permanent refusal
+    /// comes back as [`FetchError::Permanent`], which fails the hemisphere
+    /// at once — the same request answered the same way, and every other
+    /// tile would refuse too.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the tile's grid position, size and shared progress slot, handed over at once"
+    )]
+    fn fetch_tile(
+        &self,
+        name: &str,
+        index: usize,
+        bbox: &str,
+        row: u32,
+        col: u32,
+        tiles: u32,
+        tile_px: u32,
+        deadline: Instant,
+    ) -> Result<GrayMap, FetchError> {
+        let tile_bbox = sub_bbox(bbox, row, col, tiles);
+        let url = build_wms_url(&tile_bbox, tile_px);
+        for attempt in 1..=MAX_ATTEMPTS {
+            if Instant::now() >= deadline {
+                return Err(FetchError::Permanent(
+                    "the round budget is spent before attempt {attempt}".to_owned(),
+                ));
+            }
+            match self.request_hemisphere(name, index, &url, tile_px, MAX_BODY_BYTES) {
+                Ok((_, map)) => return Ok(map),
                 Err(FetchError::Permanent(message)) => {
-                    return Err(format!("EUMETSAT {name} hemisphere: {message}"));
+                    return Err(FetchError::Permanent(format!(
+                        "tile {row},{col}: {message}"
+                    )));
                 }
                 Err(FetchError::Transient(message, retry_after)) => {
                     if attempt == MAX_ATTEMPTS {
-                        return Err(format!(
-                            "EUMETSAT {name} hemisphere failed after {MAX_ATTEMPTS} attempts: {message}"
+                        return Err(FetchError::Transient(
+                            format!(
+                                "tile {row},{col} failed after {MAX_ATTEMPTS} attempts: {message}"
+                            ),
+                            retry_after,
                         ));
                     }
                     let delay = retry_after.unwrap_or(self.retry_delays[(attempt - 1) as usize]);
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if delay >= remaining {
-                        return Err(format!(
-                            "EUMETSAT {name} hemisphere: retrying after {delay:?} would pass the round budget"
+                        return Err(FetchError::Transient(
+                            format!(
+                                "tile {row},{col}: retrying after {delay:?} would pass the round budget"
+                            ),
+                            None,
                         ));
                     }
-                    info!(attempt, hemisphere = name, delay = ?delay, "retrying the EUMETSAT hemisphere");
-                    self.set_progress(
-                        index,
-                        &format!(
-                            "{name} (attempt {}/{MAX_ATTEMPTS}): retrying in {}s",
-                            attempt + 1,
-                            delay.as_secs()
-                        ),
-                    );
+                    info!(attempt, hemisphere = name, tile = ?(row, col), delay = ?delay, "retrying a tile");
                     std::thread::sleep(delay);
                 }
             }
@@ -1084,6 +1179,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The Retry-After header, in whole seconds. The HTTP-date form is not
 /// honored: only a delay this round can actually wait out is.
+/// The sub-bbox of tile `(row, col)` of a `tiles`-per-side grid over `bbox`,
+/// in the same latitude,longitude order the hemisphere constants use.
+fn sub_bbox(bbox: &str, row: u32, col: u32, tiles: u32) -> String {
+    let parts: Vec<f64> = bbox
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let [min_lat, min_lon, max_lat, max_lon] = parts[..] else {
+        return bbox.to_owned();
+    };
+    let span_lat = (max_lat - min_lat) / f64::from(tiles);
+    let span_lon = (max_lon - min_lon) / f64::from(tiles);
+    let lat0 = min_lat + span_lat * f64::from(row);
+    let lat1 = min_lat + span_lat * f64::from(row + 1);
+    let lon0 = min_lon + span_lon * f64::from(col);
+    let lon1 = min_lon + span_lon * f64::from(col + 1);
+    format!("{lat0},{lon0},{lat1},{lon1}")
+}
+
+/// Paste a tile's pixels into the canvas at its grid position.
+fn paste_tile(canvas: &mut [f32], px: u32, tile: &GrayMap, row: u32, col: u32, tile_px: u32) {
+    let (w, h) = (px as usize, tile_px as usize);
+    let x0 = col as usize * h;
+    let y0 = row as usize * h;
+    for y in 0..h {
+        let dst = (y0 + y) * w + x0;
+        canvas[dst..dst + h].copy_from_slice(&tile.pixels()[y * h..(y + 1) * h]);
+    }
+}
+
+/// Encode a grayscale map as a lossless PNG, the raw pair's artifact: a
+/// value the live round produced is exactly what a reprocessed round reads
+/// back, since every canvas value already sits on the u8 grid the tiles
+/// arrived on.
+fn encode_png(map: &GrayMap) -> Vec<u8> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the values are already on the u8 grid the tiles arrived on"
+    )]
+    let bytes: Vec<u8> = map
+        .pixels()
+        .iter()
+        .map(|&v| (v.clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(
+            &bytes,
+            map.width(),
+            map.height(),
+            image::ExtendedColorType::L8,
+        )
+        .expect("a grayscale PNG of an in-memory buffer");
+    out
+}
+
 fn retry_after_header(headers: &ureq::http::HeaderMap) -> Option<Duration> {
     let value = headers.get("Retry-After")?.to_str().ok()?;
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
@@ -1154,7 +1306,7 @@ mod tests {
         assert_eq!(JPEG_QUALITY, 88);
         assert_eq!(REQUEST_TIMEOUT, Duration::from_mins(5));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
-        assert_eq!(ROUND_BUDGET, Duration::from_mins(15));
+        assert_eq!(ROUND_BUDGET, Duration::from_mins(25));
         assert_eq!(MAX_ATTEMPTS, 3);
         assert_eq!(
             RETRY_DELAYS,
@@ -1532,15 +1684,19 @@ mod tests {
     fn fetch_if_changed_rounds_two_hemispheres_into_one_jpeg_and_ignores_etags() {
         let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         source.retry_delays = [Duration::ZERO, Duration::ZERO];
-        // The 2048 texture resolution halves into 1024 px hemispheres, which
-        // the stub serves. Both hemispheres are one identical 128/255 fill,
-        // so the stitched 2048x1024 map is uniform before trim, coverage and
-        // encode.
-        let (agent, calls) = stub_agent(|_| Ok(png_response(1024, 128)));
+        // The 2048 texture resolution halves into 1024 px hemispheres, each
+        // fetched as a 2x2 grid of 512 px tiles, which the stub serves. Both
+        // hemispheres are one identical 128/255 fill, so the stitched
+        // 2048x1024 map is uniform before trim, coverage and encode.
+        let (agent, calls) = stub_agent(|_| Ok(png_response(512, 128)));
         source.agent = agent;
         source.prepare(2048);
         let image = source.fetch_if_changed(Some("\"old\"")).unwrap().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "one round, two requests");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            8,
+            "one round: two hemispheres of four tiles"
+        );
         assert!(image.etag.is_none(), "no conditional requests upstream");
         let decoded = image::load_from_memory(&image.bytes).unwrap();
         assert_eq!(decoded.width(), 2048);
@@ -1570,7 +1726,7 @@ mod tests {
         }
         // No 304 semantics: the second poll fetches a fresh round regardless.
         source.fetch_if_changed(Some("\"old\"")).unwrap().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 16);
     }
 
     #[test]
@@ -1834,6 +1990,123 @@ mod tests {
         assert_eq!(mib(2_811_907), "2.7 MiB");
         assert_eq!(speed_text(300.0 * 1024.0), "300 KiB/s");
         assert_eq!(speed_text(2.4 * 1024.0 * 1024.0), "2.4 MiB/s");
+    }
+
+    /// A middleware that serves each tile's fill value from its bbox: tile
+    /// (row, col) of the west hemisphere comes back uniform at
+    /// `100 + 40*row + 40*col`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the bbox grid indexes are small whole numbers by construction"
+    )]
+    fn per_tile_agent(
+        fail_plan: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+    ) -> (ureq::Agent, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .middleware(
+                move |req: ureq::http::Request<ureq::SendBody>,
+                      _: ureq::middleware::MiddlewareNext| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let url = req.uri().to_string();
+                    let bbox = url
+                        .split("bbox=")
+                        .nth(1)
+                        .unwrap_or_default()
+                        .split('&')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let numbers: Vec<f64> = bbox
+                        .split(',')
+                        .filter_map(|v| v.trim().parse().ok())
+                        .collect();
+                    let fill = if numbers.len() == 4 {
+                        // West hemisphere: lat -90..90, lon -180..0.
+                        let row = ((numbers[0] + 90.0) / 90.0).round() as usize;
+                        let col = ((numbers[1] + 180.0) / 90.0).round() as usize;
+                        let planned = fail_plan
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .get_mut(&bbox)
+                            .is_some_and(|left| {
+                                let fire = *left > 0;
+                                if fire {
+                                    *left -= 1;
+                                }
+                                fire
+                            });
+                        if planned {
+                            return Ok(Response::builder()
+                                .status(503)
+                                .body(Body::builder().data(Vec::new()))
+                                .unwrap());
+                        }
+                        u8::try_from(100 + 40 * row + 40 * col).unwrap_or(255)
+                    } else {
+                        128
+                    };
+                    Ok(png_response(512, fill))
+                },
+            )
+            .build()
+            .new_agent();
+        (agent, calls)
+    }
+
+    #[test]
+    fn tiles_are_stitched_at_their_grid_positions() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        let (agent, calls) = per_tile_agent(Arc::default());
+        source.agent = agent;
+        let (_, map) = source
+            .fetch_hemisphere(
+                "west",
+                0,
+                "-90,-180,90,0",
+                1024,
+                Instant::now() + ROUND_BUDGET,
+            )
+            .expect("the tiled hemisphere arrives");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "a 2x2 grid of tiles");
+        // Tile (row, col) fills 100 + 40*row + 40*col, and each tile is
+        // 512 px, so the first pixel of each quadrant names the tile that
+        // owns it.
+        let expected = |row: usize, col: usize| {
+            f32::from(u8::try_from(100 + 40 * row + 40 * col).unwrap_or(255)) / 255.0
+        };
+        approx::assert_relative_eq!(map.pixels()[0], expected(0, 0));
+        approx::assert_relative_eq!(map.pixels()[512], expected(0, 1));
+        approx::assert_relative_eq!(map.pixels()[512 * 1024], expected(1, 0));
+        approx::assert_relative_eq!(map.pixels()[512 * 1024 + 512], expected(1, 1));
+    }
+
+    #[test]
+    fn failed_tiles_are_retried_in_a_second_pass() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        // Tile west (0,1) — bbox "-90,-90,0,0" — fails its three pass-1
+        // attempts and lands on the fourth (pass 2).
+        let mut plan = std::collections::HashMap::new();
+        plan.insert("-90,-90,0,0".to_owned(), 3usize);
+        let (agent, calls) = per_tile_agent(Arc::new(Mutex::new(plan)));
+        source.agent = agent;
+        let (_, map) = source
+            .fetch_hemisphere(
+                "west",
+                0,
+                "-90,-180,90,0",
+                1024,
+                Instant::now() + ROUND_BUDGET,
+            )
+            .expect("the second pass recovers the failed tile");
+        // Three other tiles once, the failed one four times.
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        approx::assert_relative_eq!(map.pixels()[512], 140.0 / 255.0);
     }
 
     #[test]

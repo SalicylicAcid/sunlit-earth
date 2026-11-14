@@ -96,7 +96,7 @@ impl CloudWait {
     pub fn duration(self) -> Duration {
         match self {
             Self::Existing => Duration::from_secs(60),
-            Self::LongFetch => Duration::from_mins(16),
+            Self::LongFetch => Duration::from_mins(26),
         }
     }
 }
@@ -437,7 +437,7 @@ mod tests {
         }
         assert_eq!(wide.wait, CloudWait::Existing);
         assert_eq!(CloudWait::Existing.duration(), Duration::from_secs(60));
-        assert_eq!(CloudWait::LongFetch.duration(), Duration::from_mins(16));
+        assert_eq!(CloudWait::LongFetch.duration(), Duration::from_mins(26));
     }
 
     #[test]
