@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use super::cloud_fetcher::cloud_variant;
 use super::cloud_source::{CloudImage, CloudSource, CloudTarget, CloudWait, Download};
-use super::eumetsat::FetchError;
+use super::eumetsat::{FetchError, blur_f32};
 use crate::config::DEFAULT_TEXTURE_RESOLUTION;
 
 /// GIBS' WMS 1.1.1 endpoint for the Geographic projection, unauthenticated.
@@ -39,7 +39,7 @@ pub(crate) const LAYER: &str = "MODIS_Terra_Cloud_Fraction_Day";
 /// Quality of the derived grayscale JPEG, matching the other sources.
 const JPEG_QUALITY: u8 = 88;
 /// The processing algorithm's version, stored in the derived map's metadata.
-const ALGORITHM_VERSION: u32 = 1;
+const ALGORITHM_VERSION: u32 = 2;
 
 /// One WMS request at most.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
@@ -84,7 +84,10 @@ impl GrayMap {
         self.width
     }
 
-    #[cfg(test)]
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
     pub(crate) fn pixels(&self) -> &[f32] {
         &self.pixels
     }
@@ -340,10 +343,30 @@ impl GibsCloudSource {
         meta.version == 1 && meta.algorithm == ALGORITHM_VERSION && meta.raw_sha256 == raw_sha
     }
 
-    /// Convert the raw RGBA map to grayscale and store it with its metadata.
+    /// Convert the raw RGBA map to grayscale, fill the orbit gaps, smooth
+    /// the product's native grid, and store the result with its metadata.
     fn process_and_store(&self, width: u32, raw: &[u8], raw_sha: &str) -> Result<Vec<u8>, String> {
-        let map = decode_png(raw, width)?;
-        let bytes = encode_jpeg(&map);
+        let decoded = decode_png(raw, width)?;
+        // The product's native grid is about one degree: at this width the
+        // data is blocky, and the satellite's orbit gaps cut hard through
+        // cloud bands. Small gaps are bridged by interpolation along their
+        // row, the remainder along their column, and what is left — a region
+        // the satellite never saw today — stays clear sky. A blur scaled to
+        // the native grid smooths both the blockiness and the fill seams.
+        let mut pixels = decoded.pixels().to_vec();
+        fill_gaps(
+            width,
+            decoded.height(),
+            &mut pixels,
+            // Row runs up to 12% of the width; the column pass then bridges
+            // what remains up to 25% of the height. Longer runs are regions
+            // the satellite never saw today and stay clear sky.
+            width as usize / 8,
+            decoded.height() as usize / 4,
+        );
+        blur_f32(&pixels, width, decoded.height(), f64::from(width) / 1024.0);
+        let filled = GrayMap::new(width, decoded.height(), pixels).expect("the filled rectangle");
+        let bytes = encode_jpeg(&filled);
         info!(bytes = bytes.len(), "the GIBS map is generated");
         if let Some(dir) = &self.cache_dir {
             let height = width / 2;
@@ -445,6 +468,86 @@ fn decode_png(body: &[u8], width: u32) -> Result<GrayMap, String> {
         .decode()
         .map_err(|e| format!("the GIBS PNG did not decode: {e}"))?;
     rgba_to_gray(&img.to_rgba8(), width)
+}
+
+/// Linearly interpolate no-data runs no longer than `run_max` along one
+/// dimension. A pixel is no-data when it holds the negative sentinel; runs
+/// longer than the bound stay negative — regions the satellite never saw
+/// stay clear sky rather than streaking across half the map.
+fn fill_line(values: &[f32], run_max: usize) -> Vec<f32> {
+    let mut out = values.to_vec();
+    let len = values.len();
+    let mut position = 0;
+    while position < len {
+        if values[position] >= 0.0 {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        while position < len && values[position] < 0.0 {
+            position += 1;
+        }
+        let run = position - start;
+        if run > run_max {
+            continue;
+        }
+        let left = start.checked_sub(1).map(|i| values[i]);
+        let right = (position < len).then(|| values[position]);
+        match (left, right) {
+            (Some(l), Some(r)) =>
+            {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a run position is far inside the f32 mantissa"
+                )]
+                for (offset, i) in (start..position).enumerate() {
+                    let t = (offset + 1) as f32 / (run + 1) as f32;
+                    out[i] = l + (r - l) * t;
+                }
+            }
+            (Some(l), None) => {
+                out[start..position].fill(l);
+            }
+            (None, Some(r)) => {
+                out[start..position].fill(r);
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// Bridge the satellite's orbit gaps: small no-data runs are interpolated
+/// along their row, the remainder along their column, and what no pass
+/// reaches — a region the satellite never saw today — is cleared to clear
+/// sky afterwards.
+fn fill_gaps(width: u32, height: u32, pixels: &mut [f32], run_row: usize, run_column: usize) {
+    let (w, h) = (width as usize, height as usize);
+    // No-data pixels carry the negative sentinel through the fill passes.
+    for pixel in pixels.iter_mut() {
+        *pixel = -1.0 - *pixel;
+    }
+    let mut line = vec![0.0f32; w];
+    for y in 0..h {
+        line.copy_from_slice(&pixels[y * w..(y + 1) * w]);
+        let filled = fill_line(&line, run_row);
+        pixels[y * w..(y + 1) * w].copy_from_slice(&filled);
+    }
+    let mut column = vec![0.0f32; h];
+    for x in 0..w {
+        for y in 0..h {
+            column[y] = pixels[y * w + x];
+        }
+        let filled = fill_line(&column, run_column);
+        for y in 0..h {
+            pixels[y * w + x] = filled[y];
+        }
+    }
+    for pixel in pixels.iter_mut() {
+        if *pixel < 0.0 {
+            *pixel = 0.0;
+        }
+    }
 }
 
 fn progress_line(body: &[u8], total: Option<u64>, started: &Instant) -> String {

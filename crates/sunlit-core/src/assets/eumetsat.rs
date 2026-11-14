@@ -304,6 +304,15 @@ pub(crate) fn to_coverage(image: &GrayMap, settings: &EumetsatSettings) -> GrayM
 
 /// Gaussian blur with scipy's `gaussian_filter` semantics: `truncate` 4.0, a
 /// symmetric boundary (the edge value repeats), and no-op at sigma <= 0.
+pub(crate) fn gaussian_blur(image: &GrayMap, sigma: f64) -> GrayMap {
+    let mut blurred = blur_f32(&image.pixels, image.width, image.height, sigma);
+    GrayMap::new(image.width, image.height, std::mem::take(&mut blurred))
+        .expect("the blurred rectangle")
+}
+
+/// Separable Gaussian blur over a row-major f32 buffer, with scipy's
+/// `gaussian_filter` semantics (truncate 4.0, symmetric boundary). Shared by
+/// the sources whose pipelines smooth their maps.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -311,9 +320,9 @@ pub(crate) fn to_coverage(image: &GrayMap, settings: &EumetsatSettings) -> GrayM
     clippy::cast_precision_loss,
     reason = "kernel offsets around a fixed-size image, mirrored at the boundary"
 )]
-pub(crate) fn gaussian_blur(image: &GrayMap, sigma: f64) -> GrayMap {
+pub(crate) fn blur_f32(pixels: &[f32], width: u32, height: u32, sigma: f64) -> Vec<f32> {
     if sigma <= 0.0 {
-        return image.clone();
+        return pixels.to_vec();
     }
     // scipy.ndimage.gaussian_filter semantics: truncate 4.0, a symmetric
     // boundary (the edge value repeats), separable passes.
@@ -329,8 +338,8 @@ pub(crate) fn gaussian_blur(image: &GrayMap, sigma: f64) -> GrayMap {
         .map(|&weight| (weight / total) as f32)
         .collect();
 
-    let width = image.width as usize;
-    let height = image.height as usize;
+    let width = width as usize;
+    let height = height as usize;
     // Horizontal pass, then vertical on the horizontal result.
     let mut horizontal = vec![0.0f32; width * height];
     for y in 0..height {
@@ -339,7 +348,7 @@ pub(crate) fn gaussian_blur(image: &GrayMap, sigma: f64) -> GrayMap {
             for (k, &weight) in kernel.iter().enumerate() {
                 let dx = k as isize - radius as isize;
                 let sx = mirror(x as isize + dx, width as isize) as usize;
-                acc += image.pixels[y * width + sx] * weight;
+                acc += pixels[y * width + sx] * weight;
             }
             horizontal[y * width + x] = acc;
         }
@@ -356,7 +365,7 @@ pub(crate) fn gaussian_blur(image: &GrayMap, sigma: f64) -> GrayMap {
             out[y * width + x] = acc;
         }
     }
-    GrayMap::new(image.width, image.height, out).expect("same rectangle")
+    out
 }
 
 /// scipy's 'reflect' boundary: the edge value repeats, so index -1 reads 0
