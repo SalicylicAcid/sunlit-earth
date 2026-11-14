@@ -9,12 +9,11 @@ use std::time::Duration;
 use tracing::info;
 
 use sunlit_core::assets::cloud_fetcher;
-use sunlit_core::assets::cloud_source::{CloudSource, HttpCloudSource};
+use sunlit_core::assets::cloud_source::{self, CloudSource};
 use sunlit_core::assets::cube_layout::CubeTextures;
-use sunlit_core::assets::eumetsat::EumetsatCloudSource;
 use sunlit_core::assets::{texture_loader, tiles};
 use sunlit_core::config::clouds::ENV_CLOUD_URL;
-use sunlit_core::config::{AppConfig, CloudSourceConfig, CloudSourceMode, QualityTier};
+use sunlit_core::config::{AppConfig, CloudSourceConfig, QualityTier};
 use sunlit_core::engine::clock::SystemClock;
 use sunlit_core::engine::wallpaper_sink::SystemWallpaper;
 use sunlit_core::engine::{EngineConfig, TileGate};
@@ -87,7 +86,8 @@ pub(crate) fn quality_tier(cli: &Cli, config: &AppConfig) -> QualityTier {
     cli.quality.map_or(config.quality_tier, QualityTier::from)
 }
 
-/// Presence-only disabling wins before any source is resolved.
+/// Presence-only disabling wins before any source is resolved. The resolution
+/// itself is the core's one implementation, shared with a runtime switch.
 fn cloud_source(
     config: &CloudSourceConfig,
     disabled: bool,
@@ -97,19 +97,9 @@ fn cloud_source(
         info!("cloud fetcher disabled (SUNLIT_EARTH_NO_CLOUDS)");
         return None;
     }
-    let effective = config.resolve(env_url);
-    match effective.mode {
-        CloudSourceMode::Remote => {
-            let source = HttpCloudSource::from_config(effective.remote);
-            info!(source = %source.describe(), "cloud source configured");
-            Some(Arc::new(source))
-        }
-        CloudSourceMode::Eumetsat => {
-            let source = EumetsatCloudSource::new(effective.eumetsat);
-            info!(source = %source.describe(), "cloud source configured");
-            Some(Arc::new(source))
-        }
-    }
+    let source = cloud_source::resolve(config, env_url);
+    info!(source = %source.describe(), "cloud source configured");
+    Some(source)
 }
 
 /// Build the engine configuration shared by every startup mode.

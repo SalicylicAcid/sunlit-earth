@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::assets::mailbox::TextureMailbox;
 use crate::assets::tiles::TranscoderConfig;
+use crate::config::CloudSourceConfig;
 use crate::config::QualityTier;
 use crate::display::layout::{self, Framing};
 use crate::params::{OutputParams, SceneParams};
@@ -359,7 +360,7 @@ impl Engine {
                 source,
                 mailbox,
                 notify,
-                Arc::clone(&cloud_generation),
+                &cloud_generation,
                 cache_dir,
                 cloud_poll_interval,
                 now,
@@ -540,6 +541,8 @@ impl Engine {
             EngineCommand::SetAutoRefresh { enabled, interval } => {
                 self.set_auto_refresh(enabled, interval);
             }
+            EngineCommand::SetCloudSource(config) => self.set_cloud_source(config.as_ref()),
+            EngineCommand::RefreshClouds => self.refresh_clouds(),
             EngineCommand::DisplaysChanged => {
                 // Trailing rather than leading: every hint pushes the deadline
                 // out, so a burst is one query at the end of it.
@@ -747,6 +750,41 @@ impl Engine {
             interval_secs = interval.as_secs(),
             "auto-refresh changed"
         );
+    }
+
+    /// Replace the cloud source the worker fetches from.
+    ///
+    /// Resolved exactly like the startup one — the environment override
+    /// forces a fixed remote URL, and the saved mode picks the native or the
+    /// remote source otherwise — so a runtime switch and a startup cannot
+    /// disagree about what a configuration means. A session with no cloud
+    /// worker was started with the layer switched off by the environment;
+    /// there is nothing to switch and the apply is refused with a log line
+    /// rather than started.
+    /// One poll now, ahead of the schedule; a busy worker owes one instead,
+    /// and the tick retries it.
+    fn refresh_clouds(&mut self) {
+        let Some(cloud) = self.cloud.as_mut() else {
+            return;
+        };
+        if !cloud.request() {
+            cloud.owed = true;
+        }
+    }
+
+    fn set_cloud_source(&mut self, config: &CloudSourceConfig) {
+        let Some(cloud) = self.cloud.as_mut() else {
+            info!("a cloud source arrived for a session without one, ignoring it");
+            return;
+        };
+        let source = crate::assets::cloud_source::resolve(
+            config,
+            crate::env_override(crate::config::clouds::ENV_CLOUD_URL).as_deref(),
+        );
+        info!(source = %source.describe(), "the cloud source is switching");
+        cloud.set_source(source);
+        // Worth a poll as soon as the worker can take one, ahead of schedule.
+        cloud.owed = true;
     }
 
     /// Run everything the schedule says is due, then render if anything changed.

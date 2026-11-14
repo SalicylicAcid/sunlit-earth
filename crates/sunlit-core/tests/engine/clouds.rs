@@ -1161,3 +1161,204 @@ fn a_wallpaper_waiting_for_the_clouds_is_made_when_the_engine_stops() {
     assert_eq!(sink.publications().len(), 1);
     source.release();
 }
+
+/// Switching the cloud source at runtime, through the real resolution path.
+///
+/// The command carries the saved configuration, and the engine resolves it
+/// with the one implementation startup uses, so what these cases prove is the
+/// whole chain: the configuration means a real HTTP source, the worker
+/// applies it between attempts, the generation moves, and the renderer shows
+/// the pair of the target in force.
+mod runtime_switch {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
+
+    use sunlit_core::config::CloudSourceConfig;
+
+    use super::*;
+
+    /// One PNG per path, distinct in size, so the memory report's cloud row
+    /// tells which source's map is on the GPU without a pixel readback.
+    fn png(width: u32, value: u8) -> Vec<u8> {
+        let img =
+            image::RgbaImage::from_pixel(width, width / 2, image::Rgba([value, value, value, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("the fixture encodes");
+        out.into_inner()
+    }
+
+    /// A local HTTP server: `/a` and `/b` serve maps of different sizes, and
+    /// `/slow` serves `/b`'s map after a delay, so a switch can be made while
+    /// a fetch is in flight. Every request is counted.
+    struct Stub {
+        addr: String,
+        requests: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl Stub {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a local listener");
+            let addr = listener
+                .local_addr()
+                .expect("the listener's address")
+                .to_string();
+            let requests = Arc::new(Mutex::new(HashMap::new()));
+            let counts = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let counts = Arc::clone(&counts);
+                    std::thread::spawn(move || handle(stream, &counts));
+                }
+            });
+            Self { addr, requests }
+        }
+
+        fn count(&self, path: &str) -> u64 {
+            self.requests
+                .lock()
+                .expect("the request counts are not poisoned")
+                .get(path)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn wait_for_request(&self, path: &str, what: &str) {
+            let deadline = std::time::Instant::now() + TIMEOUT;
+            while self.count(path) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: no request for {path} within {TIMEOUT:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.addr)
+        }
+    }
+
+    fn handle(mut stream: TcpStream, counts: &Arc<Mutex<HashMap<String, u64>>>) {
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if header == "\r\n" => break,
+                Ok(_) => {}
+            }
+        }
+        let path = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        *counts
+            .lock()
+            .expect("the request counts are not poisoned")
+            .entry(path.clone())
+            .or_insert(0) += 1;
+        let (delay, size, value) = match path.as_str() {
+            "/a" => (false, 256, 40),
+            "/slow" => (true, 384, 220),
+            _ => (false, 384, 220),
+        };
+        if delay {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        let body = png(size, value);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&body);
+    }
+
+    fn source_for(config: &CloudSourceConfig) -> Arc<dyn CloudSource> {
+        sunlit_core::assets::cloud_source::resolve(config, None)
+    }
+
+    fn config_for(url: String) -> CloudSourceConfig {
+        CloudSourceConfig {
+            remote_url: url,
+            ..CloudSourceConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_switch_between_two_sources_shows_each_map_and_back_again() {
+        let _gpu = gpu();
+        let stub = Stub::start();
+        let first = config_for(stub.url("/a"));
+        let harness = Harness::start(|config| {
+            config.cloud = Some(source_for(&first));
+        });
+        wait_for_cloud_size(&harness, (256, 128), "the first source");
+
+        harness.engine.set_cloud_source(config_for(stub.url("/b")));
+        wait_for_cloud_size(&harness, (384, 192), "the second source");
+
+        harness.engine.set_cloud_source(config_for(stub.url("/a")));
+        wait_for_cloud_size(&harness, (256, 128), "the first source again");
+    }
+
+    #[test]
+    fn refresh_clouds_fetches_ahead_of_the_schedule() {
+        let _gpu = gpu();
+        let stub = Stub::start();
+        let first = config_for(stub.url("/a"));
+        let harness = Harness::start(|config| {
+            config.cloud = Some(source_for(&first));
+        });
+        wait_for_cloud_size(&harness, (256, 128), "the first source");
+        let before = stub.count("/a");
+
+        harness.engine.refresh_clouds();
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while stub.count("/a") <= before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no refresh fetch within {TIMEOUT:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_switch_during_a_slow_fetch_lands_the_new_target_and_ignores_the_old() {
+        let _gpu = gpu();
+        let stub = Stub::start();
+        let slow = config_for(stub.url("/slow"));
+        let harness = Harness::start(|config| {
+            config.cloud = Some(source_for(&slow));
+        });
+        stub.wait_for_request("/slow", "the first poll is in flight");
+
+        harness.engine.set_cloud_source(config_for(stub.url("/b")));
+        wait_for_cloud_size(&harness, (384, 192), "the new source");
+        // Outlast the slow fetch, which returns a pair stamped with the
+        // generation the switch raised: it must not displace the new target.
+        std::thread::sleep(Duration::from_millis(700));
+        let report = harness.engine.memory_report().expect("a report");
+        let cloud = report
+            .expected
+            .iter()
+            .find(|texture| texture.label == "cloud_texture")
+            .expect("the cloud texture is resident");
+        assert_eq!(
+            (cloud.width, cloud.height),
+            (384, 192),
+            "the superseded fetch must not take the target back"
+        );
+    }
+}

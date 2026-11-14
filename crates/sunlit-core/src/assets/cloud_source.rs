@@ -3,6 +3,7 @@
 //! The engine talks to a `CloudSource` rather than to HTTP directly, so tests
 //! can publish frames on a simulated schedule without a network or a server.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use tracing::info;
 
 use super::cloud_fetcher::cloud_variant;
 use crate::config::CloudSourceConfig;
+use crate::config::CloudSourceMode;
 use crate::config::clouds::{DEFAULT_REMOTE_URL, ENV_CLOUD_URL, RemoteCloudUrl};
 
 /// One fetched cloud image plus the freshness metadata that came with it.
@@ -104,6 +106,21 @@ impl CloudWait {
 pub struct CloudTarget {
     pub cache_key: String,
     pub wait: CloudWait,
+}
+
+/// Resolve a persisted cloud source into the runtime source, the way the
+/// startup and a runtime switch both do: the environment override forces a
+/// fixed remote URL, and the saved mode picks the native or the remote source
+/// otherwise. One implementation, so neither path can grow its own opinion of
+/// what a configuration means.
+pub fn resolve(config: &CloudSourceConfig, env_url: Option<&str>) -> Arc<dyn CloudSource> {
+    let effective = config.resolve(env_url);
+    match effective.mode {
+        CloudSourceMode::Remote => Arc::new(HttpCloudSource::from_config(effective.remote)),
+        CloudSourceMode::Eumetsat => Arc::new(super::eumetsat::EumetsatCloudSource::new(
+            effective.eumetsat,
+        )),
+    }
 }
 
 impl CloudTarget {

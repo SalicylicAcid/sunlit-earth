@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
+use crate::config::CloudSourceConfig;
 use crate::memory_report::MemoryReport;
 use crate::params::SceneParams;
 
@@ -73,6 +74,15 @@ pub enum EngineCommand {
     },
     /// Turn the unattended wallpaper refresh on or off.
     SetAutoRefresh { enabled: bool, interval: Duration },
+    /// Replace the cloud source at runtime, resolved the way the startup one
+    /// is: the environment override forces a fixed remote URL, and the saved
+    /// mode picks the native or the remote source otherwise. A session with no
+    /// cloud worker (the layer switched off by the environment) has nothing to
+    /// switch and ignores this.
+    SetCloudSource(Box<CloudSourceConfig>),
+    /// Ask the cloud worker for one poll now, ahead of its schedule. A worker
+    /// still busy with the previous poll owes one instead.
+    RefreshClouds,
     /// Replace the mode and the anchor a wallpaper is planned with.
     ///
     /// Not part of `UpdateParams` for the same reason `SetTextureResolution` is

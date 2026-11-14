@@ -186,6 +186,17 @@ impl EngineHandle {
         self.tx.clone()
     }
 
+    /// Replace the cloud source at runtime, resolved on the engine thread the
+    /// way the startup one is. A session with no cloud worker ignores it.
+    pub fn set_cloud_source(&self, config: crate::config::CloudSourceConfig) {
+        self.send(EngineCommand::SetCloudSource(Box::new(config)));
+    }
+
+    /// Ask the cloud worker for one poll now, ahead of its schedule.
+    pub fn refresh_clouds(&self) {
+        self.send(EngineCommand::RefreshClouds);
+    }
+
     /// Description of the selected GPU adapter, for the UI's renderer label.
     pub fn adapter_info(&self) -> &str {
         &self.adapter.info
