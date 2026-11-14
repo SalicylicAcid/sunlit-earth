@@ -11,7 +11,10 @@ use tracing::warn;
 use crate::scene::camera::{CAMERA_FOV_MAX, CAMERA_FOV_MIN, CameraParams};
 use crate::scene::scene_time::SceneTime;
 
+pub mod clouds;
 mod migrate;
+
+pub use clouds::{CloudSourceConfig, CloudSourceMode, EumetsatSettings};
 mod window_geometry;
 
 use migrate::{CONFIG_VERSION, Migrated, migrate};
@@ -261,6 +264,8 @@ pub struct AppConfig {
     pub fresnel_exp: f32,
 
     // Clouds
+    #[serde(deserialize_with = "CloudSourceConfig::deserialize_value")]
+    pub cloud_source: CloudSourceConfig,
     pub clouds_enabled: bool,
     pub cloud_opacity: f32,
     pub cloud_opacity_night: f32,
@@ -492,6 +497,7 @@ impl Default for AppConfig {
             spec_intensity: 0.17,
             fresnel_mix: 0.75,
             fresnel_exp: 4.0,
+            cloud_source: CloudSourceConfig::default(),
             clouds_enabled: true,
             cloud_opacity: 0.85,
             cloud_opacity_night: 0.45,
@@ -765,6 +771,84 @@ mod tests {
         let _ = load_config();
     }
 
+    #[test]
+    fn cloud_source_old_files_default_without_a_schema_bump() {
+        let scratch = ScratchDir::new("cloud_source_old");
+        let path = scratch.join("config.toml");
+        fs::write(&path, "version = 4\n[sunlit.earth]\nlongitude = 42.0\n").unwrap();
+        let config = load_and_upgrade(&path);
+        assert_relative_eq!(config.longitude, 42.0);
+        let saved = toml::Value::try_from(&config).unwrap();
+        assert_eq!(saved["cloud_source"]["mode"].as_str(), Some("remote"));
+        assert_eq!(
+            saved["cloud_source"]["remote_url"].as_str(),
+            Some("https://clouds.matteason.co.uk/images/{size}/clouds.jpg")
+        );
+        assert_eq!(CONFIG_VERSION, 4);
+        assert!(!backup_path(&path, 4).exists());
+    }
+
+    #[test]
+    fn cloud_source_round_trips_both_modes_and_all_parameters() {
+        for mode in ["remote", "eumetsat"] {
+            let scratch = ScratchDir::new("cloud_source_roundtrip");
+            let path = scratch.join("config.toml");
+            let source = format!(
+                "mode = '{mode}'\nremote_url = 'https://example.org/{{size}}.jpg?token=secret'\n[eumetsat]\nfloor = 61\nceiling = 179\ngamma = 0.7\nblur = 1.5\n"
+            );
+            let text = format!(
+                "version = 4\n[sunlit.earth]\nlongitude = 42.0\n[sunlit.earth.cloud_source]\n{}",
+                source.replace("[eumetsat]", "[sunlit.earth.cloud_source.eumetsat]")
+            );
+            fs::write(&path, text).unwrap();
+            let config = load_config_from(&path);
+            let saved = toml::Value::try_from(&config).unwrap();
+            assert_eq!(
+                saved.get("cloud_source"),
+                Some(&toml::from_str::<toml::Value>(&source).unwrap())
+            );
+            save_config_to(&config, &path);
+            assert_eq!(load_config_from(&path), config);
+        }
+    }
+
+    #[test]
+    fn cloud_source_invalid_subtables_restore_only_the_source() {
+        let scratch = ScratchDir::new("cloud_source_invalid");
+        let path = scratch.join("config.toml");
+        for source in [
+            "cloud_source = 1",
+            "[cloud_source]\nmode = 'future'",
+            "[cloud_source]\nremote_url = 123",
+            "[cloud_source]\nremote_url = 'https://user:secret@example.org/map'",
+            "[cloud_source]\nremote_url = 'https://example.org/{unknown}'",
+            "[cloud_source.eumetsat]\nfloor = -1",
+            "[cloud_source.eumetsat]\nfloor = 180\nceiling = 180",
+            "[cloud_source.eumetsat]\nceiling = 256",
+            "[cloud_source.eumetsat]\ngamma = nan",
+            "[cloud_source.eumetsat]\ngamma = inf",
+            "[cloud_source.eumetsat]\ngamma = 0.09",
+            "[cloud_source.eumetsat]\ngamma = 4.01",
+            "[cloud_source.eumetsat]\nblur = -0.1",
+            "[cloud_source.eumetsat]\nblur = 10.1",
+            "[cloud_source.eumetsat]\nblur = inf",
+        ] {
+            let source = source.replace("[cloud_source", "[sunlit.earth.cloud_source");
+            fs::write(&path, format!("version = 4\n[sunlit.earth]\nlongitude = 42.0\ntexture_resolution = 2048\n{source}\n")).unwrap();
+            let config = load_config_from(&path);
+            assert_relative_eq!(config.longitude, 42.0);
+            assert_eq!(config.texture_resolution, 2048);
+            let saved = toml::Value::try_from(&config).unwrap();
+            let defaults = toml::Value::try_from(AppConfig::default()).unwrap();
+            assert!(saved.get("cloud_source").is_some());
+            assert_eq!(
+                saved.get("cloud_source"),
+                defaults.get("cloud_source"),
+                "{source}"
+            );
+        }
+    }
+
     // --- AppConfig defaults and serde ---
 
     #[test]
@@ -878,6 +962,7 @@ mod tests {
             spec_intensity: 0.6,
             fresnel_mix: 0.5,
             fresnel_exp: 3.0,
+            cloud_source: CloudSourceConfig::default(),
             clouds_enabled: false,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.45,
@@ -1125,6 +1210,7 @@ sky_fov = 111.0
             spec_intensity: 0.8,
             fresnel_mix: 0.7,
             fresnel_exp: 4.0,
+            cloud_source: CloudSourceConfig::default(),
             clouds_enabled: false,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.95,

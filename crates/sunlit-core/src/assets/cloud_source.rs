@@ -7,7 +7,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tracing::info;
+
+use super::cloud_fetcher::cloud_variant;
+use crate::config::CloudSourceConfig;
+use crate::config::clouds::{DEFAULT_REMOTE_URL, ENV_CLOUD_URL, RemoteCloudUrl};
 
 /// One fetched cloud image plus the freshness metadata that came with it.
 pub struct CloudImage {
@@ -78,11 +83,81 @@ impl std::ops::Deref for Download {
     }
 }
 
+/// Metadata for a source's startup wait; consumers opt in separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloudWait {
+    Existing,
+    LongFetch,
+}
+
+impl CloudWait {
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Existing => Duration::from_secs(60),
+            Self::LongFetch => Duration::from_mins(16),
+        }
+    }
+}
+
+/// Identity of the image prepared for the next poll. No URL secrets in the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudTarget {
+    pub cache_key: String,
+    pub wait: CloudWait,
+}
+
+impl CloudTarget {
+    fn remote(url: &str, legacy_template: bool) -> Self {
+        // Only the exact original template may reuse a pre-source cache entry.
+        let legacy = legacy_template
+            .then(|| {
+                crate::config::TEXTURE_RESOLUTIONS
+                    .iter()
+                    .find_map(|&width| {
+                        let (w, h) = cloud_variant(width);
+                        let size = format!("{w}x{h}");
+                        (url == DEFAULT_REMOTE_URL.replace("{size}", &size))
+                            .then(|| format!("clouds_cache_{size}"))
+                    })
+            })
+            .flatten();
+        Self {
+            cache_key: legacy.unwrap_or_else(|| {
+                use std::fmt::Write;
+                let mut key = "clouds_cache_url_".to_owned();
+                for byte in Sha256::digest(url.as_bytes()) {
+                    let _ = write!(key, "{byte:02x}");
+                }
+                key
+            }),
+            wait: CloudWait::Existing,
+        }
+    }
+}
+
+fn prepare_remote(remote: &RemoteCloudUrl, resolution: u32) -> (String, CloudTarget) {
+    let (w, h) = cloud_variant(resolution);
+    let url = remote.expand(&format!("{w}x{h}"));
+    let target = CloudTarget::remote(&url, remote.is_default_template());
+    (url, target)
+}
+
 /// A source of equirectangular cloud imagery.
 ///
 /// Implementations must be cheap to call when nothing has changed: the engine
 /// polls on a schedule and expects `None` most of the time.
 pub trait CloudSource: Send + Sync {
+    /// Select the image and cache identity before polling. The default keeps
+    /// URL-driven fixtures following the original service (and env override);
+    /// fixed fixtures can continue to ignore `retarget`.
+    fn prepare(&self, resolution: u32) -> CloudTarget {
+        let effective =
+            CloudSourceConfig::default().resolve(crate::env_override(ENV_CLOUD_URL).as_deref());
+        let (url, target) = prepare_remote(&effective.remote, resolution);
+        self.retarget(&url);
+        target
+    }
+
     /// Fetch the current image if it differs from `known_etag`.
     ///
     /// Returns `Ok(None)` when the source is unchanged.
@@ -108,6 +183,8 @@ pub struct HttpCloudSource {
     /// Behind a lock because [`CloudSource::retarget`] moves it while the
     /// worker thread owns the only handle.
     url: Mutex<String>,
+    /// Kept intact when a resolution expands a new request URL.
+    configured: Option<RemoteCloudUrl>,
 }
 
 impl HttpCloudSource {
@@ -121,7 +198,16 @@ impl HttpCloudSource {
         Self {
             agent,
             url: Mutex::new(url),
+            configured: None,
         }
+    }
+
+    /// Construct a source from the validated runtime remote selection.
+    pub fn from_config(remote: RemoteCloudUrl) -> Self {
+        let (url, _) = prepare_remote(&remote, crate::config::DEFAULT_TEXTURE_RESOLUTION);
+        let mut source = Self::new(url);
+        source.configured = Some(remote);
+        source
     }
 
     /// The URL as of right now.
@@ -140,26 +226,26 @@ impl HttpCloudSource {
     ///
     /// Returns `Ok(true)` if unchanged (304), `Ok(false)` if new content is
     /// available (200), or `Err` on transport/server errors.
-    #[tracing::instrument(skip(self), fields(etag = %etag))]
-    fn check_freshness(&self, etag: &str) -> Result<bool, String> {
+    #[tracing::instrument(skip_all)]
+    fn check_freshness(&self, url: &str, etag: &str) -> Result<bool, String> {
         let response = self
             .agent
-            .head(&self.url())
+            .head(url)
             .header("If-None-Match", etag)
             .call()
-            .map_err(|e| format!("Cloud freshness check failed: {e}"))?;
+            .map_err(|_| "Cloud freshness check failed (transport or HTTP status)".to_owned())?;
 
         Ok(response.status().as_u16() == 304)
     }
 
     /// Download the cloud image unconditionally.
-    #[tracing::instrument(skip(self))]
-    fn download(&self) -> Result<CloudImage, String> {
+    #[tracing::instrument(skip_all)]
+    fn download(&self, url: &str) -> Result<CloudImage, String> {
         let mut response = self
             .agent
-            .get(&self.url())
+            .get(url)
             .call()
-            .map_err(|e| format!("Cloud download failed: {e}"))?;
+            .map_err(|_| "Cloud download failed (transport or HTTP status)".to_owned())?;
 
         let header = |name: &str| {
             response
@@ -177,7 +263,7 @@ impl HttpCloudSource {
             .with_config()
             .limit(50 * 1024 * 1024)
             .read_to_vec()
-            .map_err(|e| format!("Failed to read cloud image body: {e}"))?;
+            .map_err(|_| "Failed to read cloud image body".to_owned())?;
 
         Ok(CloudImage {
             bytes: Download::new(bytes),
@@ -188,9 +274,20 @@ impl HttpCloudSource {
 }
 
 impl CloudSource for HttpCloudSource {
+    fn prepare(&self, resolution: u32) -> CloudTarget {
+        if let Some(remote) = &self.configured {
+            let (url, target) = prepare_remote(remote, resolution);
+            self.retarget(&url);
+            target
+        } else {
+            CloudTarget::remote(&self.url(), false)
+        }
+    }
+
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
+        let url = self.url();
         if let Some(etag) = known_etag {
-            if self.check_freshness(etag)? {
+            if self.check_freshness(&url, etag)? {
                 info!("cloud image unchanged (304 Not Modified)");
                 return Ok(None);
             }
@@ -198,11 +295,21 @@ impl CloudSource for HttpCloudSource {
         } else {
             info!("no cached cloud ETag, downloading");
         }
-        self.download().map(Some)
+        self.download(&url).map(Some)
     }
 
     fn describe(&self) -> String {
-        self.url()
+        let url = self.url();
+        if url
+            .parse::<ureq::http::Uri>()
+            .ok()
+            .and_then(|uri| uri.authority().cloned())
+            .is_none_or(|authority| authority.as_str().contains('@'))
+            || url.contains('#')
+        {
+            return "remote cloud image".to_owned();
+        }
+        url.split('?').next().unwrap_or_default().to_owned()
     }
 
     fn retarget(&self, url: &str) {
@@ -212,5 +319,143 @@ impl CloudSource for HttpCloudSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         current.clear();
         current.push_str(url);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, OnceLock};
+    use ureq::http::{Method, Request, Response};
+    use ureq::middleware::MiddlewareNext;
+    use ureq::{Body, SendBody};
+
+    #[test]
+    fn templates_survive_multiple_resolution_changes_and_default_keys_stay_compatible() {
+        let config = CloudSourceConfig {
+            remote_url: "https://example.org/{size}/map?size={size}&token=secret".to_owned(),
+            ..CloudSourceConfig::default()
+        };
+        let source = HttpCloudSource::from_config(config.resolve(None).remote);
+        let wide = source.prepare(8192);
+        assert_eq!(
+            source.url(),
+            "https://example.org/8192x4096/map?size=8192x4096&token=secret"
+        );
+        let narrow = source.prepare(2048);
+        assert_eq!(
+            source.url(),
+            "https://example.org/2048x1024/map?size=2048x1024&token=secret"
+        );
+        assert_ne!(wide.cache_key, narrow.cache_key);
+        assert!(!wide.cache_key.contains("secret"));
+        assert_eq!(source.prepare(8192), wide);
+        let restarted = HttpCloudSource::from_config(config.resolve(None).remote);
+        assert_eq!(restarted.prepare(2048), narrow);
+        let default =
+            HttpCloudSource::from_config(CloudSourceConfig::default().resolve(None).remote);
+        for width in crate::config::TEXTURE_RESOLUTIONS {
+            assert_eq!(
+                default.prepare(width).cache_key,
+                format!("clouds_cache_{width}x{}", width / 2)
+            );
+            let fixed = HttpCloudSource::new(default.url());
+            assert_ne!(
+                fixed.prepare(width).cache_key,
+                default.prepare(width).cache_key
+            );
+        }
+        assert_eq!(wide.wait, CloudWait::Existing);
+        assert_eq!(CloudWait::Existing.duration(), Duration::from_secs(60));
+        assert_eq!(CloudWait::LongFetch.duration(), Duration::from_mins(16));
+    }
+
+    #[test]
+    fn a_query_at_sign_is_not_userinfo_and_its_token_is_hidden() {
+        let source = HttpCloudSource::new(
+            "https://example.org/map?mail=user@example.org&token=secret".to_owned(),
+        );
+        assert_eq!(source.describe(), "https://example.org/map");
+    }
+
+    #[test]
+    fn description_hides_query_and_invalid_credentials() {
+        let source =
+            HttpCloudSource::new("https://example.org/map.jpg?token=secret&key=hidden".to_owned());
+        assert_eq!(source.describe(), "https://example.org/map.jpg");
+        source.retarget("https://user:secret@example.org/map.jpg#hidden");
+        let description = source.describe();
+        assert!(!description.contains("secret") && !description.contains("hidden"));
+    }
+
+    #[test]
+    fn head_and_get_use_one_url_snapshot_even_when_retargeted() {
+        let holder: Arc<OnceLock<std::sync::Weak<HttpCloudSource>>> = Arc::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let source_ref = Arc::clone(&holder);
+        let log = Arc::clone(&requests);
+        let agent = ureq::Agent::config_builder()
+            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                log.lock()
+                    .unwrap()
+                    .push((req.method().clone(), req.uri().to_string()));
+                if req.method() == Method::HEAD {
+                    assert_eq!(req.headers()["If-None-Match"], "old");
+                    source_ref
+                        .get()
+                        .unwrap()
+                        .upgrade()
+                        .unwrap()
+                        .retarget("https://example.org/new.jpg?token=new");
+                }
+                Ok(Response::builder()
+                    .status(200)
+                    .header("ETag", "fresh")
+                    .body(Body::builder().data(b"image".to_vec()))
+                    .unwrap())
+            })
+            .build()
+            .new_agent();
+        let mut source = HttpCloudSource::new("https://example.org/old.jpg?token=old".to_owned());
+        source.agent = agent;
+        let source = Arc::new(source);
+        holder.set(Arc::downgrade(&source)).unwrap();
+        let image = source.fetch_if_changed(Some("old")).unwrap().unwrap();
+        assert_eq!(image.etag.as_deref(), Some("fresh"));
+        assert_eq!(&*image.bytes, b"image");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                (
+                    Method::HEAD,
+                    "https://example.org/old.jpg?token=old".to_owned()
+                ),
+                (
+                    Method::GET,
+                    "https://example.org/old.jpg?token=old".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(source.url(), "https://example.org/new.jpg?token=new");
+    }
+
+    #[test]
+    fn transport_errors_do_not_echo_secret_urls() {
+        let agent = ureq::Agent::config_builder()
+            .middleware(|_: Request<SendBody>, _: MiddlewareNext| {
+                Err(ureq::Error::Io(std::io::Error::other(
+                    "https://example.org/map?token=secret",
+                )))
+            })
+            .build()
+            .new_agent();
+        let mut source = HttpCloudSource::new("https://example.org/map?token=secret".to_owned());
+        source.agent = agent;
+        for etag in [None, Some("old")] {
+            let Err(error) = source.fetch_if_changed(etag) else {
+                panic!("expected a transport failure")
+            };
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 }

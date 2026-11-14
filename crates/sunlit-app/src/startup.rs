@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use sunlit_core::assets::cloud_fetcher;
-use sunlit_core::assets::cloud_source::HttpCloudSource;
+use sunlit_core::assets::cloud_source::{CloudSource, HttpCloudSource};
 use sunlit_core::assets::cube_layout::CubeTextures;
 use sunlit_core::assets::{texture_loader, tiles};
-use sunlit_core::config::{AppConfig, QualityTier};
+use sunlit_core::config::clouds::ENV_CLOUD_URL;
+use sunlit_core::config::{AppConfig, CloudSourceConfig, CloudSourceMode, QualityTier};
 use sunlit_core::engine::clock::SystemClock;
 use sunlit_core::engine::wallpaper_sink::SystemWallpaper;
 use sunlit_core::engine::{EngineConfig, TileGate};
@@ -85,6 +86,32 @@ pub(crate) fn quality_tier(cli: &Cli, config: &AppConfig) -> QualityTier {
     cli.quality.map_or(config.quality_tier, QualityTier::from)
 }
 
+/// Presence-only disabling wins before any source is resolved.
+fn cloud_source(
+    config: &CloudSourceConfig,
+    disabled: bool,
+    env_url: Option<&str>,
+) -> Option<Arc<dyn CloudSource>> {
+    if disabled {
+        info!("cloud fetcher disabled (SUNLIT_EARTH_NO_CLOUDS)");
+        return None;
+    }
+    let effective = config.resolve(env_url);
+    match effective.mode {
+        CloudSourceMode::Remote => {
+            let source = HttpCloudSource::from_config(effective.remote);
+            info!(source = %source.describe(), "cloud source configured");
+            Some(Arc::new(source))
+        }
+        CloudSourceMode::Eumetsat => {
+            // Step 2 connects the native source here, using effective.eumetsat.
+            // Until then, never substitute remote imagery for a native choice.
+            warn!("EUMETSAT cloud source is not connected yet; cloud fetching disabled");
+            None
+        }
+    }
+}
+
 /// Build the engine configuration shared by every startup mode.
 pub(crate) fn engine_config(
     cli: &Cli,
@@ -96,16 +123,11 @@ pub(crate) fn engine_config(
     info!(?quality, "quality tier");
     let texture_resolution = effective_texture_resolution(cli, config);
 
-    // Skip cloud fetching entirely when SUNLIT_EARTH_NO_CLOUDS is set; e2e
-    // tests use it to keep the network out of the picture.
-    let cloud = if std::env::var("SUNLIT_EARTH_NO_CLOUDS").is_ok() {
-        info!("cloud fetcher disabled (SUNLIT_EARTH_NO_CLOUDS)");
-        None
-    } else {
-        let url = cloud_fetcher::cloud_url(texture_resolution);
-        info!(url = %url, "cloud source configured");
-        Some(Arc::new(HttpCloudSource::new(url)) as Arc<_>)
-    };
+    let cloud = cloud_source(
+        &config.cloud_source,
+        std::env::var("SUNLIT_EARTH_NO_CLOUDS").is_ok(),
+        sunlit_core::env_override(ENV_CLOUD_URL).as_deref(),
+    );
 
     let textures = resolve_textures(cli.textures_dir.as_deref());
     EngineConfig {
@@ -143,6 +165,49 @@ pub(crate) fn engine_config(
 mod tests {
     use super::*;
     use crate::test_support::ScratchDir;
+
+    #[test]
+    fn saved_remote_source_and_runtime_override_reach_startup() {
+        use sunlit_core::config::{CloudSourceConfig, CloudSourceMode};
+        let saved = CloudSourceConfig {
+            remote_url: "https://saved.org/{size}/map?token=saved".to_owned(),
+            ..CloudSourceConfig::default()
+        };
+        let source = cloud_source(&saved, false, None).unwrap();
+        source.prepare(2048);
+        assert_eq!(source.describe(), "https://saved.org/2048x1024/map");
+        source.prepare(8192);
+        assert_eq!(source.describe(), "https://saved.org/8192x4096/map");
+        let native = CloudSourceConfig {
+            mode: CloudSourceMode::Eumetsat,
+            ..saved.clone()
+        };
+        assert!(
+            cloud_source(&native, false, None).is_none(),
+            "native source is not silently replaced before step 2"
+        );
+        let source = cloud_source(
+            &native,
+            false,
+            Some("https://override.org/map?token=override"),
+        )
+        .unwrap();
+        let key = source.prepare(8192).cache_key;
+        assert_eq!(source.prepare(2048).cache_key, key);
+        assert_eq!(source.describe(), "https://override.org/map");
+        assert!(cloud_source(&native, true, Some("https://override.org/map")).is_none());
+        for invalid in [
+            "",
+            " ",
+            "file:///invalid",
+            "https://user:secret@example.org/map",
+        ] {
+            let source = cloud_source(&saved, false, Some(invalid)).unwrap();
+            source.prepare(2048);
+            assert_eq!(source.describe(), "https://saved.org/2048x1024/map");
+        }
+        assert_eq!(saved.remote_url, "https://saved.org/{size}/map?token=saved");
+    }
 
     /// A pointer file exists, so `exists()` is not the question to ask.
     #[test]

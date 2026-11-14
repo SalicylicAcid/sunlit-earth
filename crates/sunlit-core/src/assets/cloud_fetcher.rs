@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::config::{DEFAULT_TEXTURE_RESOLUTION, TEXTURE_RESOLUTIONS};
 
 use super::cloud_haze;
-use super::cloud_source::{CloudSource, Download};
+use super::cloud_source::{CloudSource, CloudTarget, Download};
 use super::mailbox::{DecodedTextureMessage, TextureMailbox};
 use super::texture_loader::{self, Channels, DecodedImage, Pixels};
 
@@ -37,10 +37,6 @@ pub(crate) fn no_notify() -> NotifyFn {
     Arc::new(|| {})
 }
 
-/// Base of the upstream cloud service. The path segment before `clouds.jpg`
-/// selects the resolution variant, which is how the texture resolution setting
-/// gets a cheaper download without any new asset work.
-const CLOUD_URL_TEMPLATE: &str = "https://clouds.matteason.co.uk/images/{size}/clouds.jpg";
 const POLL_INTERVAL: Duration = Duration::from_hours(1);
 /// First delay after a failed poll. Doubles up to [`MAX_RETRY_DELAY`].
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(15);
@@ -86,8 +82,6 @@ impl Default for RetryBackoff {
     }
 }
 
-/// Environment variable overriding the cloud image URL.
-const ENV_CLOUD_URL: &str = "SUNLIT_EARTH_CLOUD_URL";
 /// Environment variable overriding the poll interval, in seconds.
 const ENV_POLL_SECS: &str = "SUNLIT_EARTH_CLOUD_POLL_SECS";
 
@@ -116,22 +110,6 @@ pub(crate) fn cloud_variant(resolution: u32) -> (u32, u32) {
         .or_else(|| TEXTURE_RESOLUTIONS.iter().copied().min())
         .unwrap_or(DEFAULT_TEXTURE_RESOLUTION);
     (width, width / 2)
-}
-
-/// The upstream URL for a texture resolution's image variant.
-fn variant_cloud_url(resolution: u32) -> String {
-    let (w, h) = cloud_variant(resolution);
-    CLOUD_URL_TEMPLATE.replace("{size}", &format!("{w}x{h}"))
-}
-
-/// Resolve the cloud image URL: the environment override wins over the variant.
-fn resolve_cloud_url(raw: Option<&str>, resolution: u32) -> String {
-    raw.map_or_else(|| variant_cloud_url(resolution), ToOwned::to_owned)
-}
-
-/// The cloud image URL for `resolution`, honoring `SUNLIT_EARTH_CLOUD_URL`.
-pub fn cloud_url(resolution: u32) -> String {
-    resolve_cloud_url(crate::env_override(ENV_CLOUD_URL).as_deref(), resolution)
 }
 
 /// Resolve the poll interval from an optional environment override.
@@ -273,18 +251,10 @@ pub(crate) struct CloudUpdater {
     notify: NotifyFn,
     slots: CloudSlots,
     cache_dir: Option<PathBuf>,
-    /// Whether `SUNLIT_EARTH_CLOUD_URL` is in force, which decides what the
-    /// cache entry is named after. Read once: the environment does not change
-    /// under a running process.
-    overridden: bool,
-    /// Which image variant is being fetched, and which cache entry belongs to
-    /// it. Follows the texture resolution through [`Self::set_resolution`].
+    /// Avoid preparing the same offered resolution on every worker poll.
     variant: (u32, u32),
-    /// The URL the source is pointed at, which is what actually decides both
-    /// the bytes and the cache entry. Kept because the variant alone cannot
-    /// answer whether a switch changes anything: under the environment override
-    /// every variant resolves to the same URL.
-    url: String,
+    /// The source, not this updater, owns URL resolution and cache identity.
+    target: CloudTarget,
     image_path: Option<PathBuf>,
     meta_path: Option<PathBuf>,
     cached_meta: Option<CacheMeta>,
@@ -295,24 +265,6 @@ pub(crate) struct CloudUpdater {
     /// Whether a download that has come back is still wanted, read between the
     /// download and its decode. `None` wants every one.
     gate: Option<Arc<AtomicBool>>,
-}
-
-/// What a cache entry is named after.
-///
-/// The variant, so that a resolution switch can never be answered with the
-/// previous variant's bytes and a switch back finds what it left behind. An
-/// entry a run at another resolution wrote is dead weight this one never reads,
-/// which is also what makes the change safe to roll back.
-///
-/// `SUNLIT_EARTH_CLOUD_URL` wins over the variant, and what it serves has no
-/// variant at all, so its bytes get an entry of their own rather than a name
-/// claiming a size nobody checked.
-fn cache_stem(variant: (u32, u32), overridden: bool) -> String {
-    if overridden {
-        return "clouds_cache_override".to_owned();
-    }
-    let (width, height) = variant;
-    format!("clouds_cache_{width}x{height}")
 }
 
 /// Where a cache entry's JPEG and its metadata sidecar live.
@@ -338,11 +290,8 @@ impl CloudUpdater {
         resolution: u32,
     ) -> Self {
         let variant = cloud_variant(resolution);
-        let url = cloud_url(resolution);
-        source.retarget(&url);
-        let overridden = crate::env_override(ENV_CLOUD_URL).is_some();
-        let (image_path, meta_path) =
-            cache_paths(cache_dir.as_deref(), &cache_stem(variant, overridden));
+        let target = source.prepare(resolution);
+        let (image_path, meta_path) = cache_paths(cache_dir.as_deref(), &target.cache_key);
         let cached_meta = meta_path.as_ref().and_then(|p| load_cache_meta(p));
         Self {
             source,
@@ -350,9 +299,8 @@ impl CloudUpdater {
             notify,
             slots,
             cache_dir,
-            overridden,
             variant,
-            url,
+            target,
             image_path,
             meta_path,
             cached_meta,
@@ -382,22 +330,20 @@ impl CloudUpdater {
         }
         self.variant = variant;
 
-        let url = cloud_url(resolution);
-        if url == self.url {
-            // `SUNLIT_EARTH_CLOUD_URL` is in force, so the variant selected
-            // nothing: the same image is served either way, and moving the
-            // cache entry or dropping the ETag would only cost a re-download of
-            // bytes already in hand.
+        let target = self.source.prepare(resolution);
+        let changed = target.cache_key != self.target.cache_key;
+        self.target = target;
+        if !changed {
+            // A fixed URL keeps its image, in-memory ETag and cache entry.
             return false;
         }
-        self.url = url;
-        info!(url = %self.url, resolution, "cloud variant follows the texture resolution");
-        self.source.retarget(&self.url);
-
-        let (image_path, meta_path) = cache_paths(
-            self.cache_dir.as_deref(),
-            &cache_stem(variant, self.overridden),
+        info!(
+            resolution,
+            "cloud source target follows the texture resolution"
         );
+
+        let (image_path, meta_path) =
+            cache_paths(self.cache_dir.as_deref(), &self.target.cache_key);
         self.image_path = image_path;
         self.meta_path = meta_path;
         self.cached_meta = self.meta_path.as_ref().and_then(|p| load_cache_meta(p));
@@ -559,7 +505,26 @@ impl CloudUpdater {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cloud_source::HttpCloudSource;
     use super::*;
+    use crate::config::CloudSourceConfig;
+
+    fn resolve_cloud_url(raw: Option<&str>, resolution: u32) -> String {
+        let remote = CloudSourceConfig::default().resolve(raw).remote;
+        let (w, h) = cloud_variant(resolution);
+        remote.expand(&format!("{w}x{h}"))
+    }
+
+    fn variant_cloud_url(resolution: u32) -> String {
+        let (w, h) = cloud_variant(resolution);
+        format!("https://clouds.matteason.co.uk/images/{w}x{h}/clouds.jpg")
+    }
+
+    fn remote_cache_key(resolution: u32, override_url: Option<&str>) -> String {
+        HttpCloudSource::from_config(CloudSourceConfig::default().resolve(override_url).remote)
+            .prepare(resolution)
+            .cache_key
+    }
     use crate::test_support::ScratchDir;
 
     #[test]
@@ -653,6 +618,121 @@ mod tests {
     }
 
     #[test]
+    fn invalid_environment_urls_fall_back_without_expanding_templates() {
+        for raw in [
+            "",
+            "  ",
+            " https://example.org/map",
+            "https://example.org/map ",
+            "ftp://example.org/map",
+            "//example.org/map",
+            "https:///map",
+            "https://u:secret@example.org/map",
+            "https://example.org/map#secret",
+            "https://example.org/{size}",
+            "https://example.org:bad/map",
+            "https://example.org:65536/map",
+            "https://example.org/a b",
+            "https://example.org/map?token=a\nb",
+        ] {
+            assert_eq!(
+                resolve_cloud_url(Some(raw), 4096),
+                variant_cloud_url(4096),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixed_http_source_is_not_retargeted_or_given_the_legacy_cache() {
+        use super::super::cloud_source::HttpCloudSource;
+        let scratch = ScratchDir::new("cloud_fixed_cache");
+        let source = Arc::new(HttpCloudSource::new(
+            "https://example.org/map?token=one".to_owned(),
+        ));
+        let mailbox = TextureMailbox::new(SLOT_COUNT);
+        let mut updater = CloudUpdater::new(
+            Arc::clone(&source) as Arc<dyn CloudSource>,
+            mailbox.clone(),
+            no_notify(),
+            SLOTS,
+            Some(scratch.path().to_path_buf()),
+            8192,
+        );
+        assert_eq!(source.describe(), "https://example.org/map");
+        let image_path = updater.image_path.clone();
+        assert_ne!(image_path, Some(scratch.join("clouds_cache_8192x4096.jpg")));
+        assert_ne!(image_path, Some(scratch.join("clouds_cache_override.jpg")));
+        updater.cached_meta = Some(CacheMeta {
+            etag: Some("kept".to_owned()),
+            last_modified: None,
+        });
+        assert!(!updater.set_resolution(2048));
+        assert_eq!(updater.image_path, image_path);
+        assert_eq!(
+            updater.cached_meta.as_ref().unwrap().etag.as_deref(),
+            Some("kept")
+        );
+        assert!(mailbox.take_all().is_empty());
+    }
+
+    #[test]
+    fn custom_urls_never_read_another_sources_cache_or_legacy_override() {
+        use super::super::cloud_source::HttpCloudSource;
+        let scratch = ScratchDir::new("cloud_cache_identity");
+        let mailbox = TextureMailbox::new(SLOT_COUNT);
+        for name in [
+            "clouds_cache_override",
+            "clouds_cache",
+            "clouds_cache_8192x4096",
+        ] {
+            save_cache_image(
+                &ScriptedSource::new().jpeg,
+                &scratch.join(&format!("{name}.jpg")),
+            );
+            save_cache_meta(
+                &CacheMeta {
+                    etag: Some("foreign".to_owned()),
+                    last_modified: None,
+                },
+                &scratch.join(&format!("{name}_meta.toml")),
+            );
+        }
+        let make = |url: &str| {
+            CloudUpdater::new(
+                Arc::new(HttpCloudSource::new(url.to_owned())),
+                mailbox.clone(),
+                no_notify(),
+                SLOTS,
+                Some(scratch.path().to_path_buf()),
+                8192,
+            )
+        };
+        let first = make("https://example.org/clouds?token=one");
+        assert!(!first.post_cached());
+        assert!(first.cached_meta.is_none());
+        save_cache_image(
+            &ScriptedSource::new().jpeg,
+            first.image_path.as_deref().unwrap(),
+        );
+        save_cache_meta(
+            &CacheMeta {
+                etag: Some("one".to_owned()),
+                last_modified: None,
+            },
+            first.meta_path.as_deref().unwrap(),
+        );
+        let second = make("https://example.org/clouds?token=two");
+        assert_ne!(first.image_path, second.image_path);
+        assert!(!second.post_cached());
+        assert!(second.cached_meta.is_none());
+        let restarted = make("https://example.org/clouds?token=one");
+        assert_eq!(first.image_path, restarted.image_path);
+        assert!(restarted.post_cached());
+        assert_eq!(restarted.cached_meta.unwrap().etag.as_deref(), Some("one"));
+    }
+
+    #[test]
     fn environment_override_wins_over_the_variant() {
         for resolution in TEXTURE_RESOLUTIONS {
             assert_eq!(
@@ -667,7 +747,7 @@ mod tests {
         let dir = PathBuf::from("C:/tmp/sunlit");
         let mut seen = std::collections::HashSet::new();
         for &width in &TEXTURE_RESOLUTIONS {
-            let (image, meta) = cache_paths(Some(&dir), &cache_stem(cloud_variant(width), false));
+            let (image, meta) = cache_paths(Some(&dir), &remote_cache_key(width, None));
             let image = image.expect("a cache dir was given");
             let meta = meta.expect("a cache dir was given");
             assert_ne!(image, meta);
@@ -678,19 +758,22 @@ mod tests {
 
     #[test]
     fn the_environment_override_gets_a_cache_entry_of_its_own() {
-        let overridden = cache_stem(cloud_variant(4096), true);
+        let overridden = remote_cache_key(4096, Some("https://example.org/map.jpg"));
         for &width in &TEXTURE_RESOLUTIONS {
-            assert_ne!(cache_stem(cloud_variant(width), false), overridden);
+            assert_ne!(remote_cache_key(width, None), overridden);
         }
         // And one entry whatever the resolution, since the URL is the same.
         for &width in &TEXTURE_RESOLUTIONS {
-            assert_eq!(cache_stem(cloud_variant(width), true), overridden);
+            assert_eq!(
+                remote_cache_key(width, Some("https://example.org/map.jpg")),
+                overridden
+            );
         }
     }
 
     #[test]
     fn no_cache_directory_means_no_cache_paths() {
-        let (image, meta) = cache_paths(None, &cache_stem(cloud_variant(4096), false));
+        let (image, meta) = cache_paths(None, &remote_cache_key(4096, None));
         assert!(image.is_none());
         assert!(meta.is_none());
     }
@@ -1212,7 +1295,7 @@ mod tests {
     fn an_image_that_could_not_be_cached_leaves_no_freshness_claim() {
         let scratch = ScratchDir::new("cloud_failed_image_write");
         let dir = scratch.path();
-        let stem = cache_stem(cloud_variant(8192), false);
+        let stem = remote_cache_key(8192, None);
         let image = dir.join(format!("{stem}.jpg"));
         let meta = dir.join(format!("{stem}_meta.toml"));
 
@@ -1253,7 +1336,7 @@ mod tests {
     fn an_undecodable_body_leaves_no_freshness_claim() {
         let scratch = ScratchDir::new("cloud_undecodable_body");
         let dir = scratch.path();
-        let stem = cache_stem(cloud_variant(8192), false);
+        let stem = remote_cache_key(8192, None);
         let image = dir.join(format!("{stem}.jpg"));
         let meta = dir.join(format!("{stem}_meta.toml"));
 
