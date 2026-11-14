@@ -81,6 +81,19 @@ cargo app -- displays --out ./plan
 
 `render` produces a single PNG without a window. `displays` prints the detected monitors, anchor, and wallpaper plan without creating a GPU device or changing the desktop. Adding `--out` renders the planned images into the chosen directory for inspection but does not apply them as wallpaper. The text output is useful in display bug reports.
 
+## The cloud source
+
+Where the clouds come from is the Source row in the Clouds group of the Advanced section. Two sources are built in:
+
+- **Remote image** — a HTTP or HTTPS URL to a grayscale equirectangular cloud map, by default `https://clouds.matteason.co.uk/images/{size}/clouds.jpg`. `{size}` becomes the map's width by height for the texture resolution in force (`4096x2048` at the default); a URL without the placeholder is used as it is for every resolution. This is the source every release before 0.6.0 shipped with.
+- **EUMETSAT (this machine)** — the app fetches EUMETView's global infrared cloud layer (`mumi:worldcloudmap_ir108`, WMS 1.3.0 over EPSG:4326) itself, stitches the two hemispheres, trims the geostationary blind zone at the poles per column, and maps infrared brightness to cloud coverage on this machine. No Python and no other service is involved. The imagery requires the "Contains modified EUMETSAT data" attribution; see the About window. Two approximations are inherent to the method: the per-column pole trim stretches latitudes near the poles (a visualization approximation, not a reprojection), and the two hemispheres are "latest" requests taken seconds apart rather than one instant.
+
+Edits stay a draft in the panel until **Apply source** is pressed, which validates the whole draft, switches the engine, and saves `config.toml`; nothing fetches before that. The validation rules are a URL without embedded credentials or a fragment and `0 ≤ floor < ceiling ≤ 255`, `gamma` in 0.1–4 and `blur` in 0–10; an invalid draft says so and changes nothing. Load Defaults, Revert to Saved and the Clouds group's ↺ reset the source section with the rest, and reset applies too.
+
+The round takes two to three minutes at the 8192 texture resolution (one request per hemisphere), and is retried within a fifteen-minute budget before the next poll. The raw hemispheres are cached beside the derived map, so changing the processing parameters reprocesses what is on disk without a new download; one derived map and one raw pair per size are kept. The status line under the source rows says what the layer is doing (checking, downloading a hemisphere, processing, ready, or a failed poll's next retry).
+
+`SUNLIT_EARTH_CLOUD_URL`, when set to a non-blank value, forces a fixed remote URL for the session, wins over the saved source, and disables the section's edits for the run; it is never written back to `config.toml`. `SUNLIT_EARTH_NO_CLOUDS` disables fetching entirely.
+
 ## The menu bar and the tray menu
 
 The main window has three menus. On Windows they are in the window's own menu bar, on Linux the app draws them at the top of the window, and on macOS they are in the menu bar at the top of the screen, after the App menu every Mac app has.
