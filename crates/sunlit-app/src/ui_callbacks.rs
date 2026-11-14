@@ -880,7 +880,7 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
 
 /// Push one cloud source config into the window as the applied value, a
 /// draft over it, and the defaults resets go back to.
-fn apply_cloud_source_to_window(window: &MainWindow, config: &config::CloudSourceConfig) {
+pub fn apply_cloud_source_to_window(window: &MainWindow, config: &config::CloudSourceConfig) {
     let applied = cloud_source_settings(config);
     window.set_cloud_source(applied.clone());
     window.set_cloud_source_draft(applied.clone());
@@ -952,8 +952,10 @@ fn apply_cloud_source(win: &MainWindow, engine: &EngineLink, draft: &CloudSource
     }
     engine.set_cloud_source(config.clone());
     CLOUDS.drawn.store(false, Ordering::Relaxed);
-    win.set_cloud_source_status("Applied; the map is on its way.".into());
+    // The push resets the section, including its status line; the applied
+    // note goes out after it, so the two do not race for the same property.
     apply_cloud_source_to_window(win, &config);
+    win.set_cloud_source_status("Applied; the map is on its way.".into());
     config::save_config(&read_config_from_window(win, engine));
 }
 

@@ -260,17 +260,9 @@ pub(super) fn spawn_cloud_worker(
                 // A switch that arrived while the worker was busy applies
                 // before anything else, including the first cached showing.
                 fetch.apply_switch();
-                // Show whatever is on disk before touching the network, on the
-                // first request rather than at spawn, so a session that starts
-                // with the layer switched off decodes nothing until it is on.
-                // A resolution switched before then posts its own entry.
-                if std::mem::take(&mut first)
-                    && !fetch
-                        .updater
-                        .set_resolution(fetch.target.load(Ordering::SeqCst))
-                {
-                    fetch.updater.post_cached();
-                }
+                // Show whatever is on disk before touching the network, on
+                // the first request rather than at spawn.
+                fetch.first_showing(&mut first);
                 match fetch.run(&rx) {
                     FetchEnds::Settled | FetchEnds::LayerOff => {}
                     FetchEnds::EngineGone => return,
@@ -388,6 +380,20 @@ impl FetchLoop<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// The first request shows whatever the target already has on disk
+    /// before touching the network, so a session that starts with the layer
+    /// switched off decodes nothing until it is on. A resolution switched
+    /// before then posts its own entry.
+    fn first_showing(&mut self, first: &mut bool) {
+        if std::mem::take(first)
+            && !self
+                .updater
+                .set_resolution(self.target.load(Ordering::SeqCst))
+        {
+            self.updater.post_cached();
         }
     }
 

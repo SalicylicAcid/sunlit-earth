@@ -9764,3 +9764,226 @@ fn test_copy_puts_the_package_managers_command_on_the_clipboard() {
     probe.invoke_paste();
     assert_eq!(probe.get_text(), "scoop update sunlit-earth");
 }
+
+// The Clouds group's source section
+// ---------------------------------------------------------------------------
+
+/// The window for the source-section cases, whose apply path is registered
+/// the way the app registers it, sending into a channel the case reads.
+struct SourceWindow {
+    window: MainWindow,
+    link: sunlit_earth::engine_client::EngineLink,
+    sent: crossbeam_channel::Receiver<sunlit_core::engine::EngineCommand>,
+}
+
+fn create_source_window() -> SourceWindow {
+    let window = create_window();
+    // The Clouds group is part of the Advanced section, whose rows the
+    // testing backend materializes only while it is open.
+    window.set_advanced_open(true);
+    let (sender, sent) = crossbeam_channel::unbounded();
+    let link = sunlit_earth::engine_client::EngineLink::new(sender, vec![], vec![1]);
+    let screens = sunlit_earth::displays::shared_monitors();
+    ui_callbacks::register_action_callbacks(&window, &link, &screens);
+    SourceWindow { window, link, sent }
+}
+
+/// The URL row, which exists only while the draft says a remote image.
+fn url_row(window: &MainWindow) -> bool {
+    param_row_present(window, "MainWindow::cloud-url")
+}
+
+/// Whether one of the section's parameter rows is in the tree, which is how
+/// the conditional `if` blocks show and hide them.
+fn param_row_present(window: &MainWindow, id: &str) -> bool {
+    let id = id.to_owned();
+    ElementQuery::from_root(window)
+        .match_predicate(move |element| element.id().is_some_and(|name| name == id))
+        .find_all()
+        .into_iter()
+        .next()
+        .is_some()
+}
+
+#[test]
+fn test_cloud_source_section_pushes_the_saved_config() {
+    let SourceWindow {
+        window,
+        link: _,
+        sent,
+    } = create_source_window();
+    let defaults = sunlit_core::config::CloudSourceConfig::default();
+    let applied = window.get_cloud_source();
+    assert_eq!(applied.mode, 0, "the default source is the remote one");
+    assert_eq!(
+        applied.remote_url.as_str(),
+        defaults.remote_url,
+        "the URL is the built-in service until it is changed"
+    );
+    approx::assert_relative_eq!(applied.floor, 60.0);
+    approx::assert_relative_eq!(applied.ceiling, 180.0);
+    approx::assert_relative_eq!(applied.gamma, 0.8);
+    approx::assert_relative_eq!(applied.blur, 0.0);
+    assert_eq!(
+        window.get_cloud_source_draft(),
+        window.get_cloud_source(),
+        "the draft starts over the applied value"
+    );
+    assert!(!window.get_cloud_source_override());
+    assert!(sent.try_iter().next().is_none(), "pushing sends nothing");
+}
+
+#[test]
+fn test_cloud_source_rows_follow_the_draft_mode() {
+    let SourceWindow { window, .. } = create_source_window();
+    // Remote: the URL row is up, the EUMETSAT parameters are not.
+    assert!(url_row(&window), "the URL row shows for a remote source");
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
+
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 1;
+    window.set_cloud_source_draft(draft);
+    assert!(
+        !url_row(&window),
+        "the URL row goes once the mode is native"
+    );
+    assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
+    assert!(param_row_present(
+        &window,
+        "MainWindow::cloud-ceiling-slider"
+    ));
+    assert!(param_row_present(&window, "MainWindow::cloud-gamma-slider"));
+    assert!(param_row_present(&window, "MainWindow::cloud-blur-slider"));
+
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 0;
+    window.set_cloud_source_draft(draft);
+    assert!(url_row(&window));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
+}
+
+#[test]
+fn test_the_draft_never_reaches_the_applied_or_the_save() {
+    let SourceWindow { window, link, sent } = create_source_window();
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 1;
+    draft.floor = 61.0;
+    window.set_cloud_source_draft(draft);
+    // The applied value is untouched by a draft edit.
+    approx::assert_relative_eq!(window.get_cloud_source().floor, 60.0);
+    let config = ui_callbacks::read_config_from_window(&window, &link);
+    assert_eq!(
+        config.cloud_source.eumetsat.floor, 60,
+        "a save reads the applied value, never the draft"
+    );
+    assert!(
+        sent.try_iter().next().is_none(),
+        "draft edits send nothing to the engine"
+    );
+}
+
+#[test]
+fn test_an_invalid_draft_is_refused_entirely() {
+    let SourceWindow {
+        window,
+        link: _,
+        sent,
+    } = create_source_window();
+    // floor above the ceiling, with the mode switched on the way there.
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 1;
+    draft.floor = 200.0;
+    draft.ceiling = 100.0;
+    window.set_cloud_source_draft(draft.clone());
+    window.invoke_apply_cloud_source(draft.clone());
+
+    assert!(
+        sent.try_iter().next().is_none(),
+        "an invalid draft must not reach the engine"
+    );
+    assert!(
+        window.get_cloud_source_status().contains("not valid"),
+        "the status says why: {:?}",
+        window.get_cloud_source_status()
+    );
+    // The applied value survives a refused apply.
+    approx::assert_relative_eq!(window.get_cloud_source().floor, 60.0);
+    // The draft survives too: refusing is not editing behind the user's back.
+    approx::assert_relative_eq!(window.get_cloud_source_draft().floor, 200.0);
+}
+
+/// The valid apply switches the engine, pushes the applied value and reads
+/// it back as the save would. The file the save writes is covered by the e2e
+/// runs, which isolate `SUNLIT_EARTH_CONFIG` in a child process: this process
+/// may not touch the environment at all (`unsafe_code` is denied) and must
+/// not write the developer's own config.
+#[test]
+fn test_apply_switches_the_engine_and_reads_the_applied_value() {
+    let SourceWindow { window, link, sent } = create_source_window();
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 1;
+    draft.floor = 61.0;
+    // 0.5 is exact in f32, which the sliders' values travel through.
+    draft.gamma = 0.5;
+    window.set_cloud_source_draft(draft.clone());
+    window.invoke_apply_cloud_source(draft.clone());
+
+    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    let switched = sent.iter().find_map(|command| match command {
+        sunlit_core::engine::EngineCommand::SetCloudSource(config) => Some(config),
+        _ => None,
+    });
+    let switched = switched.expect("the apply switches the engine");
+    assert_eq!(
+        switched.mode,
+        sunlit_core::config::CloudSourceMode::Eumetsat
+    );
+
+    approx::assert_relative_eq!(switched.eumetsat.gamma, 0.5);
+    // The applied value is what the draft asked for.
+    approx::assert_relative_eq!(window.get_cloud_source().floor, 61.0);
+    assert_eq!(
+        window.get_cloud_source_draft(),
+        window.get_cloud_source(),
+        "the draft lands on the applied value once it is applied"
+    );
+    let config = ui_callbacks::read_config_from_window(&window, &link);
+    assert_eq!(
+        config.cloud_source.eumetsat.floor, 61,
+        "a save reads the applied value"
+    );
+    assert!(
+        window.get_cloud_source_status().starts_with("Applied"),
+        "the status says the apply went out: {:?}",
+        window.get_cloud_source_status()
+    );
+}
+
+/// The override flag is what the section's disable bindings read. The
+/// environment-to-flag half is one line in the push, exercised by the e2e
+/// runs that isolate their configuration in a child process: this process
+/// may not touch the environment (`unsafe_code` is denied).
+#[test]
+fn test_the_override_flag_clears_with_the_push() {
+    let SourceWindow { window, .. } = create_source_window();
+    window.set_cloud_source_override(true);
+    assert!(window.get_cloud_source_override());
+    // A push without the override clears it, and the section comes back
+    // editable with the saved source in it.
+    ui_callbacks::apply_cloud_source_to_window(
+        &window,
+        &sunlit_core::config::CloudSourceConfig::default(),
+    );
+    assert!(!window.get_cloud_source_override());
+    assert_eq!(
+        window.get_cloud_source(),
+        window.get_cloud_source_draft(),
+        "the push resets the draft over the applied value"
+    );
+}
