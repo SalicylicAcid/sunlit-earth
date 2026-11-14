@@ -97,7 +97,7 @@ fn cloud_source(
         info!("cloud fetcher disabled (SUNLIT_EARTH_NO_CLOUDS)");
         return None;
     }
-    let source = cloud_source::resolve(config, env_url);
+    let source = cloud_source::resolve(config, env_url, cloud_fetcher::cache_dir().as_deref());
     info!(source = %source.describe(), "cloud source configured");
     Some(source)
 }

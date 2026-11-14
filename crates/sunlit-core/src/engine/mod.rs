@@ -780,6 +780,7 @@ impl Engine {
         let source = crate::assets::cloud_source::resolve(
             config,
             crate::env_override(crate::config::clouds::ENV_CLOUD_URL).as_deref(),
+            crate::assets::cloud_fetcher::cache_dir().as_deref(),
         );
         info!(source = %source.describe(), "the cloud source is switching");
         cloud.set_source(source);

@@ -113,12 +113,17 @@ pub struct CloudTarget {
 /// fixed remote URL, and the saved mode picks the native or the remote source
 /// otherwise. One implementation, so neither path can grow its own opinion of
 /// what a configuration means.
-pub fn resolve(config: &CloudSourceConfig, env_url: Option<&str>) -> Arc<dyn CloudSource> {
+pub fn resolve(
+    config: &CloudSourceConfig,
+    env_url: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+) -> Arc<dyn CloudSource> {
     let effective = config.resolve(env_url);
     match effective.mode {
         CloudSourceMode::Remote => Arc::new(HttpCloudSource::from_config(effective.remote)),
         CloudSourceMode::Eumetsat => Arc::new(super::eumetsat::EumetsatCloudSource::new(
             effective.eumetsat,
+            cache_dir.map(std::path::Path::to_path_buf),
         )),
     }
 }

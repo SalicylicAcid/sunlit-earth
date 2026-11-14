@@ -1285,7 +1285,7 @@ mod runtime_switch {
     }
 
     fn source_for(config: &CloudSourceConfig) -> Arc<dyn CloudSource> {
-        sunlit_core::assets::cloud_source::resolve(config, None)
+        sunlit_core::assets::cloud_source::resolve(config, None, None)
     }
 
     fn config_for(url: String) -> CloudSourceConfig {

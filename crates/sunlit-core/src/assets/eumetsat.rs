@@ -20,10 +20,11 @@
 
 use std::io::Cursor;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use image::ImageEncoder;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use super::cloud_fetcher::cloud_variant;
 use super::cloud_source::{CloudImage, CloudSource, CloudTarget, Download};
@@ -435,16 +436,72 @@ enum FetchError {
 /// ignored on purpose. The two hemispheres are "latest" requests taken
 /// seconds apart; the round's start and end times are logged, not claimed to
 /// be one satellite instant.
+///
+/// The disk cache holds two layers. The raw pair (the two hemisphere PNGs and
+/// a manifest naming their hashes, published with the manifest last) is what
+/// a processing-parameter change reuses instead of the network. The derived
+/// map carries the raw hashes, the parameters and the algorithm version in
+/// its metadata, and is reused only when all three match, one file per
+/// hemisphere size: sliding the parameters rewrites it rather than
+/// accumulating files.
 pub struct EumetsatCloudSource {
     settings: EumetsatSettings,
     /// Hemisphere size in pixels currently prepared. `prepare` and the fetch
     /// both run on the engine's single cloud worker; the lock is for
     /// construction and for tests, like `HttpCloudSource`'s URL.
     size: Mutex<u32>,
+    /// Where the raw pair and the derived map are cached, the fetcher's own
+    /// cache directory. `None` caches nothing and every round hits the
+    /// network.
+    cache_dir: Option<std::path::PathBuf>,
+    /// Whether the next fetch is this instance's first. A parameter or
+    /// algorithm change arrives as a new instance, and its first fetch
+    /// reprocesses the stored raw pair instead of downloading again.
+    first_fetch: AtomicBool,
     /// Backoff between transient attempts; the shipped values are
     /// [`RETRY_DELAYS`] and tests shorten them.
     retry_delays: [Duration; (MAX_ATTEMPTS - 1) as usize],
     agent: ureq::Agent,
+}
+
+/// The processing algorithm's version, stored in every derived map's
+/// metadata. Bump when the math changes, so stale derivations are
+/// recomputed rather than served.
+const ALGORITHM_VERSION: u32 = 1;
+
+/// The raw pair's manifest, the commit point of a stored round: written last,
+/// after both PNGs are on disk and verified.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RawManifest {
+    version: u32,
+    algorithm: u32,
+    west_sha256: String,
+    east_sha256: String,
+    /// When the round started, Unix seconds. Informational: the two
+    /// hemispheres are "latest" requests, not one instant.
+    fetched_epoch_secs: u64,
+}
+
+/// The stored raw pair, its bytes and the hashes its manifest named.
+struct RawPair {
+    west: Vec<u8>,
+    east: Vec<u8>,
+    hashes: (String, String),
+}
+
+/// The derived map's metadata, the commit point of a derivation: only a
+/// metadata row that matches the raw hashes, the parameters and the
+/// algorithm version lets the derived file be reused.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+struct DerivedMeta {
+    version: u32,
+    algorithm: u32,
+    floor: u8,
+    ceiling: u8,
+    gamma: f64,
+    blur: f64,
+    west_sha256: String,
+    east_sha256: String,
 }
 
 /// The hemisphere size a texture resolution's map needs: the map's width
@@ -454,7 +511,7 @@ pub(crate) fn hemisphere_px(resolution: u32) -> u32 {
 }
 
 impl EumetsatCloudSource {
-    pub fn new(settings: EumetsatSettings) -> Self {
+    pub fn new(settings: EumetsatSettings, cache_dir: Option<std::path::PathBuf>) -> Self {
         let user_agent = format!("sunlit.earth/{}", env!("CARGO_PKG_VERSION"));
         let agent = ureq::Agent::config_builder()
             .user_agent(&user_agent)
@@ -467,20 +524,20 @@ impl EumetsatCloudSource {
         Self {
             settings,
             size: Mutex::new(hemisphere_px(DEFAULT_TEXTURE_RESOLUTION)),
+            cache_dir,
+            first_fetch: AtomicBool::new(true),
             retry_delays: RETRY_DELAYS,
             agent,
         }
     }
 
-    /// What one round's cache entry is named after: the layer, the processing
-    /// settings and the hemisphere size. Hashed, so the key names no other
-    /// source's entry and carries no settings in the clear.
-    fn identity(&self, px: u32) -> String {
-        let s = &self.settings;
-        format!(
-            "{LAYER}|{}|{}|{}|{}|{px}",
-            s.floor, s.ceiling, s.gamma, s.blur
-        )
+    /// What one round's cache entry is named after: the layer and the
+    /// hemisphere size. The processing parameters are deliberately absent —
+    /// a parameter change must reuse the same derived file rather than
+    /// accumulate one per tuning — so the key names the imagery, not the
+    /// look.
+    fn identity(px: u32) -> String {
+        format!("{LAYER}|{px}")
     }
 
     fn px(&self) -> u32 {
@@ -493,9 +550,16 @@ impl EumetsatCloudSource {
     /// Fetch one hemisphere with up to [`MAX_ATTEMPTS`] tries, transient
     /// failures backed off and a Retry-After honored within `deadline`.
     ///
-    /// No attempt starts after `deadline`; a request already in flight ends
-    /// when it ends, and the next attempt then sees the exhausted budget.
-    fn fetch_hemisphere(&self, bbox: &str, px: u32, deadline: Instant) -> Result<GrayMap, String> {
+    /// Returns the response's raw bytes — what the raw pair stores and its
+    /// manifest hashes — beside the decoded map. No attempt starts after
+    /// `deadline`; a request already in flight ends when it ends, and the
+    /// next attempt then sees the exhausted budget.
+    fn fetch_hemisphere(
+        &self,
+        bbox: &str,
+        px: u32,
+        deadline: Instant,
+    ) -> Result<(Vec<u8>, GrayMap), String> {
         let url = build_wms_url(bbox, px);
         for attempt in 1..=MAX_ATTEMPTS {
             if Instant::now() >= deadline {
@@ -504,7 +568,7 @@ impl EumetsatCloudSource {
                 ));
             }
             match self.request_hemisphere(&url, px, MAX_BODY_BYTES) {
-                Ok(map) => return Ok(map),
+                Ok(pair) => return Ok(pair),
                 // A permanent refusal or an invalid image: repeating this
                 // round verbatim cannot help, the next scheduled one may.
                 Err(FetchError::Permanent(message)) => {
@@ -532,7 +596,12 @@ impl EumetsatCloudSource {
     }
 
     /// One attempt of one hemisphere: request, classify, read, validate.
-    fn request_hemisphere(&self, url: &str, px: u32, max_body: u64) -> Result<GrayMap, FetchError> {
+    fn request_hemisphere(
+        &self,
+        url: &str,
+        px: u32,
+        max_body: u64,
+    ) -> Result<(Vec<u8>, GrayMap), FetchError> {
         let mut response = self
             .agent
             .get(url)
@@ -569,7 +638,8 @@ impl EumetsatCloudSource {
                 }
                 other => FetchError::Transient(format!("body read: {other}"), None),
             })?;
-        decode_png(&body, px).map_err(FetchError::Permanent)
+        let map = decode_png(&body, px).map_err(FetchError::Permanent)?;
+        Ok((body, map))
     }
 }
 
@@ -581,22 +651,195 @@ impl CloudSource for EumetsatCloudSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *size = px;
-        CloudTarget::eumetsat(&self.identity(px))
+        CloudTarget::eumetsat(&Self::identity(px))
     }
 
     fn fetch_if_changed(&self, _known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
         let px = self.px();
         let started = Instant::now();
         let deadline = started + ROUND_BUDGET;
+
+        // A parameter or algorithm change arrives as a new instance, whose
+        // first fetch reprocesses the stored raw pair instead of downloading
+        // again. A derivation that already matches costs nothing.
+        let cached_raw = self.load_raw_pair(px);
+        if self.first_fetch.swap(false, Ordering::SeqCst)
+            && let Some(pair) = &cached_raw
+        {
+            if self.derived_matches(px, &pair.hashes.0, &pair.hashes.1) {
+                info!(
+                    px,
+                    "the stored raw pair and its derivation are still current"
+                );
+                return Ok(None);
+            }
+            info!(px, "reprocessing the stored raw pair without the network");
+            let west = decode_png(&pair.west, px)?;
+            let east = decode_png(&pair.east, px)?;
+            let bytes =
+                self.process_and_store(px, &west, &east, &pair.hashes.0, &pair.hashes.1, started)?;
+            return Ok(Some(CloudImage {
+                bytes: Download::new(bytes),
+                etag: None,
+                last_modified: None,
+            }));
+        }
+
         // Both hemispheres of one round, in order; only a complete pair goes
         // on to processing, so no half a map is ever stitched to history.
-        let west = self.fetch_hemisphere(HEMISPHERES[0].1, px, deadline)?;
+        let (west_body, west) = self.fetch_hemisphere(HEMISPHERES[0].1, px, deadline)?;
         info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
-        let east = self.fetch_hemisphere(HEMISPHERES[1].1, px, deadline)?;
+        let (east_body, east) = self.fetch_hemisphere(HEMISPHERES[1].1, px, deadline)?;
         info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
-        let stitched = stitch(&west, &east);
-        drop(west);
-        drop(east);
+        let west_sha = sha256_hex(&west_body);
+        let east_sha = sha256_hex(&east_body);
+        // Upstream unchanged and the derivation current: nothing to report,
+        // and nothing to process.
+        if let Some(pair) = &cached_raw
+            && west_body == pair.west
+            && east_body == pair.east
+            && self.derived_matches(px, &pair.hashes.0, &pair.hashes.1)
+        {
+            debug!(px, "the upstream round matches the stored one");
+            return Ok(None);
+        }
+        self.store_raw_pair(px, &west_body, &east_body)?;
+        let bytes = self.process_and_store(px, &west, &east, &west_sha, &east_sha, started)?;
+        Ok(Some(CloudImage {
+            bytes: Download::new(bytes),
+            etag: None,
+            last_modified: None,
+        }))
+    }
+
+    fn describe(&self) -> String {
+        format!("eumetsat {LAYER}")
+    }
+}
+
+impl EumetsatCloudSource {
+    /// Store one round's raw pair: each PNG written to a temporary file and
+    /// verified by decoding what landed, then renamed, and the manifest
+    /// written last as the commit point. A failure anywhere leaves the
+    /// previous pair and its manifest untouched.
+    fn store_raw_pair(&self, px: u32, west: &[u8], east: &[u8]) -> Result<(), String> {
+        let Some(dir) = &self.cache_dir else {
+            return Ok(());
+        };
+        let west_tmp = dir.join(format!("eumetsat_raw_west_{px}.png.tmp"));
+        let east_tmp = dir.join(format!("eumetsat_raw_east_{px}.png.tmp"));
+        std::fs::write(&west_tmp, west).map_err(|e| format!("the raw west file failed: {e}"))?;
+        std::fs::write(&east_tmp, east).map_err(|e| format!("the raw east file failed: {e}"))?;
+        // Verify the written bytes before anything is published under a real
+        // name: a decode of what is on disk is the check the manifest's claim
+        // rests on.
+        decode_png(
+            &std::fs::read(&west_tmp).map_err(|e| format!("the raw west read back failed: {e}"))?,
+            px,
+        )?;
+        decode_png(
+            &std::fs::read(&east_tmp).map_err(|e| format!("the raw east read back failed: {e}"))?,
+            px,
+        )?;
+        let west_path = dir.join(format!("eumetsat_raw_west_{px}.png"));
+        let east_path = dir.join(format!("eumetsat_raw_east_{px}.png"));
+        std::fs::rename(&west_tmp, &west_path)
+            .map_err(|e| format!("the raw west commit failed: {e}"))?;
+        std::fs::rename(&east_tmp, &east_path)
+            .map_err(|e| format!("the raw east commit failed: {e}"))?;
+        let manifest = RawManifest {
+            version: 1,
+            algorithm: ALGORITHM_VERSION,
+            west_sha256: sha256_hex(west),
+            east_sha256: sha256_hex(east),
+            fetched_epoch_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let manifest =
+            toml::to_string(&manifest).map_err(|e| format!("the raw manifest failed: {e}"))?;
+        write_committed(
+            &dir.join(format!("eumetsat_raw_{px}_meta.toml")),
+            manifest.as_bytes(),
+        )?;
+        info!(px, "the raw pair is stored and committed");
+        Ok(())
+    }
+
+    /// Load the stored raw pair, trusting it only when the manifest's hashes
+    /// match what is on disk. `None` is "no usable pair", which the next
+    /// network round replaces; the files are left alone either way.
+    fn load_raw_pair(&self, px: u32) -> Option<RawPair> {
+        let dir = self.cache_dir.as_ref()?;
+        let manifest = std::fs::read(dir.join(format!("eumetsat_raw_{px}_meta.toml"))).ok()?;
+        let manifest: RawManifest = toml::from_str(&String::from_utf8_lossy(&manifest)).ok()?;
+        let west = std::fs::read(dir.join(format!("eumetsat_raw_west_{px}.png"))).ok()?;
+        let east = std::fs::read(dir.join(format!("eumetsat_raw_east_{px}.png"))).ok()?;
+        let (west_sha, east_sha) = (sha256_hex(&west), sha256_hex(&east));
+        if manifest.west_sha256 != west_sha || manifest.east_sha256 != east_sha {
+            warn!(
+                px,
+                "the stored raw pair does not match its manifest, ignoring it"
+            );
+            return None;
+        }
+        Some(RawPair {
+            west,
+            east,
+            hashes: (west_sha, east_sha),
+        })
+    }
+
+    /// Whether the stored derived map is reusable: it exists, and its
+    /// metadata matches the raw hashes, the current parameters and the
+    /// algorithm version, all together.
+    #[expect(
+        clippy::float_cmp,
+        reason = "the metadata must equal the tuning bit for bit, not approximately"
+    )]
+    fn derived_matches(&self, px: u32, west_sha: &str, east_sha: &str) -> bool {
+        let Some(dir) = &self.cache_dir else {
+            return false;
+        };
+        let (width, height) = (2 * px, px);
+        if !dir
+            .join(format!("eumetsat_map_{width}x{height}.jpg"))
+            .exists()
+        {
+            return false;
+        }
+        let Ok(meta) = std::fs::read(dir.join(format!("eumetsat_map_{width}x{height}_meta.toml")))
+        else {
+            return false;
+        };
+        let Ok(meta) = toml::from_str::<DerivedMeta>(&String::from_utf8_lossy(&meta)) else {
+            return false;
+        };
+        let s = &self.settings;
+        meta.version == 1
+            && meta.algorithm == ALGORITHM_VERSION
+            && meta.floor == s.floor
+            && meta.ceiling == s.ceiling
+            && meta.gamma == s.gamma
+            && meta.blur == s.blur
+            && meta.west_sha256 == west_sha
+            && meta.east_sha256 == east_sha
+    }
+
+    /// Process one round's raw pair into the derived map, and store it with
+    /// its metadata. The staged float maps are dropped as the pipeline moves
+    /// on; what stays is the JPEG and its metadata row.
+    fn process_and_store(
+        &self,
+        px: u32,
+        west: &GrayMap,
+        east: &GrayMap,
+        west_sha: &str,
+        east_sha: &str,
+        started: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let stitched = stitch(west, east);
         let map = trim_poles(&stitched);
         drop(stitched);
         let map = to_coverage(&map, &self.settings);
@@ -611,16 +854,58 @@ impl CloudSource for EumetsatCloudSource {
             elapsed = ?started.elapsed(),
             "the EUMETSAT round is generated"
         );
-        Ok(Some(CloudImage {
-            bytes: Download::new(bytes),
-            etag: None,
-            last_modified: None,
-        }))
+        if let Some(dir) = &self.cache_dir {
+            let (width, height) = (2 * px, px);
+            let meta = DerivedMeta {
+                version: 1,
+                algorithm: ALGORITHM_VERSION,
+                floor: self.settings.floor,
+                ceiling: self.settings.ceiling,
+                gamma: self.settings.gamma,
+                blur: self.settings.blur,
+                west_sha256: west_sha.to_owned(),
+                east_sha256: east_sha.to_owned(),
+            };
+            let meta =
+                toml::to_string(&meta).map_err(|e| format!("the derived metadata failed: {e}"))?;
+            let committed = (|| -> Result<(), String> {
+                write_committed(
+                    &dir.join(format!("eumetsat_map_{width}x{height}.jpg")),
+                    &bytes,
+                )?;
+                write_committed(
+                    &dir.join(format!("eumetsat_map_{width}x{height}_meta.toml")),
+                    meta.as_bytes(),
+                )
+            })();
+            if let Err(e) = committed {
+                // The bytes are already in hand and about to be posted; a
+                // failed cache write costs the next start its fast path, not
+                // this round its image.
+                warn!(error = %e, "the derived map could not be cached");
+            }
+        }
+        Ok(bytes)
     }
+}
 
-    fn describe(&self) -> String {
-        format!("eumetsat {LAYER}")
+/// Write `bytes` to `path` through a temporary file, the metadata's commit
+/// point: readers see either the previous file or the complete new one.
+fn write_committed(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("the temporary write failed: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("the commit failed: {e}"))
+}
+
+/// The SHA-256 of `bytes`, as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
     }
+    hex
 }
 
 /// The Retry-After header, in whole seconds. The HTTP-date form is not
@@ -929,7 +1214,7 @@ mod tests {
 
     #[test]
     fn a_too_large_body_is_refused_without_a_decode() {
-        let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         let (agent, calls) = stub_agent(|_| Ok(png_response(16, 128)));
         source.agent = agent;
         let url = build_wms_url("-90,-180,90,0", 16);
@@ -945,7 +1230,7 @@ mod tests {
 
     #[test]
     fn an_attempt_never_starts_after_the_round_budget() {
-        let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         let (agent, calls) = stub_agent(|_| Ok(png_response(16, 128)));
         source.agent = agent;
         let spent = Instant::now()
@@ -960,7 +1245,7 @@ mod tests {
 
     #[test]
     fn transient_failures_are_retried_and_a_retry_after_within_the_budget_wins() {
-        let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         let (agent, calls) = stub_agent(|n| {
             if n == 1 {
                 // A 429 with a Retry-After the budget can honor: it replaces
@@ -976,7 +1261,7 @@ mod tests {
         });
         source.agent = agent;
         let started = Instant::now();
-        let map = source
+        let (_, map) = source
             .fetch_hemisphere("-90,-180,90,0", 16, started + ROUND_BUDGET)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "retried once");
@@ -989,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_transport_failure_is_transient_and_uses_the_backoff() {
-        let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         source.retry_delays = [Duration::ZERO, Duration::ZERO];
         let (agent, calls) = stub_agent(|n| {
             if n == 1 {
@@ -999,7 +1284,7 @@ mod tests {
             }
         });
         source.agent = agent;
-        let map = source
+        let (_, map) = source
             .fetch_hemisphere("-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1046,7 +1331,7 @@ mod tests {
                 }),
             ),
         ] {
-            let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+            let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
             let (agent, calls) = stub_agent(make);
             source.agent = agent;
             let Err(error) =
@@ -1061,7 +1346,7 @@ mod tests {
 
     #[test]
     fn fetch_if_changed_rounds_two_hemispheres_into_one_jpeg_and_ignores_etags() {
-        let mut source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         source.retry_delays = [Duration::ZERO, Duration::ZERO];
         // The 2048 texture resolution halves into 1024 px hemispheres, which
         // the stub serves. Both hemispheres are one identical 128/255 fill,
@@ -1106,26 +1391,207 @@ mod tests {
 
     #[test]
     fn prepare_tracks_resolution_and_hashed_identity() {
-        let source = EumetsatCloudSource::new(EumetsatSettings::default());
+        let source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         let wide = source.prepare(8192);
         assert!(wide.cache_key.starts_with("clouds_cache_eumetsat_"));
         assert_eq!(wide.wait, super::super::cloud_source::CloudWait::LongFetch);
         let narrow = source.prepare(2048);
         assert_ne!(wide.cache_key, narrow.cache_key, "the size is in the key");
         assert_eq!(source.px(), 1024);
-        let retuned = EumetsatCloudSource::new(EumetsatSettings {
-            floor: 61,
-            ..EumetsatSettings::default()
-        });
-        assert_ne!(
+        let retuned = EumetsatCloudSource::new(
+            EumetsatSettings {
+                floor: 61,
+                ..EumetsatSettings::default()
+            },
+            None,
+        );
+        assert_eq!(
             retuned.prepare(2048).cache_key,
             narrow.cache_key,
-            "the settings are in the key"
+            "the parameters are out of the key: one derived file per size,              rewritten by a tuning change"
         );
         assert!(
             source
                 .describe()
                 .starts_with("eumetsat mumi:worldcloudmap_ir108")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The raw pair and the derived map caches
+    // -----------------------------------------------------------------------
+
+    /// A source with a scratch cache directory, and the directory.
+    fn scratch_cache(name: &str) -> (crate::test_support::ScratchDir, EumetsatCloudSource) {
+        let scratch = crate::test_support::ScratchDir::new(name);
+        let source = EumetsatCloudSource::new(
+            EumetsatSettings::default(),
+            Some(scratch.path().to_path_buf()),
+        );
+        (scratch, source)
+    }
+
+    /// One hemisphere's raw body at 16 px, uniform at `value`.
+    fn raw_body(value: u8) -> Vec<u8> {
+        png_bytes(16, 16, value)
+    }
+
+    #[test]
+    fn the_raw_pair_is_stored_validated_and_loaded_back_only_intact() {
+        let (scratch, source) = scratch_cache("eumetsat_raw_pair");
+        let west = raw_body(60);
+        let east = raw_body(90);
+        source
+            .store_raw_pair(16, &west, &east)
+            .expect("the pair is stored");
+        assert!(scratch.join("eumetsat_raw_west_16.png").is_file());
+        assert!(scratch.join("eumetsat_raw_east_16.png").is_file());
+        assert!(
+            !scratch.join("eumetsat_raw_west_16.png.tmp").exists(),
+            "no staging file is left behind"
+        );
+        let pair = source.load_raw_pair(16).expect("the pair loads");
+        assert_eq!(pair.west, west);
+        assert_eq!(pair.east, east);
+        assert_eq!(pair.hashes.0, sha256_hex(&west));
+        assert_eq!(pair.hashes.1, sha256_hex(&east));
+        // A file that no longer matches its manifest makes the pair unusable
+        // until a network round replaces it; the files are left alone either
+        // way.
+        let corrupted = scratch.join("eumetsat_raw_west_16.png");
+        let mut bytes = std::fs::read(&corrupted).expect("the raw west is read");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&corrupted, &bytes).expect("the raw west is corrupted");
+        assert!(
+            source.load_raw_pair(16).is_none(),
+            "the manifest's hashes no longer match what is on disk"
+        );
+    }
+
+    #[test]
+    fn the_derived_map_is_reused_only_when_its_metadata_matches() {
+        let (scratch, source) = scratch_cache("eumetsat_derived_meta");
+        let west = raw_body(60);
+        let east = raw_body(90);
+        let hashes = (sha256_hex(&west), sha256_hex(&east));
+        source.store_raw_pair(16, &west, &east).expect("stored");
+        assert!(
+            !source.derived_matches(16, &hashes.0, &hashes.1),
+            "there is no derivation yet"
+        );
+        let west_map = decode_png(&west, 16).expect("the west decodes");
+        let east_map = decode_png(&east, 16).expect("the east decodes");
+        source
+            .process_and_store(
+                16,
+                &west_map,
+                &east_map,
+                &hashes.0,
+                &hashes.1,
+                Instant::now(),
+            )
+            .expect("the derivation is stored");
+        assert!(source.derived_matches(16, &hashes.0, &hashes.1));
+        // The derived file is one per size: its name carries no parameters.
+        assert!(scratch.join("eumetsat_map_32x16.jpg").is_file());
+        // A different tuning stops the match, which is what sends a parameter
+        // change back to the raw pair.
+        let retuned = EumetsatCloudSource::new(
+            EumetsatSettings {
+                floor: 61,
+                ..EumetsatSettings::default()
+            },
+            Some(scratch.path().to_path_buf()),
+        );
+        assert!(
+            !retuned.derived_matches(16, &hashes.0, &hashes.1),
+            "the tuning moved, the derivation is stale"
+        );
+    }
+
+    #[test]
+    fn a_parameter_change_reprocesses_the_raw_pair_without_the_network() {
+        let (scratch, _dir) = scratch_cache("eumetsat_reprocess");
+        let west = raw_body(60);
+        let east = raw_body(90);
+        let hashes = (sha256_hex(&west), sha256_hex(&east));
+        let old = EumetsatCloudSource::new(
+            EumetsatSettings {
+                floor: 0,
+                ceiling: 255,
+                gamma: 1.0,
+                blur: 0.0,
+            },
+            Some(scratch.path().to_path_buf()),
+        );
+        old.store_raw_pair(16, &west, &east).expect("stored");
+        let old_west = decode_png(&west, 16).expect("decodes");
+        let old_east = decode_png(&east, 16).expect("decodes");
+        old.process_and_store(
+            16,
+            &old_west,
+            &old_east,
+            &hashes.0,
+            &hashes.1,
+            Instant::now(),
+        )
+        .expect("the old derivation is stored");
+
+        // The new instance's agent refuses to be used: reaching the network
+        // here would panic inside the middleware instead of passing.
+        let mut retuned = EumetsatCloudSource::new(
+            EumetsatSettings::default(),
+            Some(scratch.path().to_path_buf()),
+        );
+        let (agent, calls) = stub_agent(|_| panic!("the reprocess must not touch the network"));
+        retuned.agent = agent;
+        *retuned.size.lock().expect("the size lock") = 16;
+        let image = retuned
+            .fetch_if_changed(None)
+            .expect("the round succeeds")
+            .expect("a map");
+        let decoded = image::load_from_memory(&image.bytes).expect("the map decodes");
+        assert_eq!((decoded.width(), decoded.height()), (32, 16));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the network was never touched"
+        );
+        // The metadata now carries the new tuning, so the next poll's
+        // unchanged check finds the derivation current.
+        assert!(retuned.derived_matches(16, &hashes.0, &hashes.1));
+    }
+
+    #[test]
+    fn a_first_fetch_with_a_current_derivation_costs_nothing() {
+        let (_scratch, mut source) = scratch_cache("eumetsat_current");
+        let west = raw_body(60);
+        let east = raw_body(90);
+        let hashes = (sha256_hex(&west), sha256_hex(&east));
+        source.store_raw_pair(16, &west, &east).expect("stored");
+        let west_map = decode_png(&west, 16).expect("decodes");
+        let east_map = decode_png(&east, 16).expect("decodes");
+        source
+            .process_and_store(
+                16,
+                &west_map,
+                &east_map,
+                &hashes.0,
+                &hashes.1,
+                Instant::now(),
+            )
+            .expect("stored");
+        let (agent, calls) = stub_agent(|_| panic!("nothing changed, so nothing is fetched"));
+        source.agent = agent;
+        *source.size.lock().expect("the size lock") = 16;
+        assert!(
+            source
+                .fetch_if_changed(None)
+                .expect("the round succeeds")
+                .is_none(),
+            "the stored pair and its derivation are current"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
