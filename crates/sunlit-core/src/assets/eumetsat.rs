@@ -523,6 +523,10 @@ impl EumetsatCloudSource {
             .http_status_as_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_per_call(Some(REQUEST_TIMEOUT))
+            // The service is one slow server an ocean away; a user running a
+            // local proxy is the standard way around that. The standard
+            // variables carry it, and NO_PROXY is honored with it.
+            .proxy(ureq::Proxy::try_from_env())
             .build()
             .new_agent();
         Self {
@@ -566,6 +570,7 @@ impl EumetsatCloudSource {
     /// next attempt then sees the exhausted budget.
     fn fetch_hemisphere(
         &self,
+        name: &str,
         bbox: &str,
         px: u32,
         deadline: Instant,
@@ -574,30 +579,33 @@ impl EumetsatCloudSource {
         for attempt in 1..=MAX_ATTEMPTS {
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "EUMETSAT {bbox} hemisphere: the round budget is spent before attempt {attempt}"
+                    "EUMETSAT {name} hemisphere: the round budget is spent before attempt {attempt}"
                 ));
             }
+            self.set_phase(&format!(
+                "downloading the {name} hemisphere (attempt {attempt}/{MAX_ATTEMPTS})"
+            ));
             match self.request_hemisphere(&url, px, MAX_BODY_BYTES) {
                 Ok(pair) => return Ok(pair),
                 // A permanent refusal or an invalid image: repeating this
                 // round verbatim cannot help, the next scheduled one may.
                 Err(FetchError::Permanent(message)) => {
-                    return Err(format!("EUMETSAT {bbox} hemisphere: {message}"));
+                    return Err(format!("EUMETSAT {name} hemisphere: {message}"));
                 }
                 Err(FetchError::Transient(message, retry_after)) => {
                     if attempt == MAX_ATTEMPTS {
                         return Err(format!(
-                            "EUMETSAT {bbox} hemisphere failed after {MAX_ATTEMPTS} attempts: {message}"
+                            "EUMETSAT {name} hemisphere failed after {MAX_ATTEMPTS} attempts: {message}"
                         ));
                     }
                     let delay = retry_after.unwrap_or(self.retry_delays[(attempt - 1) as usize]);
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if delay >= remaining {
                         return Err(format!(
-                            "EUMETSAT {bbox} hemisphere: retrying after {delay:?} would pass the round budget"
+                            "EUMETSAT {name} hemisphere: retrying after {delay:?} would pass the round budget"
                         ));
                     }
-                    info!(attempt, bbox, delay = ?delay, "retrying the EUMETSAT hemisphere");
+                    info!(attempt, hemisphere = name, delay = ?delay, "retrying the EUMETSAT hemisphere");
                     std::thread::sleep(delay);
                 }
             }
@@ -705,13 +713,23 @@ impl CloudSource for EumetsatCloudSource {
             }));
         }
 
-        // Both hemispheres of one round, in order; only a complete pair goes
-        // on to processing, so no half a map is ever stitched to history.
-        self.set_phase("downloading the west hemisphere");
-        let (west_body, west) = self.fetch_hemisphere(HEMISPHERES[0].1, px, deadline)?;
+        // Both hemispheres of one round, fetched in parallel over the one
+        // deadline: the two requests share nothing but the budget, so a slow
+        // west no longer holds the east's start. Only a complete pair goes on
+        // to processing, so no half a map is ever stitched to history.
+        self.set_phase("downloading the two hemispheres");
+        let (west, east) = std::thread::scope(|scope| {
+            let west = scope
+                .spawn(|| self.fetch_hemisphere(HEMISPHERES[0].0, HEMISPHERES[0].1, px, deadline));
+            let east = scope
+                .spawn(|| self.fetch_hemisphere(HEMISPHERES[1].0, HEMISPHERES[1].1, px, deadline));
+            (west.join(), east.join())
+        });
+        let west = west.map_err(|_| "the west hemisphere's fetch panicked".to_owned())?;
+        let east = east.map_err(|_| "the east hemisphere's fetch panicked".to_owned())?;
+        let (west_body, west) = west?;
         info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
-        self.set_phase("downloading the east hemisphere");
-        let (east_body, east) = self.fetch_hemisphere(HEMISPHERES[1].1, px, deadline)?;
+        let (east_body, east) = east?;
         info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
         let west_sha = sha256_hex(&west_body);
         let east_sha = sha256_hex(&east_body);
@@ -1258,7 +1276,7 @@ mod tests {
         let spent = Instant::now()
             .checked_sub(Duration::from_mins(1))
             .expect("a minute ago is representable");
-        let Err(error) = source.fetch_hemisphere("-90,-180,90,0", 16, spent) else {
+        let Err(error) = source.fetch_hemisphere("west", "-90,-180,90,0", 16, spent) else {
             panic!("an exhausted budget fetched anyway");
         };
         assert!(error.contains("budget"), "{error}");
@@ -1284,7 +1302,7 @@ mod tests {
         source.agent = agent;
         let started = Instant::now();
         let (_, map) = source
-            .fetch_hemisphere("-90,-180,90,0", 16, started + ROUND_BUDGET)
+            .fetch_hemisphere("west", "-90,-180,90,0", 16, started + ROUND_BUDGET)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "retried once");
         assert!(
@@ -1307,7 +1325,7 @@ mod tests {
         });
         source.agent = agent;
         let (_, map) = source
-            .fetch_hemisphere("-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
+            .fetch_hemisphere("west", "-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(map.width(), 16);
@@ -1357,7 +1375,7 @@ mod tests {
             let (agent, calls) = stub_agent(make);
             source.agent = agent;
             let Err(error) =
-                source.fetch_hemisphere("-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
+                source.fetch_hemisphere("west", "-90,-180,90,0", 16, Instant::now() + ROUND_BUDGET)
             else {
                 panic!("{label} produced a map");
             };
@@ -1583,6 +1601,60 @@ mod tests {
         // The metadata now carries the new tuning, so the next poll's
         // unchanged check finds the derivation current.
         assert!(retuned.derived_matches(16, &hashes.0, &hashes.1));
+    }
+
+    /// The two hemispheres fetch in parallel: the middleware holds the first
+    /// request until the second arrives, and a timeout is a permanent 403.
+    /// A sequential fetch would therefore fail in two seconds, while the
+    /// parallel one is through in milliseconds.
+    #[test]
+    fn the_two_hemispheres_fetch_in_parallel() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        // The first request waits up to two seconds for its peer; a timeout
+        // is a permanent 403. A sequential fetch would therefore fail, while
+        // the parallel one is through in milliseconds.
+        let (peer_tx, peer_rx) = crossbeam_channel::bounded::<()>(1);
+        let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peer_tx = Arc::new(Mutex::new(Some(peer_tx)));
+        let peer_rx = Arc::new(Mutex::new(peer_rx));
+        let (agent, calls) = stub_agent(move |_| {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            if arrived.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let rx = peer_rx.lock().unwrap_or_else(PoisonError::into_inner);
+                if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    return Ok(Response::builder()
+                        .status(403)
+                        .body(Body::builder().data(Vec::new()))
+                        .unwrap());
+                }
+            } else if let Some(tx) = peer_tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                let _ = tx.send(());
+            }
+            Ok(png_response(16, 128))
+        });
+        source.agent = agent;
+        *source.size.lock().expect("the size lock") = 16;
+        let started = Instant::now();
+        let image = source
+            .fetch_if_changed(None)
+            .expect("both hemispheres arrive")
+            .expect("a map comes out");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one request per hemisphere"
+        );
+        assert_eq!(image::load_from_memory(&image.bytes).unwrap().width(), 32);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the round waited on the barrier, so the fetches were sequential: {elapsed:?}"
+        );
     }
 
     #[test]
