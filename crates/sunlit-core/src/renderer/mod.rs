@@ -26,6 +26,8 @@ pub(crate) use sizing::resolve_sample_count;
 pub(crate) use surface::{SurfaceFormats, SurfaceLayer};
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tracing::debug;
 
@@ -73,6 +75,8 @@ pub(crate) struct RendererConfig {
     pub mailbox: TextureMailbox,
     /// Invoked from decode threads once a result has been parked.
     pub notify: NotifyFn,
+    /// The cloud generation in force, shared with the fetch worker.
+    pub cloud_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The month in force, January 0, when the globe is drawn from the cube
     /// surface the engine hands over pack by pack; `None` draws the grid.
     pub cube_month: Option<usize>,
@@ -164,6 +168,18 @@ pub(crate) struct Renderer {
     /// group. Until one lands the group binds the 1x1 dummy, which reads zero:
     /// no haze removed.
     cloud_background_view: Option<wgpu::TextureView>,
+    /// The two textures behind the views, held so a replacement drops the old
+    /// allocation at a known moment rather than whenever the last view drops.
+    cloud_map_texture: Option<wgpu::Texture>,
+    cloud_background_texture: Option<wgpu::Texture>,
+    /// The cloud generation in force, shared with the fetch worker, which
+    /// bumps it whenever the effective target changes.
+    cloud_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// The generation of the pair that is on the GPU. A target switch raises
+    /// the generation in force before its own pair lands, and in that window
+    /// the GPU keeps the previous target's image, which `clouds_resident`
+    /// reports as not resident for the current target.
+    cloud_generation_drawn: u64,
 }
 
 impl Renderer {
@@ -279,6 +295,15 @@ impl Renderer {
             .enumerate()
             .filter_map(|(index, slot)| Some(held(self.slot_label(index), slot.texture.as_ref()?)))
             .collect();
+        // The cloud pair no longer travels through the slots; its textures are
+        // held beside the views they are sampled through, under the same labels
+        // the slot path used.
+        if let Some(map) = &self.cloud_map_texture {
+            expected.push(held("cloud_texture".to_owned(), map));
+        }
+        if let Some(background) = &self.cloud_background_texture {
+            expected.push(held("cloud_background_texture".to_owned(), background));
+        }
         if let Some(surface) = &self.surface {
             expected.extend(
                 surface
@@ -655,9 +680,14 @@ impl Renderer {
         self.cloud_bind_group = Some(group);
     }
 
-    /// Whether the cloud map and its background have both landed.
+    /// Whether the cloud map and its background have both landed, and are the
+    /// pair of the generation in force. A target switch raises the generation
+    /// before its own pair lands, so in that window this says no and the
+    /// previous target's image stays on the GPU.
     pub(crate) fn clouds_resident(&self) -> bool {
-        self.cloud_texture_view.is_some() && self.cloud_background_view.is_some()
+        self.cloud_texture_view.is_some()
+            && self.cloud_background_view.is_some()
+            && self.cloud_generation_drawn == self.cloud_generation.load(Ordering::SeqCst)
     }
 
     /// A bind group of one flat texture.

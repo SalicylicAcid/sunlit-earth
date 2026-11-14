@@ -120,6 +120,7 @@ pub(super) fn create_renderer(
         texture_resolution,
         mailbox: texture_mailbox,
         notify,
+        cloud_generation,
         cube_month,
         cpu_adapter,
         tile_geometry,
@@ -392,6 +393,10 @@ pub(super) fn create_renderer(
         cloud_bind_group: None,
         cloud_texture_view: None,
         cloud_background_view: None,
+        cloud_map_texture: None,
+        cloud_background_texture: None,
+        cloud_generation,
+        cloud_generation_drawn: 0,
     }
 }
 

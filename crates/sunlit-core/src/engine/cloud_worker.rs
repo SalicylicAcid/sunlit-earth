@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use crossbeam_channel::{Sender, TryRecvError, bounded};
 use tracing::{debug, info, warn};
 
 use super::schedule::Schedule;
-use crate::assets::cloud_fetcher::{CloudSlots, CloudUpdater, PollOutcome, RetryBackoff};
+use crate::assets::cloud_fetcher::{CloudUpdater, PollOutcome, RetryBackoff};
 use crate::assets::cloud_source::CloudSource;
 use crate::assets::mailbox::TextureMailbox;
 
@@ -123,11 +123,11 @@ pub(super) fn spawn_cloud_worker(
     source: Arc<dyn CloudSource>,
     mailbox: TextureMailbox,
     notify: crate::assets::cloud_fetcher::NotifyFn,
+    generation: Arc<AtomicU64>,
     cache_dir: Option<PathBuf>,
     interval: Duration,
     now: Duration,
     texture_resolution: u32,
-    slots: CloudSlots,
     enabled: bool,
 ) -> CloudWorker {
     info!(source = %source.describe(), poll_secs = interval.as_secs(), "cloud source configured");
@@ -151,7 +151,7 @@ pub(super) fn spawn_cloud_worker(
                 source,
                 mailbox,
                 notify,
-                slots,
+                Arc::clone(&generation),
                 cache_dir,
                 texture_resolution,
             );
@@ -194,7 +194,11 @@ pub(super) fn spawn_cloud_worker(
                     // Inside the retry loop, not outside it: an outage can hold
                     // this thread for minutes at a time, and a resolution
                     // switch made during one should change what the next
-                    // attempt asks for rather than wait its turn.
+                    // attempt asks for rather than wait its turn. The updater
+                    // bumps the shared generation itself when the target it
+                    // lands on differs, so the pair of the previous target is
+                    // dropped and its cached image, if any, lands stamped with
+                    // the generation now in force.
                     updater.set_resolution(worker_target.load(Ordering::SeqCst));
                     let outcome = updater.poll_once();
                     record_first_answer(&worker_answer, outcome, updater.has_posted());

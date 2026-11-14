@@ -30,6 +30,9 @@ pub struct DecodedTextureMessage {
 #[derive(Clone)]
 pub struct TextureMailbox {
     slots: Arc<Mutex<Vec<Option<DecodedTextureMessage>>>>,
+    /// The cloud map and its clear-sky background, parked as one pair. One
+    /// spot, latest value: only the newest decoded pair is ever useful.
+    cloud_frame: Arc<Mutex<Option<CloudFrame>>>,
 }
 
 impl TextureMailbox {
@@ -39,6 +42,7 @@ impl TextureMailbox {
             slots: Arc::new(Mutex::new(
                 std::iter::repeat_with(|| None).take(slot_count).collect(),
             )),
+            cloud_frame: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -97,6 +101,51 @@ impl TextureMailbox {
         let mut slots = self.slots.lock().expect("texture mailbox lock poisoned");
         slots.iter_mut().filter_map(Option::take).collect()
     }
+
+    /// Park one decoded cloud pair, replacing any pair not yet consumed,
+    /// unless what is parked is from a newer cloud generation than the
+    /// arrival. Same latest-value rule as the slots, with the cloud
+    /// generation in place of the texture resolution's.
+    pub fn post_cloud_frame(&self, frame: CloudFrame) {
+        let mut parked = self
+            .cloud_frame
+            .lock()
+            .expect("cloud frame mailbox lock poisoned");
+        if let Some(parked) = parked.as_ref()
+            && parked.generation > frame.generation
+        {
+            debug!(
+                parked = parked.generation,
+                arriving = frame.generation,
+                "keeping the newer parked cloud frame, dropping a superseded arrival"
+            );
+            return;
+        }
+        *parked = Some(frame);
+    }
+
+    /// Take the parked cloud pair, leaving the spot empty.
+    pub(crate) fn take_cloud_frame(&self) -> Option<CloudFrame> {
+        self.cloud_frame
+            .lock()
+            .expect("cloud frame mailbox lock poisoned")
+            .take()
+    }
+}
+
+/// One cloud frame and its clear-sky background, decoded together and stamped
+/// with the cloud generation they were made for.
+///
+/// A pair travels as one message so the renderer uploads the map and the
+/// background in the same breath and rebuilds the cloud bind group once,
+/// rather than drawing a new map against the previous background while the
+/// two slot messages cross. The generation is what the consumer checks
+/// against the generation in force: a frame made for a target the session
+/// has already left is dropped with the previous GPU image kept on show.
+pub struct CloudFrame {
+    pub map: texture_loader::DecodedImage,
+    pub background: texture_loader::DecodedImage,
+    pub generation: u64,
 }
 
 /// Whether what is already parked is from a newer generation than what is
@@ -244,5 +293,59 @@ mod tests {
         // The mailbox must still accept valid slots afterwards.
         mailbox.post(message(1, 1));
         assert_eq!(mailbox.take_all().len(), 1);
+    }
+
+    /// A decoded pair tagged with its generation so tests can tell frames
+    /// apart.
+    fn cloud_frame(map_width: u32, generation: u64) -> CloudFrame {
+        let image = |width: u32| texture_loader::DecodedImage {
+            pixels: texture_loader::Pixels::new(vec![0; 4]),
+            width,
+            height: 1,
+            channels: texture_loader::Channels::Rgba,
+        };
+        CloudFrame {
+            map: image(map_width),
+            background: image(map_width / 2),
+            generation,
+        }
+    }
+
+    fn parked_frame_tag(mailbox: &TextureMailbox) -> u32 {
+        let frame = mailbox
+            .take_cloud_frame()
+            .expect("expected exactly one parked pair");
+        frame.map.width
+    }
+
+    #[test]
+    fn a_cloud_pair_is_taken_whole_and_the_slot_messages_stay_untouched() {
+        let mailbox = TextureMailbox::new(4);
+        mailbox.post_cloud_frame(cloud_frame(64, 0));
+        let frame = mailbox.take_cloud_frame().expect("the pair is parked");
+        assert_eq!(frame.map.width, 64);
+        assert_eq!(frame.background.width, 32, "the background travels with it");
+        assert_eq!(frame.generation, 0);
+        assert!(
+            mailbox.take_cloud_frame().is_none(),
+            "the take empties the pair spot"
+        );
+        // The pair spot and the file-texture slots are independent.
+        mailbox.post(message(1, 3));
+        mailbox.post_cloud_frame(cloud_frame(64, 1));
+        assert_eq!(mailbox.take_all().len(), 1);
+        assert_eq!(parked_frame_tag(&mailbox), 64);
+    }
+
+    #[test]
+    fn the_newest_cloud_pair_wins_whichever_order_the_two_arrive_in() {
+        let mailbox = TextureMailbox::new(4);
+        mailbox.post_cloud_frame(cloud_frame(64, 1));
+        mailbox.post_cloud_frame(cloud_frame(96, 2));
+        assert_eq!(parked_frame_tag(&mailbox), 96);
+
+        mailbox.post_cloud_frame(cloud_frame(96, 2));
+        mailbox.post_cloud_frame(cloud_frame(64, 1));
+        assert_eq!(parked_frame_tag(&mailbox), 96);
     }
 }

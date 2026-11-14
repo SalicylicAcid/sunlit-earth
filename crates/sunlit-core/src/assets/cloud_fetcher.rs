@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use crate::config::{DEFAULT_TEXTURE_RESOLUTION, TEXTURE_RESOLUTIONS};
 
 use super::cloud_haze;
 use super::cloud_source::{CloudSource, CloudTarget, Download};
-use super::mailbox::{DecodedTextureMessage, TextureMailbox};
+use super::mailbox::{CloudFrame, TextureMailbox};
 use super::texture_loader::{self, Channels, DecodedImage, Pixels};
 
 /// Callback invoked after a new frame has been posted, so a client that only
@@ -235,21 +235,16 @@ pub(crate) enum PollOutcome {
     Abandoned,
 }
 
-/// The two mailbox slots every cloud map is posted to: the map's, and its
-/// clear-sky background's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CloudSlots {
-    pub map: usize,
-    pub background: usize,
-}
-
 /// Turns a [`CloudSource`] into decoded frames in the texture mailbox, keeping
 /// the on-disk cache in step.
 pub(crate) struct CloudUpdater {
     source: Arc<dyn CloudSource>,
     mailbox: TextureMailbox,
     notify: NotifyFn,
-    slots: CloudSlots,
+    /// The cloud generation in force, shared with the renderer. Read at post
+    /// time so a pair carries the generation it was made for; the worker bumps
+    /// it when the target changes.
+    generation: Arc<AtomicU64>,
     cache_dir: Option<PathBuf>,
     /// Avoid preparing the same offered resolution on every worker poll.
     variant: (u32, u32),
@@ -280,12 +275,14 @@ impl CloudUpdater {
     /// `resolution` and caching into `cache_dir` (skipped entirely when `None`).
     ///
     /// The source is pointed at the URL the cache entry is named after, so the
-    /// name and the bytes behind it cannot disagree.
+    /// name and the bytes behind it cannot disagree. `generation` is the shared
+    /// cloud generation: read at post time, bumped by the worker when the
+    /// target changes.
     pub fn new(
         source: Arc<dyn CloudSource>,
         mailbox: TextureMailbox,
         notify: NotifyFn,
-        slots: CloudSlots,
+        generation: Arc<AtomicU64>,
         cache_dir: Option<PathBuf>,
         resolution: u32,
     ) -> Self {
@@ -297,7 +294,7 @@ impl CloudUpdater {
             source,
             mailbox,
             notify,
-            slots,
+            generation,
             cache_dir,
             variant,
             target,
@@ -337,6 +334,11 @@ impl CloudUpdater {
             // A fixed URL keeps its image, in-memory ETag and cache entry.
             return false;
         }
+        // The target moved, so the pair of the previous one is no longer
+        // wanted. Bumped before the cached image of the new target is posted,
+        // which is what makes that posting land with the generation now in
+        // force; the worker reads the same counter for its own decisions.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         info!(
             resolution,
             "cloud source target follows the texture resolution"
@@ -488,15 +490,13 @@ impl CloudUpdater {
             elapsed_ms = format_args!("{:.1}", start.elapsed().as_secs_f64() * 1000.0),
             "estimated the clear-sky background"
         );
-        self.mailbox.post(DecodedTextureMessage {
-            slot_index: self.slots.background,
-            result: Ok(background),
-            generation: None,
-        });
-        self.mailbox.post(DecodedTextureMessage {
-            slot_index: self.slots.map,
-            result: Ok(img),
-            generation: None,
+        // One pair, not two slot messages: the renderer uploads both and
+        // rebuilds the cloud bind group once, so a new map is never drawn
+        // against the previous background.
+        self.mailbox.post_cloud_frame(CloudFrame {
+            map: img,
+            background,
+            generation: self.generation.load(Ordering::SeqCst),
         });
         self.posted.set(true);
         (self.notify)();
@@ -655,7 +655,7 @@ mod tests {
             Arc::clone(&source) as Arc<dyn CloudSource>,
             mailbox.clone(),
             no_notify(),
-            SLOTS,
+            test_generation(),
             Some(scratch.path().to_path_buf()),
             8192,
         );
@@ -703,7 +703,7 @@ mod tests {
                 Arc::new(HttpCloudSource::new(url.to_owned())),
                 mailbox.clone(),
                 no_notify(),
-                SLOTS,
+                test_generation(),
                 Some(scratch.path().to_path_buf()),
                 8192,
             )
@@ -981,31 +981,34 @@ mod tests {
 
     use super::super::cloud_source::CloudImage;
 
-    const SLOTS: CloudSlots = CloudSlots {
-        map: 3,
-        background: 4,
-    };
-    const SLOT_COUNT: usize = 5;
+    /// Enough slots for the grid and the two file-backed textures; the cloud
+    /// pair no longer travels through the slots at all.
+    const SLOT_COUNT: usize = 3;
 
-    /// Take everything parked and count the maps, each of which must have come
+    /// The cloud generation every test runs at unless it bumps its own.
+    fn test_generation() -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Take every parked pair and count the maps, each of which must have come
     /// with a background of the grid's size.
     fn maps_posted(mailbox: &TextureMailbox) -> usize {
-        let posted = mailbox.take_all();
-        let in_slot = |slot| posted.iter().filter(|m| m.slot_index == slot).count();
-        let (maps, backgrounds) = (in_slot(SLOTS.map), in_slot(SLOTS.background));
-        assert_eq!(maps, backgrounds, "a map without its background");
-        assert_eq!(maps + backgrounds, posted.len(), "a post to another slot");
-        for message in posted.iter().filter(|m| m.slot_index == SLOTS.background) {
-            let image = message
-                .result
-                .as_ref()
-                .expect("a background is never an error");
+        let mut pairs = Vec::new();
+        while let Some(frame) = mailbox.take_cloud_frame() {
             assert_eq!(
-                (image.width as usize, image.height as usize),
+                (
+                    frame.background.width as usize,
+                    frame.background.height as usize
+                ),
                 (cloud_haze::GRID_WIDTH, cloud_haze::GRID_HEIGHT)
             );
+            pairs.push(frame);
         }
-        maps
+        assert!(
+            mailbox.take_all().is_empty(),
+            "the cloud pair must not travel through the file-texture slots"
+        );
+        pairs.len()
     }
 
     fn updater_for(source: Arc<ScriptedSource>, mailbox: &TextureMailbox) -> CloudUpdater {
@@ -1013,7 +1016,7 @@ mod tests {
             source,
             mailbox.clone(),
             no_notify(),
-            SLOTS,
+            test_generation(),
             None,
             DEFAULT_TEXTURE_RESOLUTION,
         )
@@ -1126,7 +1129,7 @@ mod tests {
             source,
             mailbox,
             notify,
-            SLOTS,
+            test_generation(),
             None,
             DEFAULT_TEXTURE_RESOLUTION,
         );
@@ -1203,7 +1206,7 @@ mod tests {
             Arc::clone(source) as Arc<dyn CloudSource>,
             mailbox.clone(),
             no_notify(),
-            SLOTS,
+            test_generation(),
             Some(dir.to_path_buf()),
             resolution,
         )
@@ -1221,7 +1224,7 @@ mod tests {
             Arc::clone(&source) as Arc<dyn CloudSource>,
             mailbox,
             no_notify(),
-            SLOTS,
+            test_generation(),
             None,
             8192,
         );

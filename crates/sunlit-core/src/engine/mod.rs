@@ -24,7 +24,6 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
-use crate::assets::cloud_fetcher::CloudSlots;
 use crate::assets::mailbox::TextureMailbox;
 use crate::assets::tiles::TranscoderConfig;
 use crate::config::QualityTier;
@@ -296,6 +295,10 @@ impl Engine {
         let now = clock.elapsed();
         let month = crate::scene::month::month_in_force(&params.time, clock.now_utc());
         let drawn_instant = params.time.instant(clock.now_utc());
+        // The cloud generation in force: bumped by the worker whenever the
+        // effective target changes, read by the renderer to drop the frames of
+        // a target the session has left.
+        let cloud_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cpu_adapter = gpu.device_type == wgpu::DeviceType::Cpu;
         let formats = SurfaceFormats::for_adapter(
             gpu.device
@@ -343,6 +346,7 @@ impl Engine {
                 texture_resolution,
                 mailbox: mailbox.clone(),
                 notify: Arc::clone(&notify),
+                cloud_generation: Arc::clone(&cloud_generation),
                 cube_month: surface.as_ref().map(|_| month),
                 cpu_adapter,
                 tile_geometry,
@@ -355,14 +359,11 @@ impl Engine {
                 source,
                 mailbox,
                 notify,
+                Arc::clone(&cloud_generation),
                 cache_dir,
                 cloud_poll_interval,
                 now,
                 texture_resolution,
-                CloudSlots {
-                    map: slots.clouds(),
-                    background: slots.cloud_background(),
-                },
                 params.clouds_enabled,
             )
         });

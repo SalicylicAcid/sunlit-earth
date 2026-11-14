@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use tracing::{debug, error, info};
 
@@ -28,8 +29,8 @@ pub(super) struct TextureSlot {
 /// processed, signaling that a re-render is needed even if the frame state
 /// hasn't changed.
 pub(super) fn process_decoded_textures(res: &mut super::Renderer) -> bool {
+    let mut applied_any = process_cloud_frame(res);
     let messages = res.texture_mailbox.take_all();
-    let mut applied_any = false;
     for msg in messages {
         if !is_current(msg.generation, res.texture_generation) {
             debug!(
@@ -65,10 +66,9 @@ pub(super) fn process_decoded_textures(res: &mut super::Renderer) -> bool {
                 info!(slot = msg.slot_index, "GPU texture created");
                 crate::memory::log_memory_usage("after texture upload");
                 let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let layout = res.layout();
-                // The clouds and their background are drawn through the cloud
-                // group alone, which is rebuilt below.
-                let bind_group = (msg.slot_index < layout.clouds()).then(|| {
+                // The cloud pair no longer travels through the slots: it comes
+                // as one message, uploaded whole by `process_cloud_frame`.
+                let bind_group = (msg.slot_index < res.layout().clouds()).then(|| {
                     res.flat_bind_group(&tex_view, &format!("bind_group_slot_{}", msg.slot_index))
                 });
                 let slot = &mut res.texture_slots[msg.slot_index];
@@ -80,14 +80,6 @@ pub(super) fn process_decoded_textures(res: &mut super::Renderer) -> bool {
                 // for the purge, where the point is to release before the
                 // replacement is allocated.
                 slot.texture = Some(tex);
-
-                if msg.slot_index == layout.clouds() {
-                    res.cloud_texture_view = Some(tex_view);
-                    res.rebuild_cloud_group();
-                } else if msg.slot_index == layout.cloud_background() {
-                    res.cloud_background_view = Some(tex_view);
-                    res.rebuild_cloud_group();
-                }
             }
             Err(e) => {
                 error!(slot = msg.slot_index, error = %e, "texture decode failed");
@@ -99,6 +91,55 @@ pub(super) fn process_decoded_textures(res: &mut super::Renderer) -> bool {
     }
     res.texture_dirty |= applied_any;
     applied_any
+}
+
+/// Take the parked cloud pair, if any, and upload it whole.
+///
+/// The map and its clear-sky background land together and the cloud bind
+/// group is rebuilt once, so a new map is never drawn against the previous
+/// background. A pair from a generation that is no longer in force is dropped
+/// with the previous target's image kept, which is what a switch shows while
+/// the new one loads: the old picture, with `clouds_resident` reading false
+/// until the pair of the generation in force has landed.
+fn process_cloud_frame(res: &mut super::Renderer) -> bool {
+    let Some(frame) = res.texture_mailbox.take_cloud_frame() else {
+        return false;
+    };
+    let current = res.cloud_generation.load(Ordering::SeqCst);
+    if frame.generation != current {
+        debug!(
+            arriving = frame.generation,
+            current, "dropping a cloud frame from a target the session has left"
+        );
+        return false;
+    }
+    let map = create_mipmapped_texture(&res.device, &res.queue, "cloud_map", frame.map);
+    let background = create_mipmapped_texture(
+        &res.device,
+        &res.queue,
+        "cloud_background",
+        frame.background,
+    );
+    // Flush staging buffers so they don't accumulate across textures.
+    let _ = res.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    info!(generation = frame.generation, "the cloud pair is uploaded");
+    crate::memory::log_memory_usage("after cloud pair upload");
+    // Replacing the views before the old textures are dropped, not after:
+    // the bind group being rebuilt may still reference them, and wgpu's own
+    // refcount frees them once nothing does. Destroying is for the purge,
+    // which a cloud switch is not.
+    res.cloud_texture_view = Some(map.create_view(&wgpu::TextureViewDescriptor::default()));
+    res.cloud_background_view =
+        Some(background.create_view(&wgpu::TextureViewDescriptor::default()));
+    res.cloud_map_texture = Some(map);
+    res.cloud_background_texture = Some(background);
+    res.rebuild_cloud_group();
+    res.cloud_generation_drawn = frame.generation;
+    res.texture_dirty = true;
+    true
 }
 
 /// Whether a decoded texture is still wanted.
