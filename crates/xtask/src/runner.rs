@@ -82,6 +82,13 @@ pub struct Cmd {
     /// a command whose whole purpose is to hand the terminal over, and there is
     /// one: `vm ssh`, which is a person at a shell in the guest.
     pub interactive: bool,
+    /// Whether the command's `script` travels as a temporary `-File` that the
+    /// real runner writes right before the spawn and deletes once the child
+    /// has exited, rather than as an encoded command-line argument. Behavioral
+    /// antivirus on a developer machine kills a long-running encoded session,
+    /// which is what moved the transport off the command line; the history is
+    /// on [`powershell`].
+    pub script_file: bool,
 }
 
 impl Cmd {
@@ -214,8 +221,9 @@ impl RealRunner {
     }
 }
 
-impl Runner for RealRunner {
-    fn capture(&self, cmd: &Cmd) -> io::Result<CommandOutput> {
+impl RealRunner {
+    /// The capture body once the command's script file, if any, exists.
+    fn capture_piped(cmd: &Cmd) -> io::Result<CommandOutput> {
         let mut command = Self::build(cmd);
         command
             .stdin(if cmd.stdin.is_some() {
@@ -249,7 +257,8 @@ impl Runner for RealRunner {
         })
     }
 
-    fn stream(&self, cmd: &Cmd) -> io::Result<i32> {
+    /// The stream body once the command's script file, if any, exists.
+    fn stream_inherited(cmd: &Cmd) -> io::Result<i32> {
         let mut command = Self::build(cmd);
         command
             .stdin(if cmd.interactive {
@@ -262,9 +271,35 @@ impl Runner for RealRunner {
         let status = command.status()?;
         Ok(status.code().unwrap_or(-1))
     }
+}
+
+impl Runner for RealRunner {
+    fn capture(&self, cmd: &Cmd) -> io::Result<CommandOutput> {
+        let (cmd, temp_script) = materialize(cmd)?;
+        let outcome = Self::capture_piped(&cmd);
+        if let Some(path) = temp_script {
+            // Best effort: a file antivirus still holds is not worth failing a
+            // finished result over, and the next run writes a fresh name.
+            let _ = std::fs::remove_file(path);
+        }
+        outcome
+    }
+
+    fn stream(&self, cmd: &Cmd) -> io::Result<i32> {
+        let (cmd, temp_script) = materialize(cmd)?;
+        let outcome = Self::stream_inherited(&cmd);
+        if let Some(path) = temp_script {
+            let _ = std::fs::remove_file(path);
+        }
+        outcome
+    }
 
     fn spawn(&self, cmd: &Cmd, log: Option<&Path>) -> io::Result<u32> {
-        let mut command = Self::build(cmd);
+        // A spawned process may outlive this call, so a materialized script
+        // file is deliberately left where it is. No spawn caller hands over a
+        // script today; `capture` and `stream` are the paths that clean up.
+        let (cmd, _temp_script) = materialize(cmd)?;
+        let mut command = Self::build(&cmd);
         command.stdin(Stdio::null());
         match log {
             Some(path) => {
@@ -460,37 +495,84 @@ pub fn find_on_path(
     None
 }
 
-/// Build a `powershell.exe` invocation that reads its script from stdin.
+/// Build a `powershell.exe` invocation whose script travels as a temporary
+/// file that the real runner writes and deletes, and whose payload, if any,
+/// arrives on stdin.
 ///
-/// `-EncodedCommand` rather than `-Command` or a temporary script file. It
-/// sidesteps every quoting problem a multi-line script would otherwise hit on
-/// the command line, and it is the only one of the three that both leaves the
-/// filesystem alone and parses the script as a script.
+/// The transport was `-EncodedCommand` for a long time, and its advantages
+/// still hold: it sidesteps every quoting problem a multi-line script would
+/// otherwise hit on the command line, and it parses the script as a script.
+/// What changed is the neighborhood. Behavioral antivirus kills a long-running
+/// encoded session on a developer machine — measured on Huorong in 2026-11: a
+/// 321 KB stdin payload died at 30 s with exit code -1 and no output, while a
+/// short script ran to completion — which broke the script-syntax check and
+/// put every heavier xtask command behind the same risk. `-File` parses the
+/// same script without the signature, and `[Console]::In` reads the piped
+/// payload exactly as it does behind `-EncodedCommand`. The file is written
+/// right before the spawn and deleted once the child has exited, in `capture`
+/// and `stream`.
 ///
-/// The two alternatives were tried first and both failed silently, which is
-/// what earns this a paragraph. `-Command -` reads stdin the way a console
-/// reads typing: a multi-line script came back with no output, no error, and
-/// exit code 0, because a script read that way does not set an exit code when
-/// it dies. The console encoding line is wrapped in a `try` for a related
-/// reason: it throws when the process has no console attached, which is exactly
-/// the case when the xtask was started by a tool rather than from a terminal.
+/// The two alternatives tried before `-EncodedCommand` both failed silently,
+/// which is what earns this a paragraph. `-Command -` reads stdin the way a
+/// console reads typing: a multi-line script came back with no output, no
+/// error, and exit code 0, because a script read that way does not set an
+/// exit code when it dies. The console encoding line is wrapped in a `try`
+/// for a related reason: it throws when the process has no console attached,
+/// which is exactly the case when the xtask was started by a tool rather than
+/// from a terminal.
 ///
-/// The plaintext is kept on the command for logging and for the test double to
-/// match on, since the arguments themselves are base64 by then.
+/// The plaintext is kept on the command for logging and for the test double
+/// to match on.
 pub fn powershell(script: &str) -> Cmd {
     let prelude = "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }\n\
                    $ErrorActionPreference = 'Stop'\n";
     let full = format!("{prelude}{script}");
-    Cmd::new("powershell.exe")
+    let mut cmd = Cmd::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-EncodedCommand",
-            &encode_command(&full),
         ])
-        .script(full)
+        .script(full);
+    cmd.script_file = true;
+    cmd
+}
+
+/// Complete a command whose script travels as a temporary file: write the
+/// file and append the `-File` arguments. A command without one passes
+/// through untouched, and the file's removal belongs to the runner paths
+/// that wait for the child.
+fn materialize(cmd: &Cmd) -> io::Result<(Cmd, Option<PathBuf>)> {
+    if !cmd.script_file {
+        return Ok((cmd.clone(), None));
+    }
+    let script = cmd
+        .script
+        .as_deref()
+        .ok_or_else(|| io::Error::other("a file-transport script command carries no script"))?;
+    let path = write_temp_script(script)?;
+    let mut owned = cmd.clone();
+    owned.args.push("-File".to_owned());
+    owned.args.push(path.display().to_string());
+    Ok((owned, Some(path)))
+}
+
+/// Write the script for a `-File` argument: UTF-8 with a BOM, so Windows
+/// `PowerShell` 5.1 reads the bytes as UTF-8 whatever the system code page is.
+fn write_temp_script(script: &str) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let mut bytes = Vec::with_capacity(script.len() + 3);
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(script.as_bytes());
+    let path = std::env::temp_dir().join(format!(
+        "xtask-ps-{}-{}.ps1",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 /// Encode a script the way `-EncodedCommand` expects: UTF-16LE, then base64.
@@ -839,11 +921,14 @@ mod tests {
     }
 
     #[test]
-    fn powershell_scripts_travel_base64_encoded() {
+    fn powershell_scripts_travel_as_a_temporary_file() {
         let cmd = powershell("Get-CimInstance Win32_ComputerSystem");
         assert_eq!(cmd.program, "powershell.exe");
         assert!(cmd.args.contains(&"-NonInteractive".to_owned()));
-        assert!(cmd.args.contains(&"-EncodedCommand".to_owned()));
+        // The encoded form is gone: behavioral antivirus kills a long-running
+        // encoded session on a developer machine.
+        assert!(!cmd.args.contains(&"-EncodedCommand".to_owned()));
+        assert!(cmd.script_file);
         // Nothing is expected on stdin, which is what stopped working.
         assert_eq!(cmd.stdin, None);
         let script = cmd.script.expect("the plaintext travels with the command");
@@ -853,8 +938,26 @@ mod tests {
             script.starts_with("try {"),
             "the encoding line must not be able to kill the script"
         );
-        let encoded = cmd.args.last().expect("the encoded script is last");
-        assert_eq!(encode_command(&script), *encoded);
+    }
+
+    #[test]
+    fn the_real_runner_materializes_the_script_file_with_a_bom() {
+        let cmd = powershell("Write-Output 'materialized'");
+        let (materialized, temp) = materialize(&cmd).expect("the script is written");
+        let path = temp.expect("a file-transport command materializes one file");
+        assert_eq!(materialized.args.last(), Some(&path.display().to_string()));
+        assert_eq!(
+            materialized.args.get(materialized.args.len() - 2),
+            Some(&"-File".to_owned())
+        );
+        let bytes = std::fs::read(&path).expect("the script is read");
+        assert!(
+            bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "the BOM is what makes Windows PowerShell 5.1 read UTF-8"
+        );
+        let text = String::from_utf8_lossy(&bytes[3..]);
+        assert!(text.contains("Write-Output 'materialized'"));
+        std::fs::remove_file(&path).expect("the test cleans its own file");
     }
 
     #[test]
