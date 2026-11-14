@@ -241,18 +241,21 @@ struct Job {
     size: (u32, u32),
 }
 
-/// Whether the cloud layer's first answer has come, for the sheet's wait: a
-/// layer with no source never answers, so it is never waited for.
+/// Whether the cloud layer's answer for the target in force has come, for
+/// the sheet's wait: a layer with no source never answers, so it is never
+/// waited for. `drawn` follows the latest `CloudsSettled`, and a runtime
+/// source switch clears it, so a switch can never reuse the previous
+/// target's ready state.
 pub struct CloudGate {
     pub has_source: AtomicBool,
-    pub settled: AtomicBool,
+    pub drawn: AtomicBool,
 }
 
 /// The cloud layer of this process's engine, which `app.rs` and the event
-/// forwarder keep from startup, since `CloudsSettled` is sent once.
+/// forwarder keep from startup.
 pub static CLOUDS: CloudGate = CloudGate {
     has_source: AtomicBool::new(false),
-    settled: AtomicBool::new(false),
+    drawn: AtomicBool::new(false),
 };
 
 struct Controller {
@@ -513,7 +516,7 @@ impl Controller {
     /// Whether the cloud layer still owes the answer an export waits for.
     fn clouds_pending(&self, window: &MainWindow) -> bool {
         CLOUDS.has_source.load(Ordering::Relaxed)
-            && !CLOUDS.settled.load(Ordering::Relaxed)
+            && !CLOUDS.drawn.load(Ordering::Relaxed)
             && crate::ui_callbacks::read_params_from_window(window, self.link.aa_counts())
                 .draws_clouds()
     }

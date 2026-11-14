@@ -91,6 +91,12 @@ impl EngineLink {
         self.tx.clone()
     }
 
+    /// Replace the cloud source at runtime, resolved on the engine thread the
+    /// way the startup one is.
+    pub fn set_cloud_source(&self, config: sunlit_core::config::CloudSourceConfig) {
+        self.send(EngineCommand::SetCloudSource(Box::new(config)));
+    }
+
     /// Tell the engine whether anyone is looking at the preview.
     ///
     /// A hidden window costs a full readback plus a `SharedPixelBuffer` copy
@@ -266,9 +272,12 @@ pub fn event_forwarder(
         // so no wallpaper the running app asks for needs this event. The
         // export sheet does, since its exports are not publishes; the
         // one-shot commands read it to say why a picture has no clouds.
-        EngineEvent::CloudsSettled { .. } => {
-            crate::export::CLOUDS.settled.store(true, Ordering::Relaxed);
+        EngineEvent::CloudsSettled { drawn, .. } => {
+            crate::export::CLOUDS.drawn.store(drawn, Ordering::Relaxed);
             let _ = slint::invoke_from_event_loop(crate::export::clouds_settled);
+        }
+        EngineEvent::CloudStatus(status) => {
+            crate::ui_callbacks::cloud_status_to_ui(weak.clone(), status);
         }
         EngineEvent::Excursion(state) => {
             let weak = weak.clone();

@@ -206,8 +206,12 @@ struct Engine {
     /// Set when something happened that the next render must pick up.
     dirty: bool,
     textures_ready: bool,
-    /// Whether `CloudsSettled` has gone out, which it does once.
-    clouds_settled: bool,
+    /// The generation the last `CloudsSettled` went out for. One per
+    /// generation: a source switch announces afresh, and the same source's
+    /// later polls announce nothing.
+    clouds_settled_for: Option<u64>,
+    /// The cloud status last forwarded, so the event goes out on changes only.
+    cloud_status: Option<String>,
     /// Whether the one debug-level memory dump has already been written. It
     /// goes out the first time the textures are ready, which is the first
     /// moment the numbers describe a loaded scene rather than a half-built one.
@@ -407,7 +411,8 @@ impl Engine {
             drawn_short_edge: 0.0,
             dirty: true,
             textures_ready: false,
-            clouds_settled: false,
+            clouds_settled_for: None,
+            cloud_status: None,
             memory_dumped: false,
             last_status: String::new(),
             drain: Schedule::new(DRAIN_INTERVAL, now),
@@ -796,6 +801,7 @@ impl Engine {
             self.dirty = true;
         }
         self.note_clouds();
+        self.note_cloud_status();
 
         // Every tick rather than on the drain's schedule: a pack that landed is
         // one cheap check away, and the first frame of a first run waits on it.
@@ -1297,19 +1303,22 @@ impl Engine {
         }
     }
 
-    /// Tell clients, once, what the cloud layer's first answer was: drawn when
-    /// the map and its background are uploaded, not when the worker's first
-    /// attempt had nothing to show.
+    /// Tell clients, once per target, what the cloud layer's first answer
+    /// was: drawn when that target's map and its background are uploaded, not
+    /// when its first attempt had nothing to show. The generation names the
+    /// target, so a switch announces afresh and a client can tell "the
+    /// current target is ready" from "an older target's image is still up".
     ///
     /// After every drain, and on every tick, since an answer of nothing posts
     /// nothing and so wakes nobody.
     fn note_clouds(&mut self) {
-        if self.clouds_settled {
-            return;
-        }
         let Some(cloud) = &self.cloud else {
             return;
         };
+        let generation = cloud.cloud_generation();
+        if self.clouds_settled_for == Some(generation) {
+            return;
+        }
         let drawn = if self.renderer.clouds_resident() {
             true
         } else if cloud.first_answer() == FirstAnswer::Unavailable {
@@ -1317,13 +1326,28 @@ impl Engine {
         } else {
             return;
         };
-        self.clouds_settled = true;
+        self.clouds_settled_for = Some(generation);
         if drawn {
             debug!("the cloud layer is resident");
         } else {
             debug!("the cloud layer has nothing to show yet");
         }
-        self.emit(EngineEvent::CloudsSettled { drawn });
+        self.emit(EngineEvent::CloudsSettled { drawn, generation });
+    }
+
+    /// Forward what the cloud layer is doing when it changes. Called on every
+    /// tick: a long native round's phases are the only movement the UI sees
+    /// for minutes at a time.
+    fn note_cloud_status(&mut self) {
+        let Some(cloud) = &self.cloud else {
+            return;
+        };
+        let status = cloud.status();
+        if self.cloud_status.as_ref() == Some(&status) {
+            return;
+        }
+        self.cloud_status = Some(status.clone());
+        self.emit(EngineEvent::CloudStatus(status));
     }
 
     fn emit(&self, event: EngineEvent) {

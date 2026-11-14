@@ -1,18 +1,21 @@
 //! UI callback registration and config-to-window bridge functions.
 
+use std::sync::atomic::Ordering;
+
 use slint::ComponentHandle;
 
 use crate::camera_controls::{self, EaseField};
 use crate::displays;
 use crate::engine_client::EngineLink;
+use crate::export::CLOUDS;
 use crate::mouse_math;
 use crate::{
     AtmosphereSettings, CameraOrientationSettings, CameraPositionSettings, CameraReset,
-    CameraStick, CelestialSettings, CloudCoverSettings, CloudSettings, ColorCorrectionSettings,
-    ColorText, DateTimeSettings, FramingSettings, HazeSettings, LightingSettings, MainWindow,
-    MoonSettings, NightglowSettings, OverlayHints, OverlayStyle, ParsedColor, RayleighSettings,
-    SceneSettings, SkySettings, StarSettings, SunSettings, SunriseBandSettings,
-    TextureColorSettings,
+    CameraStick, CelestialSettings, CloudCoverSettings, CloudSettings, CloudSourceSettings,
+    ColorCorrectionSettings, ColorText, DateTimeSettings, FramingSettings, HazeSettings,
+    LightingSettings, MainWindow, MoonSettings, NightglowSettings, OverlayHints, OverlayStyle,
+    ParsedColor, RayleighSettings, SceneSettings, SkySettings, StarSettings, SunSettings,
+    SunriseBandSettings, TextureColorSettings,
 };
 use sunlit_core::color::Rgb8;
 use sunlit_core::config::{self, AppConfig};
@@ -631,6 +634,17 @@ pub fn register_action_callbacks(
     {
         let window_weak = window.as_weak();
         let engine = link.clone();
+        window.on_apply_cloud_source(move |draft| {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            apply_cloud_source(&win, &engine, &draft);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
         window.on_set_wallpaper(move || {
             let Some(win) = window_weak.upgrade() else {
                 return;
@@ -849,6 +863,7 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
     window.set_defaults(scene_settings(&SceneParams::default()));
     window.set_time_zone_utc(config.time_zone == config::TimeZoneChoice::Utc);
     apply_params_to_window(window, &SceneParams::from_config(config));
+    apply_cloud_source_to_window(window, &config.cloud_source);
     update_solar_time_label(window);
 
     window.set_auto_refresh_enabled(config.auto_refresh_enabled);
@@ -861,6 +876,94 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
     window.set_auto_refresh_interval(config.auto_refresh_interval_minutes as f32);
 
     update_datetime_labels(window);
+}
+
+/// Push one cloud source config into the window as the applied value, a
+/// draft over it, and the defaults resets go back to.
+fn apply_cloud_source_to_window(window: &MainWindow, config: &config::CloudSourceConfig) {
+    let applied = cloud_source_settings(config);
+    window.set_cloud_source(applied.clone());
+    window.set_cloud_source_draft(applied.clone());
+    let defaults = config::CloudSourceConfig::default();
+    window.set_cloud_source_defaults(cloud_source_settings(&defaults));
+    window.set_cloud_source_status(String::new().into());
+    let env = sunlit_core::env_override(sunlit_core::config::clouds::ENV_CLOUD_URL);
+    window.set_cloud_source_override(env.as_deref().is_some_and(|v| !v.trim().is_empty()));
+}
+
+/// The window's struct for one source config. Gamma and blur travel scaled,
+/// as the sliders' integers, and come back as the floats the settings carry.
+fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSettings {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a setting in 0..255 and two curves in small ranges, far inside f32"
+    )]
+    let build = |mode: i32| CloudSourceSettings {
+        mode,
+        remote_url: config.remote_url.clone().into(),
+        floor: f32::from(config.eumetsat.floor),
+        ceiling: f32::from(config.eumetsat.ceiling),
+        gamma: config.eumetsat.gamma as f32,
+        blur: config.eumetsat.blur as f32,
+    };
+    match config.mode {
+        config::CloudSourceMode::Eumetsat => build(1),
+        config::CloudSourceMode::Remote => build(0),
+    }
+}
+
+/// The window's struct, back into a configuration, for validation, the
+/// engine's switch and the save.
+fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSourceConfig {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the slider's rounded values, all inside the ranges it clamps"
+    )]
+    let eumetsat = config::EumetsatSettings {
+        floor: settings.floor.round() as u8,
+        ceiling: settings.ceiling.round() as u8,
+        gamma: f64::from(settings.gamma),
+        blur: f64::from(settings.blur),
+    };
+    config::CloudSourceConfig {
+        mode: if settings.mode == 1 {
+            config::CloudSourceMode::Eumetsat
+        } else {
+            config::CloudSourceMode::Remote
+        },
+        remote_url: settings.remote_url.to_string(),
+        eumetsat,
+    }
+}
+
+/// The Apply button: validate the draft as one, then switch the engine,
+/// save, and put the applied value back. An invalid draft says so and
+/// touches nothing. The export gate is cleared here, so the sheet can never
+/// reuse the previous target's ready state after a switch.
+fn apply_cloud_source(win: &MainWindow, engine: &EngineLink, draft: &CloudSourceSettings) {
+    let config = cloud_source_config_from(draft);
+    if !config.is_valid() {
+        win.set_cloud_source_status(
+            "The source is not valid: the URL must be HTTP or HTTPS without embedded              credentials, and 0 <= floor < ceiling <= 255, gamma in [0.1, 4], blur in              [0, 10]. Nothing was applied."
+                .into(),
+        );
+        return;
+    }
+    engine.set_cloud_source(config.clone());
+    CLOUDS.drawn.store(false, Ordering::Relaxed);
+    win.set_cloud_source_status("Applied; the map is on its way.".into());
+    apply_cloud_source_to_window(win, &config);
+    config::save_config(&read_config_from_window(win, engine));
+}
+
+/// The engine's cloud status line, handed to the window on the UI thread.
+pub fn cloud_status_to_ui(window: slint::Weak<MainWindow>, status: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(win) = window.upgrade() {
+            win.set_cloud_source_status(status.into());
+        }
+    });
 }
 
 /// The scene as the window holds it: one struct per group of the Advanced
@@ -1324,6 +1427,7 @@ pub fn read_config_from_window_onto(
         config.window_height = Some(height);
     }
     read_params_from_window(window, aa_counts).write_to_config(&mut config);
+    config.cloud_source = cloud_source_config_from(&window.get_cloud_source());
     config
 }
 

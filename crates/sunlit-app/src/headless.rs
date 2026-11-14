@@ -20,10 +20,23 @@ use crate::startup::engine_config;
 /// How long the render subcommand waits for textures before exporting anyway.
 const RENDER_TEXTURE_TIMEOUT: Duration = Duration::from_mins(2);
 
-/// How long a one-shot command waits for the cloud layer once its textures are
-/// in: an 8192 px map of about 5 MB on a slow link, and its decode in a debug
-/// build.
+/// How long a one-shot command waits for the cloud layer once its textures
+/// are in, when there is no source to name a budget for: an 8192 px map of
+/// about 5 MB on a slow link, and its decode in a debug build.
 const CLOUD_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// The cloud wait this run's source names, when there is one: a minute for a
+/// remote image, the native generation budget for EUMETSAT.
+fn cloud_timeout(config: &AppConfig) -> Duration {
+    let env = sunlit_core::env_override(sunlit_core::config::clouds::ENV_CLOUD_URL);
+    if env.as_deref().is_some_and(|v| !v.trim().is_empty()) || !config.clouds_enabled {
+        // An override forces a fixed remote URL; the layer switched off never
+        // waits.
+        CLOUD_TIMEOUT
+    } else {
+        config.cloud_source.wait(env.as_deref())
+    }
+}
 
 /// The `displays` subcommand: no window, no desktop, and no GPU unless asked.
 ///
@@ -80,7 +93,7 @@ pub(crate) fn run_displays(
         engine::EngineEvent::WallpaperSet(result) => {
             let _ = done_tx.try_send(result.clone());
         }
-        engine::EngineEvent::CloudsSettled { drawn } => {
+        engine::EngineEvent::CloudsSettled { drawn, .. } => {
             let _ = clouds_tx.try_send(drawn);
         }
         _ => {}
@@ -98,7 +111,7 @@ pub(crate) fn run_displays(
     // answer on its own, for a minute at the most. Waiting here as well is
     // what puts the outcome in the log before the render starts.
     if clouds {
-        wait_for_clouds(&clouds_rx, CLOUD_TIMEOUT);
+        wait_for_clouds(&clouds_rx, cloud_timeout(config));
     }
     engine.send(EngineCommand::RenderWallpaperNow);
     let status = match done_rx.recv_timeout(RENDER_TEXTURE_TIMEOUT) {
@@ -134,7 +147,7 @@ pub(crate) fn run_render(
         engine::EngineEvent::TexturesReady => {
             let _ = ready_tx.try_send(());
         }
-        engine::EngineEvent::CloudsSettled { drawn } => {
+        engine::EngineEvent::CloudsSettled { drawn, .. } => {
             let _ = clouds_tx.try_send(drawn);
         }
         _ => {}
@@ -164,7 +177,7 @@ pub(crate) fn run_render(
     // export is not a publish, so the engine's own wait for the clouds does
     // not apply to it.
     if clouds {
-        wait_for_clouds(&clouds_rx, CLOUD_TIMEOUT);
+        wait_for_clouds(&clouds_rx, cloud_timeout(config));
     }
 
     let status = match engine.render_to_file(output.to_path_buf(), width, height) {

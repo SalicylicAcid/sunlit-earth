@@ -232,11 +232,15 @@ impl Engine {
 
     /// Whether the cloud layer is still owed a first answer that a wallpaper
     /// should wait for: one is drawn, there is a source to draw it from, and
-    /// `CloudsSettled` has not gone out. Without the first two the event never
-    /// comes, and after it a slow, failing or in-flight poll holds nothing, so
-    /// a session offline for hours still publishes on schedule.
+    /// `CloudsSettled` has not gone out for the generation in force. Without
+    /// the first two the event never comes, and after it a slow, failing or
+    /// in-flight poll holds nothing, so a session offline for hours still
+    /// publishes on schedule, and a same-source refresh re-waits for nothing.
     fn clouds_pending(&self) -> bool {
-        self.cloud.is_some() && self.params.draws_clouds() && !self.clouds_settled
+        let Some(cloud) = &self.cloud else {
+            return false;
+        };
+        self.params.draws_clouds() && self.clouds_settled_for != Some(cloud.cloud_generation())
     }
 
     /// Whether the wallpaper owed has waited [`CLOUD_WAIT`] for the cloud layer
@@ -244,11 +248,17 @@ impl Engine {
     /// resident, and the log says the update is deferred at that moment, once
     /// per wait.
     fn clouds_waited_out(&mut self, now: Duration) -> bool {
+        // The budget is the source in force's: a remote image is a minute, a
+        // native round its whole generation budget.
+        let budget = self
+            .cloud
+            .as_ref()
+            .map_or(CLOUD_WAIT, super::cloud_worker::CloudWorker::wait);
         let since = *self.clouds_awaited_since.get_or_insert_with(|| {
             info!("wallpaper update deferred until the cloud layer has settled");
             now
         });
-        now.saturating_sub(since) >= CLOUD_WAIT
+        now.saturating_sub(since) >= budget
     }
 
     /// Whether the wallpaper owed has waited [`TILE_WAIT`] for its tiles by

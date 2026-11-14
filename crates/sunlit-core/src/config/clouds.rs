@@ -1,5 +1,7 @@
 //! Persisted cloud sources and validation, independent of the fetch worker.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
@@ -81,6 +83,14 @@ impl RemoteCloudUrl {
 }
 
 impl CloudSourceConfig {
+    /// How long a client waits for this source's first answer: the same
+    /// budget the resolved source reports through `CloudSource::wait`, so a
+    /// one-shot command and the wallpaper follow the source rather than a
+    /// constant sized for the widest case.
+    pub fn wait(&self, env_url: Option<&str>) -> Duration {
+        crate::assets::cloud_source::resolve(self, env_url, None).wait()
+    }
+
     /// Resolve a value obtained via `env_override(ENV_CLOUD_URL)`. Invalid
     /// overrides warn without their contents and fall back to the saved source.
     pub fn resolve(&self, env_url: Option<&str>) -> EffectiveCloudSource {
@@ -114,6 +124,12 @@ impl CloudSourceConfig {
             },
             eumetsat: saved.eumetsat,
         }
+    }
+
+    /// The public face of the window's validation: the same rule the
+    /// resolution enforces, so an Apply and a load cannot disagree.
+    pub fn is_valid(&self) -> bool {
+        self.valid()
     }
 
     fn valid(&self) -> bool {

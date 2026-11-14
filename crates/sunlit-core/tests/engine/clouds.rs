@@ -391,7 +391,7 @@ fn clouds_settled(harness: &Harness) -> Vec<bool> {
         .events
         .try_iter()
         .filter_map(|event| match event {
-            EngineEvent::CloudsSettled { drawn } => Some(drawn),
+            EngineEvent::CloudsSettled { drawn, .. } => Some(drawn),
             _ => None,
         })
         .collect()
@@ -546,7 +546,7 @@ fn a_cloud_layer_with_nothing_to_show_says_so_before_the_first_retry() {
     let deadline = start + FIRST_RETRY;
     let mut answer = None;
     while let Ok(event) = harness.events.recv_deadline(deadline) {
-        if let EngineEvent::CloudsSettled { drawn } = event {
+        if let EngineEvent::CloudsSettled { drawn, .. } = event {
             answer = Some(drawn);
             break;
         }
@@ -858,7 +858,7 @@ fn a_wallpaper_does_not_wait_on_a_first_poll_that_failed() {
     let mut published = false;
     while let Ok(event) = harness.events.recv_deadline(deadline) {
         match event {
-            EngineEvent::CloudsSettled { drawn } => settled = Some(drawn),
+            EngineEvent::CloudsSettled { drawn, .. } => settled = Some(drawn),
             EngineEvent::WallpaperSet(result) => {
                 assert!(result.is_ok());
                 published = true;

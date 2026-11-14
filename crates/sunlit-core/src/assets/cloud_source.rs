@@ -197,6 +197,20 @@ pub trait CloudSource: Send + Sync {
         target
     }
 
+    /// How long a client waits for this source's first answer: a remote image
+    /// is one download, the native source a whole generation budget.
+    fn wait(&self) -> Duration {
+        CloudWait::Existing.duration()
+    }
+
+    /// What the source is doing right now, when it knows. The fetch worker's
+    /// own states (checking, ready, failed) are the coarse answer; a source
+    /// whose work has visible phases says which it is in, and the UI shows
+    /// that instead.
+    fn status(&self) -> Option<String> {
+        None
+    }
+
     /// Fetch the current image if it differs from `known_etag`.
     ///
     /// Returns `Ok(None)` when the source is unchanged.

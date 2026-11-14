@@ -20,6 +20,7 @@
 
 use std::io::Cursor;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ use image::ImageEncoder;
 use tracing::{debug, info, warn};
 
 use super::cloud_fetcher::cloud_variant;
-use super::cloud_source::{CloudImage, CloudSource, CloudTarget, Download};
+use super::cloud_source::{CloudImage, CloudSource, CloudTarget, CloudWait, Download};
 use crate::config::DEFAULT_TEXTURE_RESOLUTION;
 use crate::config::clouds::EumetsatSettings;
 
@@ -461,6 +462,9 @@ pub struct EumetsatCloudSource {
     /// Backoff between transient attempts; the shipped values are
     /// [`RETRY_DELAYS`] and tests shorten them.
     retry_delays: [Duration; (MAX_ATTEMPTS - 1) as usize],
+    /// What the round is doing right now, for the UI's source status: set at
+    /// the pipeline's visible phases and cleared once the map is ready.
+    phase: Mutex<String>,
     agent: ureq::Agent,
 }
 
@@ -527,6 +531,7 @@ impl EumetsatCloudSource {
             cache_dir,
             first_fetch: AtomicBool::new(true),
             retry_delays: RETRY_DELAYS,
+            phase: Mutex::new(String::new()),
             agent,
         }
     }
@@ -538,6 +543,11 @@ impl EumetsatCloudSource {
     /// look.
     fn identity(px: u32) -> String {
         format!("{LAYER}|{px}")
+    }
+
+    /// Set the round's visible phase; an empty string clears it.
+    fn set_phase(&self, phase: &str) {
+        phase.clone_into(&mut self.phase.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     fn px(&self) -> u32 {
@@ -644,6 +654,15 @@ impl EumetsatCloudSource {
 }
 
 impl CloudSource for EumetsatCloudSource {
+    fn wait(&self) -> Duration {
+        CloudWait::LongFetch.duration()
+    }
+
+    fn status(&self) -> Option<String> {
+        let phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
+        (!phase.is_empty()).then(|| phase.clone())
+    }
+
     fn prepare(&self, resolution: u32) -> CloudTarget {
         let px = hemisphere_px(resolution);
         let mut size = self
@@ -673,6 +692,7 @@ impl CloudSource for EumetsatCloudSource {
                 );
                 return Ok(None);
             }
+            self.set_phase("processing locally");
             info!(px, "reprocessing the stored raw pair without the network");
             let west = decode_png(&pair.west, px)?;
             let east = decode_png(&pair.east, px)?;
@@ -687,8 +707,10 @@ impl CloudSource for EumetsatCloudSource {
 
         // Both hemispheres of one round, in order; only a complete pair goes
         // on to processing, so no half a map is ever stitched to history.
+        self.set_phase("downloading the west hemisphere");
         let (west_body, west) = self.fetch_hemisphere(HEMISPHERES[0].1, px, deadline)?;
         info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
+        self.set_phase("downloading the east hemisphere");
         let (east_body, east) = self.fetch_hemisphere(HEMISPHERES[1].1, px, deadline)?;
         info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
         let west_sha = sha256_hex(&west_body);

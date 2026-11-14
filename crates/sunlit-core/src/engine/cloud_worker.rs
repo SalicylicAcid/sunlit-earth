@@ -38,6 +38,17 @@ pub(super) struct CloudWorker {
     /// interrupted, and its results are dropped by the generation the apply
     /// raises.
     pending: Arc<Mutex<Option<Arc<dyn CloudSource>>>>,
+    /// The cloud generation in force, shared with the updater and the
+    /// renderer, which is what makes the first-answer and ready states
+    /// per-target rather than per-engine.
+    generation: Arc<AtomicU64>,
+    /// The source in force, so the engine can ask it what it is doing.
+    current: Arc<Mutex<Option<Arc<dyn CloudSource>>>>,
+    /// The worker's own coarse state, for the UI's source status.
+    status: Arc<Mutex<String>>,
+    /// The resolved source's first-answer budget, in milliseconds, which the
+    /// wallpaper's cloud wait and the headless waits follow.
+    wait_ms: Arc<AtomicU64>,
     pub(super) schedule: Schedule,
     /// A poll came due but the worker was busy, so it still owes one. Kept
     /// separate from the schedule so a busy worker does not drag the deadline
@@ -100,6 +111,34 @@ impl CloudWorker {
         *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(source);
     }
 
+    /// The cloud generation in force: raised whenever the effective target
+    /// changes, which is what makes the first-answer and ready states
+    /// per-target rather than per-engine.
+    pub(super) fn cloud_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// What the cloud layer is doing right now: the source's own phase when
+    /// it has one, the worker's coarse state otherwise.
+    pub(super) fn status(&self) -> String {
+        let coarse = self
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        current.and_then(|source| source.status()).unwrap_or(coarse)
+    }
+
+    /// How long a client waits for the source in force to answer once.
+    pub(super) fn wait(&self) -> Duration {
+        Duration::from_millis(self.wait_ms.load(Ordering::SeqCst))
+    }
+
     /// Tell the worker whether the cloud layer is switched on.
     pub(super) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
@@ -153,7 +192,16 @@ pub(super) fn spawn_cloud_worker(
     let worker_target = Arc::clone(&target);
     let pending = Arc::new(Mutex::new(None));
     let worker_pending = Arc::clone(&pending);
-    let worker_generation = Arc::clone(generation);
+    let generation = Arc::clone(generation);
+    let worker_generation = Arc::clone(&generation);
+    let current = Arc::new(Mutex::new(None));
+    let worker_current = Arc::clone(&current);
+    let status = Arc::new(Mutex::new(String::from("waiting for the first check")));
+    let worker_status = Arc::clone(&status);
+    let wait_ms = Arc::new(AtomicU64::new(
+        u64::try_from(source.wait().as_millis()).unwrap_or(u64::MAX),
+    ));
+    let worker_wait_ms = Arc::clone(&wait_ms);
     let answer = Arc::new(AtomicU8::new(FirstAnswer::Pending as u8));
     let worker_answer = Arc::clone(&answer);
     let enabled = Arc::new(AtomicBool::new(enabled));
@@ -166,6 +214,10 @@ pub(super) fn spawn_cloud_worker(
         .spawn(move || {
             // Kept beside the updater so a source switch can rebuild it: the
             // originals are moved into the first construction.
+            let updater_source = Arc::clone(&source);
+            *worker_current
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(updater_source);
             let worker_mailbox = mailbox.clone();
             let worker_notify = Arc::clone(&notify);
             let worker_cache_dir = cache_dir.clone();
@@ -193,6 +245,9 @@ pub(super) fn spawn_cloud_worker(
                     updater: &mut updater,
                     backoff: &mut backoff,
                     pending: &worker_pending,
+                    current: &worker_current,
+                    status: &worker_status,
+                    wait_ms: &worker_wait_ms,
                     mailbox: &worker_mailbox,
                     notify: &worker_notify,
                     cache_dir: worker_cache_dir.as_ref(),
@@ -230,6 +285,10 @@ pub(super) fn spawn_cloud_worker(
         busy,
         target,
         pending,
+        generation,
+        current,
+        status,
+        wait_ms,
         // Poll immediately on the first tick, then on the configured interval.
         schedule: Schedule {
             interval,
@@ -260,6 +319,9 @@ struct FetchLoop<'a> {
     updater: &'a mut CloudUpdater,
     backoff: &'a mut RetryBackoff,
     pending: &'a Mutex<Option<Arc<dyn CloudSource>>>,
+    current: &'a Mutex<Option<Arc<dyn CloudSource>>>,
+    status: &'a Mutex<String>,
+    wait_ms: &'a AtomicU64,
     mailbox: &'a TextureMailbox,
     notify: &'a crate::assets::cloud_fetcher::NotifyFn,
     cache_dir: Option<&'a PathBuf>,
@@ -279,8 +341,10 @@ impl FetchLoop<'_> {
             // interrupted; the updater drops what it brings back undecoded.
             if !self.enabled.load(Ordering::SeqCst) {
                 give_up(self.abandoned);
+                set_coarse(self.status, "the cloud layer is switched off");
                 return FetchEnds::LayerOff;
             }
+            set_coarse(self.status, "checking the cloud source");
             // A switch that arrived while an attempt was running applies
             // here, before the next one asks for anything.
             self.apply_switch();
@@ -299,6 +363,7 @@ impl FetchLoop<'_> {
             match outcome {
                 PollOutcome::Updated | PollOutcome::Unchanged => {
                     debug!("cloud poll settled");
+                    set_coarse(self.status, "the cloud map is ready");
                     self.backoff.reset();
                     return FetchEnds::Settled;
                 }
@@ -308,6 +373,10 @@ impl FetchLoop<'_> {
                 }
                 PollOutcome::Failed => {
                     let delay = self.backoff.fail();
+                    set_coarse(
+                        self.status,
+                        &format!("the last poll failed; retrying in {}s", delay.as_secs()),
+                    );
                     warn!(
                         retry_delay_secs = delay.as_secs(),
                         "cloud poll failed, retrying"
@@ -342,19 +411,30 @@ impl FetchLoop<'_> {
             "the cloud source changed, rebuilding the fetcher"
         );
         *self.updater = CloudUpdater::new(
-            source,
+            Arc::clone(&source),
             self.mailbox.clone(),
             self.notify.clone(),
             Arc::clone(self.generation),
             self.cache_dir.cloned(),
             self.target.load(Ordering::SeqCst),
         );
+        self.wait_ms.store(
+            u64::try_from(source.wait().as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(source);
+        set_coarse(self.status, "the cloud source changed");
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.answer
             .store(FirstAnswer::Pending as u8, Ordering::SeqCst);
         // A cache hit reports the new target as available without the network.
         self.updater.post_cached();
     }
+}
+
+/// Write the worker's coarse state; the engine forwards it when it changes.
+fn set_coarse(status: &Mutex<String>, text: &str) {
+    text.clone_into(&mut status.lock().unwrap_or_else(PoisonError::into_inner));
 }
 
 /// The layer is switched off: nothing more runs until it is on again, and the

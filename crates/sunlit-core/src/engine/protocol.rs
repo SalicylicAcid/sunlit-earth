@@ -214,12 +214,16 @@ pub enum EngineEvent {
     MonitorsChanged(Vec<crate::display::Monitor>),
     /// Loading-indicator text; empty when nothing is loading.
     Status(String),
-    /// The cloud layer's first answer, sent once per engine: `drawn` when the
-    /// map and its clear-sky background are both uploaded, and not when the
-    /// worker's first attempt found no cached map and a failed poll. Never
-    /// sent without a cloud source, or while the layer is switched off and no
-    /// poll has been made.
-    CloudsSettled { drawn: bool },
+    /// The cloud layer's first answer for the target named by the generation:
+    /// `drawn` when that target's map and clear-sky background are both
+    /// uploaded, and not when its first attempt found no cached map and a
+    /// failed poll. Sent once per generation, so a source switch announces
+    /// afresh, and never without a cloud source or while the layer is
+    /// switched off and no poll has been made.
+    CloudsSettled { drawn: bool, generation: u64 },
+    /// What the cloud layer is doing right now. Forwarded when it changes,
+    /// which for a long native round is the only movement the UI sees.
+    CloudStatus(String),
 }
 
 #[cfg(test)]

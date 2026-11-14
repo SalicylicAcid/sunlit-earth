@@ -1,4 +1,4 @@
-import { Slider, Button, Palette, ScrollView, SpinBox } from "std-widgets.slint";
+import { Slider, Button, Palette, ScrollView, SpinBox, LineEdit } from "std-widgets.slint";
 import { MonitorTile, Splitter, Hint, SettingRow, SettingColor, SettingCheck, SettingCombo, SettingHeading, SettingGroup } from "widgets.slint";
 import { OverlayHint, OverlayHints, OverlayStyle, GestureTip, OverlayButton } from "overlays/common.slint";
 import { CameraPanel, CameraStick, CameraReset } from "overlays/camera-panel.slint";
@@ -80,6 +80,19 @@ export struct CloudSettings {
     haze: HazeSettings,
     land: CloudCoverSettings,
     ocean: CloudCoverSettings,
+}
+
+// Where the cloud imagery comes from. Independent of `CloudSettings`: those
+// are shader parameters, this is the pipeline's input, and the two are saved,
+// applied and reset separately. `mode` is 0 for a remote image and 1 for the
+// native EUMETSAT pipeline.
+export struct CloudSourceSettings {
+    mode: int,
+    remote-url: string,
+    floor: float,
+    ceiling: float,
+    gamma: float,
+    blur: float,
 }
 
 export struct SkySettings {
@@ -248,12 +261,21 @@ export component MainWindow inherits Window {
     in-out property <FramingSettings> framing;
     in-out property <DateTimeSettings> datetime;
     in-out property <CloudSettings> clouds;
+    // The applied cloud source, its draft (edited in place, applied as one),
+    // what the round is doing, and whether the environment overrides it.
+    in-out property <CloudSourceSettings> cloud-source;
+    in-out property <CloudSourceSettings> cloud-source-draft;
+    in-out property <string> cloud-source-status;
+    in-out property <bool> cloud-source-override;
     in-out property <CelestialSettings> celestial;
     in-out property <AtmosphereSettings> atmosphere;
     in-out property <LightingSettings> lighting;
     in-out property <ColorCorrectionSettings> color-correction;
     // What every reset in the Advanced section goes back to.
     in property <SceneSettings> defaults;
+    // The cloud source's own reset target, separate from `SceneSettings`
+    // because the source is not a scene parameter.
+    in property <CloudSourceSettings> cloud-source-defaults;
 
     out property <length> viewport-width: image-container.width;
     out property <length> viewport-height: image-container.height;
@@ -273,6 +295,7 @@ export component MainWindow inherits Window {
     in property <float> day-gamma-value;
     in property <float> night-gamma-value;
     callback sliders-changed();
+    callback apply-cloud-source(CloudSourceSettings);
     callback msaa-changed();
     callback texture-changed();
     callback texture-resolution-changed();
@@ -1523,9 +1546,11 @@ export component MainWindow inherits Window {
 
                         SettingGroup {
                             title: "Clouds";
-                            modified: root.clouds != root.defaults.clouds;
+                            modified: root.clouds != root.defaults.clouds
+                                || root.cloud-source != root.cloud-source-defaults;
                             reset => {
                                 root.clouds = root.defaults.clouds;
+                                root.apply-cloud-source(root.cloud-source-defaults);
                                 root.sliders-changed();
                             }
                             VerticalLayout {
@@ -1536,6 +1561,110 @@ export component MainWindow inherits Window {
                                     hint: "Master switch for the cloud layer. While it is off, no new download or decode starts.";
                                     checked <=> root.clouds.enabled;
                                     toggled => { root.sliders-changed(); }
+                                }
+
+                                cloud-source-combo := SettingCombo {
+                                    label: "Source";
+                                    hint: "Where the cloud imagery comes from: a remote image, or the EUMETSAT infrared layer processed on this machine.";
+                                    model: [
+                                        "Remote image",
+                                        "EUMETSAT (this machine)",
+                                    ];
+                                    current-index <=> root.cloud-source-draft.mode;
+                                    enabled: !root.cloud-source-override;
+                                }
+
+                                if root.cloud-source-draft.mode == 0 :
+                                VerticalLayout {
+                                    cloud-url := LineEdit {
+                                        min-width: 0;
+                                        accessible-label: "Remote cloud image URL";
+                                        text <=> root.cloud-source-draft.remote-url;
+                        // The text is a draft: nothing fetches until Apply.
+                                        enabled: !root.cloud-source-override;
+                                        Tooltip {
+                                            Hint { text: "HTTP or HTTPS. {size} becomes the map's width by height, a fixed URL is used as it is. Applied, saved and fetched only when Apply is pressed."; }
+                                        }
+                                    }
+                                }
+
+                                if root.cloud-source-draft.mode == 1 :
+                                VerticalLayout {
+                                    spacing: 4px;
+
+                                    cloud-floor-slider := SettingRow {
+                                        label: "IR floor";
+                                        hint: "Infrared brightness at or below this counts as clear sky.";
+                                        indent: 8px;
+                                        minimum: 0;
+                                        maximum: 254;
+                                        value <=> root.cloud-source-draft.floor;
+                                        default-value: root.cloud-source-defaults.floor;
+                                        value-text: round(root.cloud-source-draft.floor);
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    cloud-ceiling-slider := SettingRow {
+                                        label: "IR ceiling";
+                                        hint: "Infrared brightness at or above this counts as full cloud.";
+                                        indent: 8px;
+                                        minimum: 1;
+                                        maximum: 255;
+                                        value <=> root.cloud-source-draft.ceiling;
+                                        default-value: root.cloud-source-defaults.ceiling;
+                                        value-text: round(root.cloud-source-draft.ceiling);
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    cloud-gamma-slider := SettingRow {
+                                        label: "Gamma";
+                                        hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
+                                        indent: 8px;
+                                        minimum: 10;
+                                        maximum: 400;
+                                        value <=> root.cloud-source-draft.gamma;
+                                        default-value: root.cloud-source-defaults.gamma;
+                                        value-text: round(root.cloud-source-draft.gamma * 100) / 100;
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    cloud-blur-slider := SettingRow {
+                                        label: "Blur";
+                                        hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
+                                        indent: 8px;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value <=> root.cloud-source-draft.blur;
+                                        default-value: root.cloud-source-defaults.blur;
+                                        value-text: round(root.cloud-source-draft.blur * 10) / 10;
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    apply-button := Button {
+                                        text: "Apply source";
+                                        enabled: root.cloud-source-draft != root.cloud-source
+                                            && !root.cloud-source-override;
+                                        clicked => { root.apply-cloud-source(root.cloud-source-draft); }
+                                        Tooltip {
+                                            Hint { text: "Validates, saves and switches to the source as edited. Nothing fetches before this."; }
+                                        }
+                                    }
+                                }
+
+                                if root.cloud-source-status != "" :
+                                Text {
+                                    text: root.cloud-source-status;
+                                    wrap: word-wrap;
+                                    font-size: 11px;
+                                    color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                }
+
+                                if root.cloud-source-override :
+                                Text {
+                                    text: "SUNLIT_EARTH_CLOUD_URL overrides the source; edits here are disabled and the environment value is not saved.";
+                                    wrap: word-wrap;
+                                    font-size: 11px;
+                                    color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
                                 }
 
                                 if root.clouds.enabled :
