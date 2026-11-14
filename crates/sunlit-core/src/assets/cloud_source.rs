@@ -142,6 +142,23 @@ fn prepare_remote(remote: &RemoteCloudUrl, resolution: u32) -> (String, CloudTar
     (url, target)
 }
 
+impl CloudTarget {
+    /// Identity of a native EUMETSAT round: the layer, the processing settings
+    /// and the hemisphere size arrive as one string and are hashed, so the key
+    /// names no other source's entry and carries no settings in the clear.
+    pub(crate) fn eumetsat(identity: &str) -> Self {
+        use std::fmt::Write;
+        let mut key = "clouds_cache_eumetsat_".to_owned();
+        for byte in Sha256::digest(identity.as_bytes()) {
+            let _ = write!(key, "{byte:02x}");
+        }
+        Self {
+            cache_key: key,
+            wait: CloudWait::LongFetch,
+        }
+    }
+}
+
 /// A source of equirectangular cloud imagery.
 ///
 /// Implementations must be cheap to call when nothing has changed: the engine

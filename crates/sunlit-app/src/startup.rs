@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use sunlit_core::assets::cloud_fetcher;
 use sunlit_core::assets::cloud_source::{CloudSource, HttpCloudSource};
 use sunlit_core::assets::cube_layout::CubeTextures;
+use sunlit_core::assets::eumetsat::EumetsatCloudSource;
 use sunlit_core::assets::{texture_loader, tiles};
 use sunlit_core::config::clouds::ENV_CLOUD_URL;
 use sunlit_core::config::{AppConfig, CloudSourceConfig, CloudSourceMode, QualityTier};
@@ -104,10 +105,9 @@ fn cloud_source(
             Some(Arc::new(source))
         }
         CloudSourceMode::Eumetsat => {
-            // Step 2 connects the native source here, using effective.eumetsat.
-            // Until then, never substitute remote imagery for a native choice.
-            warn!("EUMETSAT cloud source is not connected yet; cloud fetching disabled");
-            None
+            let source = EumetsatCloudSource::new(effective.eumetsat);
+            info!(source = %source.describe(), "cloud source configured");
+            Some(Arc::new(source))
         }
     }
 }
@@ -182,9 +182,19 @@ mod tests {
             mode: CloudSourceMode::Eumetsat,
             ..saved.clone()
         };
+        let native_source = cloud_source(&native, false, None).expect("the native source connects");
         assert!(
-            cloud_source(&native, false, None).is_none(),
-            "native source is not silently replaced before step 2"
+            native_source
+                .describe()
+                .starts_with("eumetsat mumi:worldcloudmap_ir108"),
+            "{}",
+            native_source.describe()
+        );
+        let native_target = native_source.prepare(8192);
+        assert!(
+            native_target
+                .cache_key
+                .starts_with("clouds_cache_eumetsat_")
         );
         let source = cloud_source(
             &native,
