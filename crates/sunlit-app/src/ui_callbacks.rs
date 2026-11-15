@@ -908,7 +908,9 @@ pub fn apply_cloud_source_to_window(window: &MainWindow, config: &config::CloudS
 }
 
 /// The window's struct for one source config. Gamma and blur travel scaled,
-/// as the sliders' integers, and come back as the floats the settings carry.
+/// as the sliders' hundredth and tenth integers (the sliders run 10..=400
+/// and 0..=100 over the validated 0.1..=4 and 0..=10), and come back divided
+/// to the floats the settings carry.
 fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSettings {
     #[expect(
         clippy::cast_possible_truncation,
@@ -919,12 +921,12 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
         remote_url: config.remote_url.clone().into(),
         floor: f32::from(config.eumetsat.floor),
         ceiling: f32::from(config.eumetsat.ceiling),
-        gamma: config.eumetsat.gamma as f32,
-        blur: config.eumetsat.blur as f32,
+        gamma: (config.eumetsat.gamma * 100.0) as f32,
+        blur: (config.eumetsat.blur * 10.0) as f32,
         nsmc_floor: f32::from(config.nsmc.floor),
         nsmc_ceiling: f32::from(config.nsmc.ceiling),
-        nsmc_gamma: config.nsmc.gamma as f32,
-        nsmc_blur: config.nsmc.blur as f32,
+        nsmc_gamma: (config.nsmc.gamma * 100.0) as f32,
+        nsmc_blur: (config.nsmc.blur * 10.0) as f32,
     };
     match config.mode {
         config::CloudSourceMode::Eumetsat => build(0),
@@ -944,8 +946,8 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
     let eumetsat = config::EumetsatSettings {
         floor: settings.floor.round() as u8,
         ceiling: settings.ceiling.round() as u8,
-        gamma: f64::from(settings.gamma),
-        blur: f64::from(settings.blur),
+        gamma: f64::from(settings.gamma.round()) / 100.0,
+        blur: f64::from(settings.blur.round()) / 10.0,
     };
     #[expect(
         clippy::cast_possible_truncation,
@@ -955,8 +957,8 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
     let nsmc = config::NsmcSettings {
         floor: settings.nsmc_floor.round() as u8,
         ceiling: settings.nsmc_ceiling.round() as u8,
-        gamma: f64::from(settings.nsmc_gamma),
-        blur: f64::from(settings.nsmc_blur),
+        gamma: f64::from(settings.nsmc_gamma.round()) / 100.0,
+        blur: f64::from(settings.nsmc_blur.round()) / 10.0,
     };
     config::CloudSourceConfig {
         mode: match settings.mode {

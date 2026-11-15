@@ -9831,11 +9831,11 @@ fn test_cloud_source_section_pushes_the_saved_config() {
     );
     approx::assert_relative_eq!(applied.floor, 60.0);
     approx::assert_relative_eq!(applied.ceiling, 180.0);
-    approx::assert_relative_eq!(applied.gamma, 0.8);
+    approx::assert_relative_eq!(applied.gamma, 80.0);
     approx::assert_relative_eq!(applied.blur, 0.0);
     approx::assert_relative_eq!(applied.nsmc_floor, 0.0);
     approx::assert_relative_eq!(applied.nsmc_ceiling, 255.0);
-    approx::assert_relative_eq!(applied.nsmc_gamma, 1.0);
+    approx::assert_relative_eq!(applied.nsmc_gamma, 100.0);
     approx::assert_relative_eq!(applied.nsmc_blur, 0.0);
     assert_eq!(
         window.get_cloud_source_draft(),
@@ -9954,7 +9954,7 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
     draft.mode = 1;
     draft.floor = 61.0;
     // 0.5 is exact in f32, which the sliders' values travel through.
-    draft.gamma = 0.5;
+    draft.gamma = 50.0;
     window.set_cloud_source_draft(draft.clone());
     window.invoke_apply_cloud_source(draft.clone());
 
@@ -9995,7 +9995,7 @@ fn test_a_nsmc_draft_switches_and_saves_the_nsmc_mode() {
     let mut draft = window.get_cloud_source_draft();
     draft.mode = 2;
     // 0.5 is exact in f32, which the sliders' values travel through.
-    draft.nsmc_gamma = 1.5;
+    draft.nsmc_gamma = 150.0;
     draft.nsmc_floor = 10.0;
     window.set_cloud_source_draft(draft.clone());
     window.invoke_apply_cloud_source(draft.clone());
@@ -10088,6 +10088,167 @@ fn test_the_stop_shows_only_while_a_fetch_is_busy() {
     assert_eq!(stop_buttons(), 1, "the stop shows while the fetch runs");
     window.set_cloud_source_busy(false);
     assert_eq!(stop_buttons(), 0, "the stop goes when the run ends");
+}
+
+/// The range one source row's slider declares in `main.slint`, read out of
+/// the source itself: the range is a third party to the mapping contract —
+/// the drafts carry it, the mapping divides it, the config validates the
+/// result — and only the file knows what the widget clamps a drag to.
+fn slider_range(source: &str, id: &str) -> (f64, f64) {
+    let needle = format!("{id} := SettingRow");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{id} is missing from main.slint"));
+    let window = &source[start..start + 800];
+    let read = |name: &str| {
+        window
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{id} carries no {name}"))
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{id}'s {name} is not a number"))
+    };
+    (read("minimum:"), read("maximum:"))
+}
+
+/// The sliders' ranges are the validated domain in the scale the drafts
+/// carry: floor and ceiling are the u8 span itself, gamma and blur are the
+/// validated curves times one hundred and ten. A range that drifts from the
+/// domain is how a drag produces a value the Apply refuses — which is what a
+/// missing scale on the gamma and blur rows did.
+#[test]
+fn the_source_slider_ranges_pin_the_validated_domain() {
+    let source = include_str!("../../sunlit-ui/ui/main.slint");
+    for prefix in ["cloud", "nsmc"] {
+        let floor = slider_range(source, &format!("{prefix}-floor-slider"));
+        let ceiling = slider_range(source, &format!("{prefix}-ceiling-slider"));
+        let gamma = slider_range(source, &format!("{prefix}-gamma-slider"));
+        let blur = slider_range(source, &format!("{prefix}-blur-slider"));
+        assert_eq!(floor, (0.0, 254.0), "{prefix} floor");
+        assert_eq!(ceiling, (1.0, 255.0), "{prefix} ceiling");
+        assert_eq!(
+            gamma,
+            (10.0, 400.0),
+            "{prefix} gamma, the 0.1..=4 curve at x100"
+        );
+        assert_eq!(blur, (0.0, 100.0), "{prefix} blur, the 0..=10 curve at x10");
+    }
+}
+
+/// And the defaults the startup push writes land inside those ranges: a
+/// default outside a slider's range pins that slider at an end and reads
+/// wrong before anyone drags it.
+#[test]
+fn the_source_defaults_land_inside_the_slider_ranges() {
+    let source = include_str!("../../sunlit-ui/ui/main.slint");
+    let defaults = sunlit_core::config::CloudSourceConfig::default();
+    let in_range = |value: f64, range: (f64, f64), what: &str| {
+        assert!(
+            (range.0..=range.1).contains(&value),
+            "{what} at {value} is outside its slider's {range:?}"
+        );
+    };
+    for (prefix, floor, ceiling, gamma, blur) in [
+        (
+            "cloud",
+            f64::from(defaults.eumetsat.floor),
+            f64::from(defaults.eumetsat.ceiling),
+            defaults.eumetsat.gamma * 100.0,
+            defaults.eumetsat.blur * 10.0,
+        ),
+        (
+            "nsmc",
+            f64::from(defaults.nsmc.floor),
+            f64::from(defaults.nsmc.ceiling),
+            defaults.nsmc.gamma * 100.0,
+            defaults.nsmc.blur * 10.0,
+        ),
+    ] {
+        in_range(
+            floor,
+            slider_range(source, &format!("{prefix}-floor-slider")),
+            "floor",
+        );
+        in_range(
+            ceiling,
+            slider_range(source, &format!("{prefix}-ceiling-slider")),
+            "ceiling",
+        );
+        in_range(
+            gamma,
+            slider_range(source, &format!("{prefix}-gamma-slider")),
+            "gamma",
+        );
+        in_range(
+            blur,
+            slider_range(source, &format!("{prefix}-blur-slider")),
+            "blur",
+        );
+    }
+}
+
+/// Every draft the sliders can produce, at the ends and the middle of the
+/// ranges above, maps through the applied value into a config the
+/// validation accepts and back inside the domain it came from. The ends are
+/// where a scale mismatch shows first: the bug this pins had the gamma
+/// slider refuse every drag, because its range was the scale while the
+/// mapping read the raw value.
+#[test]
+fn every_slider_producible_draft_applies_inside_the_domain() {
+    let SourceWindow {
+        window,
+        link,
+        sent: _,
+    } = create_source_window();
+    let cases: [(u8, u8, f32, f32); 3] = [
+        (0, 1, 10.0, 0.0),
+        (254, 255, 400.0, 100.0),
+        (60, 180, 205.0, 50.0),
+    ];
+    for (floor, ceiling, gamma, blur) in cases {
+        for mode in [0i32, 2] {
+            let applied = sunlit_earth::CloudSourceSettings {
+                mode,
+                remote_url: window.get_cloud_source().remote_url,
+                floor: f32::from(floor),
+                ceiling: f32::from(ceiling),
+                gamma,
+                blur,
+                nsmc_floor: f32::from(floor),
+                nsmc_ceiling: f32::from(ceiling),
+                nsmc_gamma: gamma,
+                nsmc_blur: blur,
+            };
+            window.set_cloud_source(applied);
+            let config = ui_callbacks::read_config_from_window(&window, &link);
+            assert!(
+                config.cloud_source.is_valid(),
+                "mode {mode} from ({floor}, {ceiling}, {gamma}, {blur}): {config:?}"
+            );
+            let (mapped_floor, mapped_ceiling, mapped_gamma, mapped_blur) = if mode == 0 {
+                (
+                    f64::from(config.cloud_source.eumetsat.floor),
+                    f64::from(config.cloud_source.eumetsat.ceiling),
+                    config.cloud_source.eumetsat.gamma,
+                    config.cloud_source.eumetsat.blur,
+                )
+            } else {
+                (
+                    f64::from(config.cloud_source.nsmc.floor),
+                    f64::from(config.cloud_source.nsmc.ceiling),
+                    config.cloud_source.nsmc.gamma,
+                    config.cloud_source.nsmc.blur,
+                )
+            };
+            assert!(mapped_floor < mapped_ceiling);
+            assert!((0.1..=4.0).contains(&mapped_gamma), "gamma {mapped_gamma}");
+            assert!((0.0..=10.0).contains(&mapped_blur), "blur {mapped_blur}");
+        }
+    }
 }
 
 /// An edit arms the debounced settings write: one write a second after the

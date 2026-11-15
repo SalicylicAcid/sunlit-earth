@@ -1637,7 +1637,7 @@ export component MainWindow inherits Window {
                                         maximum: 400;
                                         value <=> root.cloud-source-draft.gamma;
                                         default-value: root.cloud-source-defaults.gamma;
-                                        value-text: round(root.cloud-source-draft.gamma * 100) / 100;
+                                        value-text: round(root.cloud-source-draft.gamma) / 100;
                                         enabled: !root.cloud-source-override;
                                     }
                                     cloud-blur-slider := SettingRow {
@@ -1648,7 +1648,7 @@ export component MainWindow inherits Window {
                                         maximum: 100;
                                         value <=> root.cloud-source-draft.blur;
                                         default-value: root.cloud-source-defaults.blur;
-                                        value-text: round(root.cloud-source-draft.blur * 10) / 10;
+                                        value-text: round(root.cloud-source-draft.blur) / 10;
                                         enabled: !root.cloud-source-override;
                                     }
                                 }
@@ -1687,7 +1687,7 @@ export component MainWindow inherits Window {
                                         maximum: 400;
                                         value <=> root.cloud-source-draft.nsmc-gamma;
                                         default-value: root.cloud-source-defaults.nsmc-gamma;
-                                        value-text: round(root.cloud-source-draft.nsmc-gamma * 100) / 100;
+                                        value-text: round(root.cloud-source-draft.nsmc-gamma) / 100;
                                         enabled: !root.cloud-source-override;
                                     }
                                     nsmc-blur-slider := SettingRow {
@@ -1698,7 +1698,7 @@ export component MainWindow inherits Window {
                                         maximum: 100;
                                         value <=> root.cloud-source-draft.nsmc-blur;
                                         default-value: root.cloud-source-defaults.nsmc-blur;
-                                        value-text: round(root.cloud-source-draft.nsmc-blur * 10) / 10;
+                                        value-text: round(root.cloud-source-draft.nsmc-blur) / 10;
                                         enabled: !root.cloud-source-override;
                                     }
                                 }
