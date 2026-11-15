@@ -643,6 +643,20 @@ pub fn register_action_callbacks(
     }
 
     {
+        let engine = link.clone();
+        window.on_refresh_clouds(move || {
+            engine.send(EngineCommand::RefreshClouds);
+        });
+    }
+
+    {
+        let engine = link.clone();
+        window.on_abort_clouds(move || {
+            engine.send(EngineCommand::AbortClouds);
+        });
+    }
+
+    {
         let window_weak = window.as_weak();
         let engine = link.clone();
         window.on_set_wallpaper(move || {
@@ -963,6 +977,16 @@ pub fn cloud_status_to_ui(window: slint::Weak<MainWindow>, status: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(win) = window.upgrade() {
             win.set_cloud_source_status(status.into());
+        }
+    });
+}
+
+/// The engine's cloud-busy flag, handed to the window on the UI thread: the
+/// stop shows against a fetch in flight.
+pub fn cloud_busy_to_ui(window: slint::Weak<MainWindow>, busy: bool) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(win) = window.upgrade() {
+            win.set_cloud_source_busy(busy);
         }
     });
 }

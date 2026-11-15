@@ -262,10 +262,12 @@ export component MainWindow inherits Window {
     in-out property <DateTimeSettings> datetime;
     in-out property <CloudSettings> clouds;
     // The applied cloud source, its draft (edited in place, applied as one),
-    // what the round is doing, and whether the environment overrides it.
+    // what the round is doing, whether the round is running, and whether the
+    // environment overrides it.
     in-out property <CloudSourceSettings> cloud-source;
     in-out property <CloudSourceSettings> cloud-source-draft;
     in-out property <string> cloud-source-status;
+    in-out property <bool> cloud-source-busy;
     in-out property <bool> cloud-source-override;
     in-out property <CelestialSettings> celestial;
     in-out property <AtmosphereSettings> atmosphere;
@@ -296,6 +298,8 @@ export component MainWindow inherits Window {
     in property <float> night-gamma-value;
     callback sliders-changed();
     callback apply-cloud-source(CloudSourceSettings);
+    callback refresh-clouds();
+    callback abort-clouds();
     callback msaa-changed();
     callback texture-changed();
     callback texture-resolution-changed();
@@ -1651,6 +1655,26 @@ export component MainWindow inherits Window {
                                         clicked => { root.apply-cloud-source(root.cloud-source-draft); }
                                         Tooltip {
                                             Hint { text: "Validates, saves and switches to the source as edited. Nothing fetches before this."; }
+                                        }
+                                    }
+                                    // The manual side of the same round: ask
+                                    // for one now, or stop the one running.
+                                    // The stop exists only while a fetch is
+                                    // in flight, which the engine reports.
+                                    refresh-cloud-button := Button {
+                                        text: "Refresh now";
+                                        enabled: root.clouds.enabled;
+                                        clicked => { root.refresh-clouds(); }
+                                        Tooltip {
+                                            Hint { text: "Fetches the current imagery now, ahead of the hourly check. Upstream republishes every 15 minutes, so a fetch that soon after the last one is served from the cache."; }
+                                        }
+                                    }
+                                    if root.cloud-source-busy :
+                                    stop-cloud-button := Button {
+                                        text: "Stop";
+                                        clicked => { root.abort-clouds(); }
+                                        Tooltip {
+                                            Hint { text: "Stops the fetch in flight without a retry. The next check is the regular one."; }
                                         }
                                     }
                                 }

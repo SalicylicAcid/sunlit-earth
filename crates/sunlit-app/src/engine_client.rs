@@ -170,6 +170,10 @@ impl EngineLink {
 /// The returned closure runs on the engine thread; everything it does to the
 /// window goes through `invoke_from_event_loop`. `screens` is the window's own
 /// monitor list, which a layout change replaces.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per event kind, each a small wiring of its own"
+)]
 pub fn event_forwarder(
     window: &MainWindow,
     screens: &crate::displays::SharedMonitors,
@@ -278,6 +282,9 @@ pub fn event_forwarder(
         }
         EngineEvent::CloudStatus(status) => {
             crate::ui_callbacks::cloud_status_to_ui(weak.clone(), status);
+        }
+        EngineEvent::CloudBusy(busy) => {
+            crate::ui_callbacks::cloud_busy_to_ui(weak.clone(), busy);
         }
         EngineEvent::Excursion(state) => {
             let weak = weak.clone();

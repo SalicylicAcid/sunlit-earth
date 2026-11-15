@@ -92,6 +92,8 @@ Edits stay a draft in the panel until **Apply source** is pressed, which validat
 
 The round fetches the two hemispheres in parallel, each as a grid of 512 px tile requests (~230 KB, seconds each). Completed tiles are kept and only the failed ones retry — first within their own attempt budget, then in a second pass — so a link that drops long transfers loses a tile, not the round. The wall time is the same total render either way; the round budget is 25 minutes, and the wallpaper and one-shot waits follow it. The status line names the tiles done and the attempt in flight. The fetch honors the standard proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, with `NO_PROXY`), which is the supported way to put a faster route between the app and EUMETSAT's European servers. The raw hemispheres are cached beside the derived map, so changing the processing parameters reprocesses what is on disk without a new download; one derived map and one raw pair per size are kept. The status line under the source rows says what the layer is doing (checking, downloading a hemisphere, processing, ready, or a failed poll's next retry).
 
+The layer checks its source right after startup and then once an hour. **Refresh now**, beside Apply source, asks for a check ahead of that schedule, and the tray menu's Refresh Clouds does the same without opening the window. Upstream republishes the infrared layer about every 15 minutes, so a round fetched inside that window is served from the cache instead of the network — the raw pair's own age, recorded when it was stored, is the gate. While a fetch runs, the row's **Stop** ends it without a retry: the tiles in flight are dropped, nothing is committed, and the next check is the regular one. Turning Show clouds off does the same to new attempts and also drops a download that comes back after the switch.
+
 `SUNLIT_EARTH_CLOUD_URL`, when set to a non-blank value, forces a fixed remote URL for the session, wins over the saved source, and disables the section's edits for the run; it is never written back to `config.toml`. `SUNLIT_EARTH_NO_CLOUDS` disables fetching entirely.
 
 ## The menu bar and the tray menu
@@ -104,7 +106,7 @@ The main window has three menus. On Windows they are in the window's own menu ba
 
 On macOS the App menu is the one the toolkit makes for every app, with the app's own About Sunlit Earth and Quit Sunlit Earth in it. Its Hide (⌘H) hides the window without the tray menu noticing, so the tray's first entry still says Hide afterwards: choosing it once puts things right, and choosing it again shows the window.
 
-The tray menu has Show or Hide, whichever the window needs next, then Refresh Now, Auto-refresh and Start on login, then Check for Updates…, Website, About and Quit. On Windows and Linux a click on the tray icon also shows or hides the window; on macOS a click opens the menu.
+The tray menu has Show or Hide, whichever the window needs next, then Refresh Now, Refresh Clouds, Auto-refresh and Start on login, then Check for Updates…, Website, About and Quit. On Windows and Linux a click on the tray icon also shows or hides the window; on macOS a click opens the menu.
 
 ## Checking for updates
 

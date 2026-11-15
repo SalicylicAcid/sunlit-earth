@@ -9981,3 +9981,46 @@ fn test_the_override_flag_clears_with_the_push() {
         "the push resets the draft over the applied value"
     );
 }
+
+/// The manual side of the fetch: the refresh and the stop reach the engine
+/// as their commands, and the stop exists only while the engine says a run
+/// is in flight.
+#[test]
+fn test_refresh_and_stop_reach_the_engine() {
+    let SourceWindow {
+        window,
+        link: _,
+        sent,
+    } = create_source_window();
+    window.invoke_refresh_clouds();
+    window.invoke_abort_clouds();
+    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    assert!(
+        sent.iter()
+            .any(|command| matches!(command, sunlit_core::engine::EngineCommand::RefreshClouds)),
+        "the refresh reaches the engine"
+    );
+    assert!(
+        sent.iter()
+            .any(|command| matches!(command, sunlit_core::engine::EngineCommand::AbortClouds)),
+        "the stop reaches the engine"
+    );
+}
+
+/// The stop button is part of the row only while a fetch runs, which the
+/// engine's busy flag drives.
+#[test]
+fn test_the_stop_shows_only_while_a_fetch_is_busy() {
+    let SourceWindow { window, .. } = create_source_window();
+    let stop_buttons = || {
+        labelled(&window, "Stop")
+            .into_iter()
+            .filter(|element| element.accessible_role() == Some(AccessibleRole::Button))
+            .count()
+    };
+    assert_eq!(stop_buttons(), 0, "an idle fetch has no stop");
+    window.set_cloud_source_busy(true);
+    assert_eq!(stop_buttons(), 1, "the stop shows while the fetch runs");
+    window.set_cloud_source_busy(false);
+    assert_eq!(stop_buttons(), 0, "the stop goes when the run ends");
+}

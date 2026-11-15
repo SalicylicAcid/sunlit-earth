@@ -28,6 +28,7 @@ export component TrayIcon inherits SystemTrayIcon {
 
     callback toggle-window();
     callback refresh-now();
+    callback refresh-clouds();
     callback auto-refresh-toggled(bool);
     callback autostart-toggled(bool);
     callback open-url(url: string);
@@ -49,6 +50,10 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem {
             title: "Refresh Now";
             activated => { root.refresh-now(); }
+        }
+        MenuItem {
+            title: "Refresh Clouds";
+            activated => { root.refresh-clouds(); }
         }
         MenuItem {
             title: "Auto-refresh";

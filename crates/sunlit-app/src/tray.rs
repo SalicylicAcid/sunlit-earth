@@ -342,6 +342,12 @@ pub fn wire(tray: &TrayIcon, window: &MainWindow, engine: &EngineLink, about: &A
         engine_link.send(EngineCommand::RenderWallpaperNow);
     });
 
+    let engine_link = engine.clone();
+    tray.on_refresh_clouds(move || {
+        info!("tray: refreshing clouds");
+        engine_link.send(EngineCommand::RefreshClouds);
+    });
+
     // The tray menu item and the checkbox in the main window are two views
     // of the same setting, so the tray hands the change to the window and lets
     // the existing auto-refresh callback do the work.
