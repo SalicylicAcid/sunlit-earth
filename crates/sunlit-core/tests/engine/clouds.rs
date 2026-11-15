@@ -1337,6 +1337,73 @@ mod runtime_switch {
         }
     }
 
+    /// A stop lands on a fetch in flight: the run unwinds without a retry or
+    /// a map, the busy state comes down, and the status names the stop.
+    #[test]
+    fn an_abort_ends_a_fetch_without_a_retry_or_a_map() {
+        let _gpu = gpu();
+        let stub = Stub::start();
+        let slow = config_for(stub.url("/slow"));
+        let harness = Harness::start(|config| {
+            config.cloud = Some(source_for(&slow));
+        });
+        stub.wait_for_request("/slow", "the first poll is in flight");
+
+        harness.engine.abort_clouds();
+
+        // The worker unwinds at the first body chunk once the stub's delay
+        // lets it, so both the busy drop and the stopped status go out.
+        let mut busy_down = false;
+        let mut named_the_stop = false;
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while !(busy_down && named_the_stop) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stop went unreported"
+            );
+            match harness.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(EngineEvent::CloudBusy(false)) => busy_down = true,
+                Ok(EngineEvent::CloudStatus(text)) => {
+                    named_the_stop |= text.contains("stopped");
+                }
+                _ => {}
+            }
+        }
+        // Outlast the stub's own delay: a fetch that ignored the stop would
+        // land its body and try nothing more, which this distinguishes.
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(stub.count("/slow"), 1, "a stop is not retried");
+    }
+
+    /// The stop reports only against a fetch that is running: the busy event
+    /// goes up while the poll is in flight and down once it settles.
+    #[test]
+    fn the_busy_state_follows_the_fetch() {
+        let _gpu = gpu();
+        let stub = Stub::start();
+        let first = config_for(stub.url("/a"));
+        let harness = Harness::start(|config| {
+            config.cloud = Some(source_for(&first));
+        });
+        wait_for_cloud_size(&harness, (256, 128), "the first source");
+
+        harness.engine.refresh_clouds();
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut saw_busy_up = false;
+        let mut saw_busy_down = false;
+        while !(saw_busy_up && saw_busy_down) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the busy pair of events never arrived"
+            );
+            match harness.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(EngineEvent::CloudBusy(true)) => saw_busy_up = true,
+                Ok(EngineEvent::CloudBusy(false)) => saw_busy_down = true,
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn a_switch_during_a_slow_fetch_lands_the_new_target_and_ignores_the_old() {
         let _gpu = gpu();

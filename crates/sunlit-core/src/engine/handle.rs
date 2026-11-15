@@ -197,6 +197,12 @@ impl EngineHandle {
         self.send(EngineCommand::RefreshClouds);
     }
 
+    /// Stop the cloud fetch in flight, if there is one; the next check is
+    /// the regular one.
+    pub fn abort_clouds(&self) {
+        self.send(EngineCommand::AbortClouds);
+    }
+
     /// Description of the selected GPU adapter, for the UI's renderer label.
     pub fn adapter_info(&self) -> &str {
         &self.adapter.info

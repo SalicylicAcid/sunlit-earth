@@ -83,6 +83,10 @@ pub enum EngineCommand {
     /// Ask the cloud worker for one poll now, ahead of its schedule. A worker
     /// still busy with the previous poll owes one instead.
     RefreshClouds,
+    /// Stop the cloud fetch in flight, if there is one: the source unwinds
+    /// at its nearest check point and the run ends without a retry, the next
+    /// check left to the regular schedule. A click between runs is harmless.
+    AbortClouds,
     /// Replace the mode and the anchor a wallpaper is planned with.
     ///
     /// Not part of `UpdateParams` for the same reason `SetTextureResolution` is
@@ -224,6 +228,10 @@ pub enum EngineEvent {
     /// What the cloud layer is doing right now. Forwarded when it changes,
     /// which for a long native round is the only movement the UI sees.
     CloudStatus(String),
+    /// Whether a cloud fetch run is in flight, the queue wait and the retry
+    /// backoff included. Forwarded when it changes; the UI's stop shows
+    /// against it.
+    CloudBusy(bool),
 }
 
 #[cfg(test)]

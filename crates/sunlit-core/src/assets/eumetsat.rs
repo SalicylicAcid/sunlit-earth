@@ -19,6 +19,7 @@
 //! simultaneous instant.
 
 use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -73,6 +74,8 @@ pub(crate) const TILE_WORKERS: u32 = 4;
 /// How often a download refreshes its progress line: often enough to look
 /// alive, rare enough that the status event stays a rarity.
 const DOWNLOAD_REPORT_EVERY: Duration = Duration::from_millis(500);
+/// How often a tile's retry nap looks at the user stop.
+const REST_SLICE: Duration = Duration::from_millis(100);
 
 /// Bytes as a one-decimal MiB figure, the unit every cloud map is measured
 /// in.
@@ -113,6 +116,13 @@ const MAX_BODY_BYTES: u64 = 50 * 1024 * 1024;
 /// Decoded hemisphere cap. The largest real hemisphere is 4096 x 4096 (the
 /// 8192 texture resolution halves into it); nothing larger is decoded.
 const MAX_HEMISPHERE_SIDE: u32 = 4096;
+/// Upstream's own refresh cadence for the IR108 layer: both hemispheres are
+/// "latest" imagery republished this often. A round fetched within the
+/// window cannot differ from the stored one, so a poll inside it serves the
+/// pair from disk rather than downloading it again — the manual refresh
+/// pressed twice, or an hourly poll landing just behind a restart, costs
+/// nothing.
+const UPSTREAM_REFRESH: Duration = Duration::from_mins(15);
 
 /// A grayscale map as row-major f32 in [0, 1], north up, -180..180 west to
 /// east: the same orientation the remote map and the generator use, which is
@@ -516,6 +526,12 @@ pub struct EumetsatCloudSource {
     /// two fetch threads and composed into the status as they move. One slot
     /// per hemisphere, in [`HEMISPHERES`] order.
     progress: Mutex<[Option<String>; 2]>,
+    /// The user stop the fetch worker hands over: set while a running round
+    /// is wanted gone, checked between tiles and inside every chunk read so a
+    /// stop lands within a second rather than at the round budget. Behind a
+    /// lock so [`CloudSource::set_cancel`] can replace it, and never `None`:
+    /// before a worker attaches one, a private flag nobody sets reads false.
+    cancel: Mutex<Arc<AtomicBool>>,
     agent: ureq::Agent,
 }
 
@@ -532,8 +548,12 @@ struct RawManifest {
     algorithm: u32,
     west_sha256: String,
     east_sha256: String,
-    /// When the round started, Unix seconds. Informational: the two
-    /// hemispheres are "latest" requests, not one instant.
+    /// When the round started, Unix seconds. The freshness gate reads it: a
+    /// round younger than [`UPSTREAM_REFRESH`] cannot differ from what
+    /// upstream has, so a poll inside the window skips the network. `default`
+    /// lets a manifest from before the gate read as unknown, which is never
+    /// fresh.
+    #[serde(default)]
     fetched_epoch_secs: u64,
 }
 
@@ -542,6 +562,8 @@ struct RawPair {
     west: Vec<u8>,
     east: Vec<u8>,
     hashes: (String, String),
+    /// The manifest's fetch time, Unix seconds; zero means unknown.
+    fetched_epoch_secs: u64,
 }
 
 /// The derived map's metadata, the commit point of a derivation: only a
@@ -595,6 +617,7 @@ impl EumetsatCloudSource {
             retry_delays: RETRY_DELAYS,
             phase: Mutex::new(String::new()),
             progress: Mutex::new([None, None]),
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             agent,
         }
     }
@@ -633,6 +656,40 @@ impl EumetsatCloudSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Whether the user's stop is standing: the round is wanted gone, and
+    /// every check point between tiles and inside each chunk read unwinds to
+    /// the nearest one.
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .load(Ordering::SeqCst)
+    }
+
+    /// The error a stop produces, whatever check point raised it. The fetch
+    /// worker tells this apart from a real failure by its own flag, so the
+    /// wording only has to read well in the status line.
+    fn stop_error() -> String {
+        "the download was stopped".to_owned()
+    }
+
+    /// Whether the stored round is too young for upstream to have published
+    /// anything new. Both hemispheres are "latest" imagery the service
+    /// republishes every [`UPSTREAM_REFRESH`], so a pair fetched inside the
+    /// window is the present state whatever the poll would ask for. A
+    /// manifest without a usable time — one from before the gate, a clock
+    /// set backwards — is never fresh.
+    fn round_is_fresh(pair: &RawPair) -> bool {
+        if pair.fetched_epoch_secs == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now >= pair.fetched_epoch_secs && now - pair.fetched_epoch_secs < UPSTREAM_REFRESH.as_secs()
+    }
+
     /// Fetch one hemisphere as a grid of [`TILE_PX`] tiles.
     ///
     /// The service renders each request on the fly and does not support
@@ -643,10 +700,15 @@ impl EumetsatCloudSource {
     /// own attempt budget, then in a second pass over whatever is left.
     /// [`TILE_WORKERS`] fetch tiles of one hemisphere concurrently, and the
     /// two hemisphere threads run side by side. Tiles that no pass reaches
-    /// fail the round; the worker's backoff starts a fresh one.
+    /// fail the round; the worker's backoff starts a fresh one. The user
+    /// stop unwinds at the nearest check point of all of them.
     ///
     /// Returns the stitched hemisphere re-encoded as PNG — what the raw pair
     /// stores — beside the decoded map. No tile starts after `deadline`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the pool's two passes and their abort checks read better as one body"
+    )]
     fn fetch_hemisphere(
         &self,
         name: &str,
@@ -675,6 +737,13 @@ impl EumetsatCloudSource {
                     scope.spawn(|| {
                         loop {
                             if abort.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            // A stop lands between tiles: no further request
+                            // is started, and what this pass already holds
+                            // is thrown away with the round.
+                            if self.cancelled() {
+                                abort.store(true, Ordering::SeqCst);
                                 return;
                             }
                             let Some((row, col)) = pending
@@ -717,6 +786,13 @@ impl EumetsatCloudSource {
                     });
                 }
             });
+            // The stop is answered before the abort's own bookkeeping: a
+            // cancel-abort may carry no recorded failure at all, the workers
+            // having simply stopped between tiles.
+            if self.cancelled() {
+                self.set_phase("");
+                return Err(Self::stop_error());
+            }
             if abort.load(Ordering::SeqCst) {
                 let failed = failed.into_inner().unwrap_or_default();
                 let Some((_, _, message)) = failed.first() else {
@@ -777,6 +853,9 @@ impl EumetsatCloudSource {
         let tile_bbox = sub_bbox(bbox, row, col, tiles);
         let url = build_wms_url(&tile_bbox, tile_px);
         for attempt in 1..=MAX_ATTEMPTS {
+            if self.cancelled() {
+                return Err(FetchError::Permanent(Self::stop_error()));
+            }
             if Instant::now() >= deadline {
                 return Err(FetchError::Permanent(
                     "the round budget is spent before attempt {attempt}".to_owned(),
@@ -809,7 +888,17 @@ impl EumetsatCloudSource {
                         ));
                     }
                     info!(attempt, hemisphere = name, tile = ?(row, col), delay = ?delay, "retrying a tile");
-                    std::thread::sleep(delay);
+                    // The retry nap wakes on a stop: a stopped round must
+                    // not sit out its backoff before noticing, and the next
+                    // attempt's own check answers it.
+                    let until = Instant::now() + delay;
+                    while !self.cancelled() {
+                        let left = until.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(REST_SLICE));
+                    }
                 }
             }
         }
@@ -870,6 +959,11 @@ impl EumetsatCloudSource {
         let mut last_report = Instant::now();
         loop {
             use std::io::Read as _;
+            // The stop is checked once per chunk, so a stop lands within
+            // about one 64 KiB read rather than at the request timeout.
+            if self.cancelled() {
+                return Err(FetchError::Permanent(Self::stop_error()));
+            }
             // One read call's worth of the map: big enough that the 500 ms
             // progress tick sees movement, small enough for the stack.
             #[expect(
@@ -934,6 +1028,10 @@ impl CloudSource for EumetsatCloudSource {
         CloudWait::LongFetch.duration()
     }
 
+    fn set_cancel(&self, flag: Arc<AtomicBool>) {
+        *self.cancel.lock().unwrap_or_else(PoisonError::into_inner) = flag;
+    }
+
     fn status(&self) -> Option<String> {
         let phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         let progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
@@ -958,26 +1056,39 @@ impl CloudSource for EumetsatCloudSource {
     }
 
     fn fetch_if_changed(&self, _known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
         let px = self.px();
         let started = Instant::now();
         let deadline = started + ROUND_BUDGET;
 
-        // A parameter or algorithm change arrives as a new instance, whose
-        // first fetch reprocesses the stored raw pair instead of downloading
-        // again. A derivation that already matches costs nothing.
+        // The stored pair is served from disk on this instance's first fetch
+        // — a parameter or algorithm change arrives as a new instance, and
+        // its first fetch reprocesses rather than downloads again — and on
+        // any poll inside the window a round can still be young in: upstream
+        // cannot have published anything the pair does not hold.
         let cached_raw = self.load_raw_pair(px);
-        if self.first_fetch.swap(false, Ordering::SeqCst)
-            && let Some(pair) = &cached_raw
+        let first = self.first_fetch.swap(false, Ordering::SeqCst);
+        let serves_from_disk = cached_raw
+            .as_ref()
+            .is_some_and(|pair| first || Self::round_is_fresh(pair));
+        if let Some(pair) = &cached_raw
+            && serves_from_disk
         {
             if self.derived_matches(px, &pair.hashes.0, &pair.hashes.1) {
                 info!(
                     px,
+                    fresh = !first,
                     "the stored raw pair and its derivation are still current"
                 );
                 return Ok(None);
             }
             self.set_phase("processing locally");
-            info!(px, "reprocessing the stored raw pair without the network");
+            info!(
+                px,
+                first, "reprocessing the stored raw pair without the network"
+            );
             let west = decode_png(&pair.west, px)?;
             let east = decode_png(&pair.east, px)?;
             let bytes =
@@ -1009,6 +1120,12 @@ impl CloudSource for EumetsatCloudSource {
         info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
         let (east_body, east) = east?;
         info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
+        // A stop that landed mid-round drops it here rather than committing a
+        // round the user asked to be rid of: the next poll starts over.
+        if self.cancelled() {
+            self.set_phase("");
+            return Err(Self::stop_error());
+        }
         let west_sha = sha256_hex(&west_body);
         let east_sha = sha256_hex(&east_body);
         // Upstream unchanged and the derivation current: nothing to report,
@@ -1106,6 +1223,7 @@ impl EumetsatCloudSource {
             west,
             east,
             hashes: (west_sha, east_sha),
+            fetched_epoch_secs: manifest.fetched_epoch_secs,
         })
     }
 
@@ -1838,6 +1956,52 @@ mod tests {
         png_bytes(16, 16, value)
     }
 
+    /// Rewrite the stored manifest's fetch time to `secs_ago` before now, so
+    /// a test can age a round past the upstream window without waiting for
+    /// it.
+    fn backdate_pair(scratch: &crate::test_support::ScratchDir, px: u32, secs_ago: u64) {
+        let path = scratch.join(&format!("eumetsat_raw_{px}_meta.toml"));
+        let text = std::fs::read_to_string(&path).expect("the manifest reads");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is set")
+            .as_secs();
+        let updated = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("fetched_epoch_secs") {
+                    format!("fetched_epoch_secs = {}", now.saturating_sub(secs_ago))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{updated}\n")).expect("the manifest is rewritten");
+    }
+
+    /// Store a raw pair and its derivation at 16 px, and point `source` at
+    /// that size: the state a poll between rounds reads.
+    fn store_round(source: &EumetsatCloudSource, west_value: u8, east_value: u8) {
+        let west = raw_body(west_value);
+        let east = raw_body(east_value);
+        let hashes = (sha256_hex(&west), sha256_hex(&east));
+        source.store_raw_pair(16, &west, &east).expect("stored");
+        let west_map = decode_png(&west, 16).expect("the west decodes");
+        let east_map = decode_png(&east, 16).expect("the east decodes");
+        source
+            .process_and_store(
+                16,
+                &west_map,
+                &east_map,
+                &hashes.0,
+                &hashes.1,
+                Instant::now(),
+            )
+            .expect("the derivation is stored");
+        *source.size.lock().expect("the size lock") = 16;
+    }
+
     #[test]
     fn the_raw_pair_is_stored_validated_and_loaded_back_only_intact() {
         let (scratch, source) = scratch_cache("eumetsat_raw_pair");
@@ -1963,6 +2127,121 @@ mod tests {
         // The metadata now carries the new tuning, so the next poll's
         // unchanged check finds the derivation current.
         assert!(retuned.derived_matches(16, &hashes.0, &hashes.1));
+    }
+
+    // -----------------------------------------------------------------------
+    // The upstream freshness gate and the user stop
+    // -----------------------------------------------------------------------
+
+    /// A round inside the upstream window is the present state whatever the
+    /// poll would ask for: the poll after the first — the shape of the hourly
+    /// check, or of a refresh pressed twice — answers from disk.
+    #[test]
+    fn a_round_within_the_upstream_window_is_served_from_disk() {
+        let (scratch, mut source) = scratch_cache("eumetsat_fresh_gate");
+        store_round(&source, 60, 90);
+        source.fetch_if_changed(None).expect("the first fetch");
+        let (agent, calls) = stub_agent(|_| panic!("a young round must not touch the network"));
+        source.agent = agent;
+        assert!(
+            source
+                .fetch_if_changed(None)
+                .expect("the gate holds")
+                .is_none(),
+            "a fresh pair with a current derivation is reused"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(scratch);
+    }
+
+    /// A round past the window is old news: the poll downloads again and
+    /// commits what it got.
+    #[test]
+    fn a_round_past_the_upstream_window_is_fetched_again() {
+        let (scratch, mut source) = scratch_cache("eumetsat_stale_gate");
+        store_round(&source, 60, 90);
+        source.fetch_if_changed(None).expect("the first fetch");
+        backdate_pair(&scratch, 16, UPSTREAM_REFRESH.as_secs() + 60);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        let (agent, calls) = stub_agent(|_| Ok(png_response(16, 128)));
+        source.agent = agent;
+        let image = source
+            .fetch_if_changed(None)
+            .expect("the refetch runs")
+            .expect("a new round");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one tile per hemisphere at this size"
+        );
+        assert_eq!(image::load_from_memory(&image.bytes).unwrap().width(), 32);
+    }
+
+    /// A young round whose derivation no longer matches — its metadata gone,
+    /// say — is reprocessed from disk rather than downloaded again.
+    #[test]
+    fn a_fresh_pair_without_a_current_derivation_is_reprocessed_from_disk() {
+        let (scratch, mut source) = scratch_cache("eumetsat_fresh_reprocess");
+        store_round(&source, 60, 90);
+        source.fetch_if_changed(None).expect("the first fetch");
+        std::fs::remove_file(scratch.join("eumetsat_map_32x16_meta.toml"))
+            .expect("the derivation's metadata is taken away");
+        let (agent, calls) = stub_agent(|_| panic!("a young round must not touch the network"));
+        source.agent = agent;
+        assert!(
+            source
+                .fetch_if_changed(None)
+                .expect("the reprocess runs")
+                .is_some(),
+            "the stored pair is processed again"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A stop standing before a round starts answers at once, and nothing
+    /// is asked of the service.
+    #[test]
+    fn a_stop_before_a_round_touches_nothing() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.set_cancel(Arc::new(AtomicBool::new(true)));
+        let (agent, calls) = stub_agent(|_| panic!("a stopped round must not touch the network"));
+        source.agent = agent;
+        let Err(error) = source.fetch_if_changed(None) else {
+            panic!("the stop answers");
+        };
+        assert!(error.contains("stopped"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A stop landing mid-round drops the round wherever it is: the error is
+    /// the stop, and no pair is committed to the cache.
+    #[test]
+    fn a_stop_during_a_round_drops_it_uncommitted() {
+        let (scratch, mut source) = scratch_cache("eumetsat_stop_mid_round");
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        *source.size.lock().expect("the size lock") = 16;
+        let stop = Arc::new(AtomicBool::new(false));
+        source.set_cancel(Arc::clone(&stop));
+        // The stop goes up the moment the service is asked for anything, so
+        // the workers unwind at their nearest check point.
+        let stopper = Arc::clone(&stop);
+        let (agent, calls) = stub_agent(move |_| {
+            stopper.store(true, Ordering::SeqCst);
+            Ok(png_response(16, 128))
+        });
+        source.agent = agent;
+        let Err(error) = source.fetch_if_changed(None) else {
+            panic!("the round is stopped");
+        };
+        assert!(error.contains("stopped"), "{error}");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the stop lands on a round that was running"
+        );
+        assert!(
+            !scratch.join("eumetsat_raw_16_meta.toml").exists(),
+            "a stopped round commits nothing"
+        );
     }
 
     /// The two hemispheres fetch in parallel: the middleware holds the first

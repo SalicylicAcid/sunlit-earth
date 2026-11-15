@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -216,6 +216,13 @@ pub trait CloudSource: Send + Sync {
     /// Returns `Ok(None)` when the source is unchanged.
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String>;
 
+    /// Hand the source the flag a user stop reads: set while a running fetch
+    /// is wanted gone, and the source unwinds to its nearest check point.
+    /// A default no-op, because a source that serves one thing in one call
+    /// has nowhere between pieces of work to look; the sources that read a
+    /// body in chunks override it and check per chunk.
+    fn set_cancel(&self, _flag: Arc<AtomicBool>) {}
+
     /// Human-readable description for logs.
     fn describe(&self) -> String;
 
@@ -238,6 +245,11 @@ pub struct HttpCloudSource {
     url: Mutex<String>,
     /// Kept intact when a resolution expands a new request URL.
     configured: Option<RemoteCloudUrl>,
+    /// The user stop, checked once per body chunk while a download reads.
+    /// Behind a lock because [`CloudSource::set_cancel`] replaces it, and
+    /// never `None`: before a worker attaches one, a private flag nobody
+    /// sets reads false.
+    cancel: Mutex<Arc<AtomicBool>>,
 }
 
 impl HttpCloudSource {
@@ -252,7 +264,16 @@ impl HttpCloudSource {
             agent,
             url: Mutex::new(url),
             configured: None,
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
         }
+    }
+
+    /// Whether the user's stop is standing.
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load(Ordering::SeqCst)
     }
 
     /// Construct a source from the validated runtime remote selection.
@@ -311,12 +332,32 @@ impl HttpCloudSource {
         let last_modified = header("Last-Modified");
 
         // 8K cloud JPEG can be ~15 MB, raise the default 10 MB limit
-        let bytes = response
+        let mut reader = response
             .body_mut()
             .with_config()
             .limit(50 * 1024 * 1024)
-            .read_to_vec()
-            .map_err(|_| "Failed to read cloud image body".to_owned())?;
+            .reader();
+        let mut bytes = Vec::new();
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "64 KiB is the chunk a download reads in, on the worker thread"
+        )]
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            use std::io::Read as _;
+            // The stop is checked once per chunk: a stop lands within about
+            // one 64 KiB read rather than at the two-minute global timeout.
+            if self.cancelled() {
+                return Err("the cloud download was stopped".to_owned());
+            }
+            let read = reader
+                .read(&mut chunk)
+                .map_err(|_| "Failed to read cloud image body".to_owned())?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
 
         Ok(CloudImage {
             bytes: Download::new(bytes),
@@ -335,6 +376,13 @@ impl CloudSource for HttpCloudSource {
         } else {
             CloudTarget::remote(&self.url(), false)
         }
+    }
+
+    fn set_cancel(&self, flag: Arc<AtomicBool>) {
+        *self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = flag;
     }
 
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {

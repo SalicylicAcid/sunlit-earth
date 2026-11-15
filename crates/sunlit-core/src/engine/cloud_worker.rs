@@ -65,6 +65,10 @@ pub(super) struct CloudWorker {
     /// The worker ended a request without finishing it because the layer was
     /// switched off. The engine takes it and owes the poll again.
     abandoned: Arc<AtomicBool>,
+    /// The user stop: raised by [`CloudWorker::abort`], read by the source
+    /// between pieces of work and consumed by the fetch loop after each
+    /// poll. Shared with the sources through [`CloudSource::set_cancel`].
+    cancel: Arc<AtomicBool>,
     _thread: JoinHandle<()>,
 }
 
@@ -139,6 +143,12 @@ impl CloudWorker {
         Duration::from_millis(self.wait_ms.load(Ordering::SeqCst))
     }
 
+    /// Whether a fetch run is in flight, the queue wait and the retry
+    /// backoff included: the UI's stop shows against this.
+    pub(super) fn fetching(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// Tell the worker whether the cloud layer is switched on.
     pub(super) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
@@ -148,6 +158,14 @@ impl CloudWorker {
     /// off, clearing the flag.
     pub(super) fn take_abandoned(&self) -> bool {
         self.abandoned.swap(false, Ordering::SeqCst)
+    }
+
+    /// Raise the user stop: the fetch in flight unwinds at its nearest check
+    /// point and the run ends without a retry. A click between runs raises a
+    /// flag the next run clears, so it never stops a fetch the user has not
+    /// seen begin.
+    pub(super) fn abort(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
     }
 
     /// Ask the worker for one poll. Returns `false` when the worker is still
@@ -171,6 +189,10 @@ impl CloudWorker {
 #[expect(
     clippy::too_many_arguments,
     reason = "the worker's whole configuration, handed over once at spawn"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the shared state's construction and the thread body read as one setup"
 )]
 pub(super) fn spawn_cloud_worker(
     source: Arc<dyn CloudSource>,
@@ -208,10 +230,15 @@ pub(super) fn spawn_cloud_worker(
     let worker_enabled = Arc::clone(&enabled);
     let abandoned = Arc::new(AtomicBool::new(false));
     let worker_abandoned = Arc::clone(&abandoned);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
 
     let thread = std::thread::Builder::new()
         .name("sunlit-cloud".into())
         .spawn(move || {
+            // The sources this worker runs are handed the stop flag, so a
+            // user stop reaches the code that can actually abandon a request.
+            source.set_cancel(Arc::clone(&worker_cancel));
             // Kept beside the updater so a source switch can rebuild it: the
             // originals are moved into the first construction.
             let updater_source = Arc::clone(&source);
@@ -236,6 +263,10 @@ pub(super) fn spawn_cloud_worker(
             let mut backoff = RetryBackoff::new();
             let mut first = true;
             while rx.recv().is_ok() {
+                // A stop standing from a run that already ended — a click
+                // that landed between runs — is stale: this run starts
+                // clean, and a click during it re-raises the flag.
+                worker_cancel.store(false, Ordering::SeqCst);
                 if !worker_enabled.load(Ordering::SeqCst) {
                     give_up(&worker_abandoned);
                     worker_busy.store(false, Ordering::SeqCst);
@@ -256,6 +287,7 @@ pub(super) fn spawn_cloud_worker(
                     answer: &worker_answer,
                     enabled: &worker_enabled,
                     abandoned: &worker_abandoned,
+                    cancel: &worker_cancel,
                 };
                 // A switch that arrived while the worker was busy applies
                 // before anything else, including the first cached showing.
@@ -290,6 +322,7 @@ pub(super) fn spawn_cloud_worker(
         answer,
         enabled,
         abandoned,
+        cancel,
         _thread: thread,
     }
 }
@@ -322,6 +355,7 @@ struct FetchLoop<'a> {
     answer: &'a AtomicU8,
     enabled: &'a AtomicBool,
     abandoned: &'a AtomicBool,
+    cancel: &'a Arc<AtomicBool>,
 }
 
 impl FetchLoop<'_> {
@@ -351,6 +385,11 @@ impl FetchLoop<'_> {
             self.updater
                 .set_resolution(self.target.load(Ordering::SeqCst));
             let outcome = self.updater.poll_once();
+            // Consumed whatever the flag now reads: a click that lands while
+            // the poll is finishing belongs to the attempt after this one,
+            // and a stop is only ever taken against a failed attempt — a
+            // round that produced a map delivers it.
+            let stopped = self.cancel.swap(false, Ordering::SeqCst);
             record_first_answer(self.answer, outcome, self.updater.has_posted());
             match outcome {
                 PollOutcome::Updated | PollOutcome::Unchanged => {
@@ -364,6 +403,14 @@ impl FetchLoop<'_> {
                     return FetchEnds::LayerOff;
                 }
                 PollOutcome::Failed => {
+                    if stopped {
+                        set_coarse(
+                            self.status,
+                            "the download was stopped; the next check follows the regular schedule",
+                        );
+                        info!("the cloud poll was stopped by the user");
+                        return FetchEnds::Settled;
+                    }
                     let delay = self.backoff.fail();
                     set_coarse(
                         self.status,
@@ -373,7 +420,7 @@ impl FetchLoop<'_> {
                         retry_delay_secs = delay.as_secs(),
                         "cloud poll failed, retrying"
                     );
-                    rest_while_enabled_or_pending(delay, self.enabled, self.pending);
+                    rest_while_enabled_or_pending(delay, self.enabled, self.pending, self.cancel);
                     // Give up if the engine went away while we slept.
                     if matches!(rx.try_recv(), Err(TryRecvError::Disconnected)) {
                         return FetchEnds::EngineGone;
@@ -416,6 +463,8 @@ impl FetchLoop<'_> {
             source = %source.describe(),
             "the cloud source changed, rebuilding the fetcher"
         );
+        // The replacement runs on the same stop flag as its predecessor.
+        source.set_cancel(Arc::clone(self.cancel));
         *self.updater = CloudUpdater::new(
             Arc::clone(&source),
             self.mailbox.clone(),
@@ -453,13 +502,15 @@ fn give_up(abandoned: &AtomicBool) {
 /// How often a backoff looks at whether the layer is still switched on.
 const REST_SLICE: Duration = Duration::from_millis(100);
 
-/// Sleep out `delay`, or less as soon as `enabled` reads false or a source
-/// switch is waiting to be applied: a switch is worth an attempt as soon as
-/// the worker can make one, not after the full backoff.
+/// Sleep out `delay`, or less as soon as `enabled` reads false, a source
+/// switch is waiting to be applied, or the user stop stands: a switch is
+/// worth an attempt as soon as the worker can make one, not after the full
+/// backoff, and a stopped run ends the moment the loop can look.
 fn rest_while_enabled_or_pending(
     delay: Duration,
     enabled: &AtomicBool,
     pending: &Mutex<Option<Arc<dyn CloudSource>>>,
+    cancel: &AtomicBool,
 ) {
     let until = std::time::Instant::now() + delay;
     loop {
@@ -467,7 +518,7 @@ fn rest_while_enabled_or_pending(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_some();
-        if !enabled.load(Ordering::SeqCst) || switch_pending {
+        if !enabled.load(Ordering::SeqCst) || switch_pending || cancel.load(Ordering::SeqCst) {
             return;
         }
         let left = until.saturating_duration_since(std::time::Instant::now());
@@ -615,5 +666,152 @@ mod tests {
             0,
             "a superseded pending switch must never fetch"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The user stop
+    // -----------------------------------------------------------------------
+
+    /// A source the test can park mid-fetch, so an abort lands while a run is
+    /// genuinely in flight, and which honors the stop the worker hands it.
+    struct StoppableSource {
+        cancel: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+        park: AtomicBool,
+        fetches: std::sync::atomic::AtomicU64,
+    }
+
+    impl StoppableSource {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cancel: std::sync::Mutex::new(None),
+                park: AtomicBool::new(false),
+                fetches: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn fetches(&self) -> u64 {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CloudSource for StoppableSource {
+        fn set_cancel(&self, flag: Arc<AtomicBool>) {
+            *self.cancel.lock().expect("the stop slot") = Some(flag);
+        }
+
+        fn fetch_if_changed(
+            &self,
+            _known_etag: Option<&str>,
+        ) -> Result<Option<CloudImage>, String> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            // Parked, this is the slow download: it answers when released,
+            // or unwinds when the user stop lands.
+            while self.park.load(Ordering::SeqCst) {
+                let stopped = self
+                    .cancel
+                    .lock()
+                    .expect("the stop slot")
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::SeqCst));
+                if stopped {
+                    return Err("the download was stopped".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 88)
+                .write_image(&[128; 4], 2, 2, image::ExtendedColorType::L8)
+                .expect("the fixture encodes");
+            Ok(Some(CloudImage {
+                bytes: Download::new(jpeg),
+                etag: None,
+                last_modified: None,
+            }))
+        }
+
+        fn describe(&self) -> String {
+            "stoppable worker source".to_owned()
+        }
+    }
+
+    /// Spawn a worker over a source the test controls, at one poll a day, so
+    /// only the test's own requests move it.
+    fn stoppable_worker() -> (CloudWorker, TextureMailbox, Arc<StoppableSource>) {
+        let mailbox = TextureMailbox::new(3);
+        let generation = Arc::new(AtomicU64::new(0));
+        let source = StoppableSource::new();
+        let worker = spawn_cloud_worker(
+            Arc::clone(&source) as Arc<dyn CloudSource>,
+            mailbox.clone(),
+            no_notify(),
+            &generation,
+            None,
+            Duration::from_secs(86_400),
+            Duration::ZERO,
+            2048,
+            true,
+        );
+        (worker, mailbox, source)
+    }
+
+    /// Ask for a poll, retrying while the worker is still finishing the
+    /// previous one.
+    fn request_when_free(worker: &CloudWorker) {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while !worker.request() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never became free"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// No pair arrives over a window long enough for a healthy fetch.
+    fn wait_without_pair(mailbox: &TextureMailbox, what: &str) {
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            mailbox.take_cloud_frame().is_none(),
+            "{what}: a pair landed after all"
+        );
+    }
+
+    /// A stop lands on a run parked mid-fetch: the run unwinds without
+    /// posting or retrying, the status names the stop, and the worker takes
+    /// the next run clean — a stale stop must not eat it.
+    #[test]
+    fn an_abort_stops_a_run_without_a_retry() {
+        let (worker, mailbox, source) = stoppable_worker();
+        worker.request();
+        wait_for_pair(&mailbox, "the first map");
+        assert_eq!(source.fetches(), 1);
+
+        // The next run parks mid-fetch, which is the slow download; the stop
+        // answers it there.
+        source.park.store(true, Ordering::SeqCst);
+        request_when_free(&worker);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while source.fetches() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second fetch never started"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        worker.abort();
+        wait_without_pair(&mailbox, "the stopped run");
+        assert_eq!(source.fetches(), 2, "a stop is answered, not retried");
+        assert!(
+            worker.status().contains("stopped"),
+            "the status names the stop: {:?}",
+            worker.status()
+        );
+
+        // And the worker is clean afterwards: the next run starts fresh and
+        // fetches normally, which is what a stale stop would break.
+        source.park.store(false, Ordering::SeqCst);
+        request_when_free(&worker);
+        wait_for_pair(&mailbox, "the map after the stop");
+        assert_eq!(source.fetches(), 3);
     }
 }

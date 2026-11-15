@@ -212,6 +212,9 @@ struct Engine {
     clouds_settled_for: Option<u64>,
     /// The cloud status last forwarded, so the event goes out on changes only.
     cloud_status: Option<String>,
+    /// Whether a cloud fetch run was in flight at the last tick, so the busy
+    /// event goes out on changes only.
+    cloud_busy: bool,
     /// Whether the one debug-level memory dump has already been written. It
     /// goes out the first time the textures are ready, which is the first
     /// moment the numbers describe a loaded scene rather than a half-built one.
@@ -413,6 +416,7 @@ impl Engine {
             textures_ready: false,
             clouds_settled_for: None,
             cloud_status: None,
+            cloud_busy: false,
             memory_dumped: false,
             last_status: String::new(),
             drain: Schedule::new(DRAIN_INTERVAL, now),
@@ -548,6 +552,7 @@ impl Engine {
             }
             EngineCommand::SetCloudSource(config) => self.set_cloud_source(config.as_ref()),
             EngineCommand::RefreshClouds => self.refresh_clouds(),
+            EngineCommand::AbortClouds => self.abort_clouds(),
             EngineCommand::DisplaysChanged => {
                 // Trailing rather than leading: every hint pushes the deadline
                 // out, so a burst is one query at the end of it.
@@ -777,6 +782,18 @@ impl Engine {
         }
     }
 
+    /// Stop the cloud fetch in flight, if there is one, and keep the tick
+    /// from re-asking for it: a stop means "no more work for now", so what
+    /// the schedule was owed is dropped. The next check is the regular one.
+    fn abort_clouds(&mut self) {
+        let Some(cloud) = self.cloud.as_mut() else {
+            return;
+        };
+        cloud.abort();
+        cloud.owed = false;
+        info!("the cloud fetch was asked to stop");
+    }
+
     fn set_cloud_source(&mut self, config: &CloudSourceConfig) {
         let Some(cloud) = self.cloud.as_mut() else {
             info!("a cloud source arrived for a session without one, ignoring it");
@@ -840,6 +857,13 @@ impl Engine {
             // owed, so switching it on sends one at once.
             if cloud.owed && self.params.clouds_enabled && cloud.request() {
                 cloud.owed = false;
+            }
+            let busy = cloud.fetching();
+            if self.cloud_busy != busy {
+                self.cloud_busy = busy;
+                // The stop shows against a fetch in flight, so the busy state
+                // goes out the tick it changes, status line or not.
+                self.emit(EngineEvent::CloudBusy(busy));
             }
         }
 
