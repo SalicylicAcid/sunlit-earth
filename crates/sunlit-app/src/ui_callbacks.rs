@@ -1,5 +1,7 @@
 //! UI callback registration and config-to-window bridge functions.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use slint::ComponentHandle;
@@ -112,7 +114,7 @@ fn register_globe_drag(window: &MainWindow, link: &EngineLink) {
         set_held_longitude(&mut position, longitude);
         position.latitude = latitude;
         win.set_camera_position(position);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 }
 
@@ -377,7 +379,7 @@ fn register_camera_panel(window: &MainWindow, link: &EngineLink) {
             return;
         };
         apply_camera_stick(&win, &stick_eases, stick, x, y, seconds);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -415,7 +417,7 @@ fn register_camera_panel(window: &MainWindow, link: &EngineLink) {
         let mut orientation = win.get_camera_orientation();
         orientation.tilt = camera_controls::roll_by(orientation.tilt, degrees);
         win.set_camera_orientation(orientation);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -449,7 +451,7 @@ fn register_camera_panel(window: &MainWindow, link: &EngineLink) {
         let mut position = win.get_camera_position();
         position.zoom = camera_controls::zoom_by_rate(position.zoom, direction, seconds);
         win.set_camera_position(position);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -459,7 +461,7 @@ fn register_camera_panel(window: &MainWindow, link: &EngineLink) {
             return;
         };
         advance_eases(&win, &eases, seconds);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 }
 
@@ -486,7 +488,7 @@ pub fn register_mouse_callbacks(window: &MainWindow, link: &EngineLink) {
             dy,
         );
         win.set_framing(framing);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -499,7 +501,7 @@ pub fn register_mouse_callbacks(window: &MainWindow, link: &EngineLink) {
         (orientation.yaw, orientation.pitch) =
             mouse_math::apply_orient_drag(orientation.yaw, orientation.pitch, dx, dy);
         win.set_camera_orientation(orientation);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -511,7 +513,7 @@ pub fn register_mouse_callbacks(window: &MainWindow, link: &EngineLink) {
         let mut orientation = win.get_camera_orientation();
         orientation.tilt = mouse_math::apply_tilt_drag(orientation.tilt, dx);
         win.set_camera_orientation(orientation);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -523,7 +525,7 @@ pub fn register_mouse_callbacks(window: &MainWindow, link: &EngineLink) {
         let mut position = win.get_camera_position();
         position.zoom = mouse_math::apply_zoom_scroll(position.zoom, delta);
         win.set_camera_position(position);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 
     let window_weak = window.as_weak();
@@ -536,7 +538,7 @@ pub fn register_mouse_callbacks(window: &MainWindow, link: &EngineLink) {
             return;
         };
         apply_preset(&win, preset);
-        engine.push_params(&win);
+        engine.push_params_as_edit(&win);
     });
 }
 
@@ -548,7 +550,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     window.on_sliders_changed(move || {
         if let Some(win) = window_weak.upgrade() {
             update_datetime_labels(&win);
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -561,7 +563,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
                 set_fixed_time(&win, now.replace_nanosecond(0).unwrap_or(now));
             }
             update_datetime_labels(&win);
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -576,7 +578,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
             });
             set_fixed_time(&win, at);
             update_datetime_labels(&win);
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -585,7 +587,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     window.on_camera_frame_toggled(move || {
         if let Some(win) = window_weak.upgrade() {
             convert_camera_frame(&win);
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -593,7 +595,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     let engine = link.clone();
     window.on_msaa_changed(move || {
         if let Some(win) = window_weak.upgrade() {
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -601,7 +603,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     let engine = link.clone();
     window.on_texture_changed(move || {
         if let Some(win) = window_weak.upgrade() {
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
         }
     });
 
@@ -988,6 +990,71 @@ pub fn cloud_busy_to_ui(window: slint::Weak<MainWindow>, busy: bool) {
         if let Some(win) = window.upgrade() {
             win.set_cloud_source_busy(busy);
         }
+    });
+}
+
+/// How long an edit waits before the settings are written: a slider reports
+/// every pixel of a drag, and the write takes the state as it stands when
+/// the drag settles.
+const SETTINGS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What an armed settings save does: the window as it stands, and the link
+/// to save it through. The real action writes the config; the test
+/// harnesses install their own.
+pub type SettingsSaveAction = Rc<dyn Fn(&MainWindow, &EngineLink)>;
+
+thread_local! {
+    /// The one debounced write every edit arms. Slint timers run on the event
+    /// loop's thread, which is where every edit happens, so one per thread is
+    /// one per event loop.
+    static SETTINGS_SAVE: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+    /// What an armed settings save does. The default writes the window's
+    /// whole state over the stored config; a test replaces it, because a test
+    /// process must never write the developer's own configuration.
+    static SETTINGS_SAVE_ACTION: RefCell<Option<SettingsSaveAction>> =
+        const { RefCell::new(None) };
+}
+
+/// Arm the debounced settings write: an edit's state lands on disk a second
+/// after the last edit, so the panel and the time bar survive a restart
+/// without waiting for an explicit Set as Wallpaper. The camera's drag
+/// events arm it too, and the debounce is what keeps a drag at one write.
+pub(crate) fn arm_settings_save(window: &MainWindow, engine: &EngineLink) {
+    let window_weak = window.as_weak();
+    let engine = engine.clone();
+    SETTINGS_SAVE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let timer = slot.get_or_insert_with(slint::Timer::default);
+        timer.start(
+            slint::TimerMode::SingleShot,
+            SETTINGS_SAVE_DELAY,
+            move || {
+                run_settings_save(&window_weak, &engine);
+            },
+        );
+    });
+}
+
+/// What an armed settings save does when it fires.
+fn run_settings_save(window: &slint::Weak<MainWindow>, engine: &EngineLink) {
+    let action = SETTINGS_SAVE_ACTION.with(|slot| slot.borrow().clone());
+    let Some(win) = window.upgrade() else {
+        return;
+    };
+    match action {
+        // A test's own action stands in for the write, which a test process
+        // must never do against the developer's configuration.
+        Some(action) => action(&win, engine),
+        None => config::save_config(&read_config_from_window(&win, engine)),
+    }
+}
+
+/// Replace what an armed settings save does. For the test harnesses: a save
+/// the test can observe — or make inert — without the process writing the
+/// developer's own configuration. `None` restores the real write.
+pub fn set_settings_save_action(action: Option<SettingsSaveAction>) {
+    SETTINGS_SAVE_ACTION.with(|slot| {
+        *slot.borrow_mut() = action;
     });
 }
 

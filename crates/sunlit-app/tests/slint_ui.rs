@@ -45,6 +45,12 @@ fn init() {
     INITIALIZED.with(|flag| {
         if !*flag.borrow() {
             i_slint_backend_testing::init_no_event_loop();
+            // An edit arms a debounced settings write whose default lands in
+            // the developer's own config file, which this process must never
+            // do. Every test thread's write is inert unless its case installs
+            // an action of its own.
+            let inert: sunlit_earth::ui_callbacks::SettingsSaveAction = Rc::new(|_, _| {});
+            ui_callbacks::set_settings_save_action(Some(inert));
             *flag.borrow_mut() = true;
         }
     });
@@ -10023,4 +10029,49 @@ fn test_the_stop_shows_only_while_a_fetch_is_busy() {
     assert_eq!(stop_buttons(), 1, "the stop shows while the fetch runs");
     window.set_cloud_source_busy(false);
     assert_eq!(stop_buttons(), 0, "the stop goes when the run ends");
+}
+
+/// An edit arms the debounced settings write: one write a second after the
+/// last edit, and none at all from the pushes that are not edits, which is
+/// what keeps a preview and a defaults load free of writes.
+#[test]
+fn test_an_edit_saves_the_settings_a_beat_after_it() {
+    let SourceWindow {
+        window,
+        link,
+        sent: _,
+    } = create_source_window();
+    ui_callbacks::register_change_callbacks(&window, &link);
+    let writes = Rc::new(std::cell::Cell::new(0usize));
+    let counter = Rc::clone(&writes);
+    let counting: sunlit_earth::ui_callbacks::SettingsSaveAction = Rc::new(move |_, _| {
+        counter.set(counter.get() + 1);
+    });
+    ui_callbacks::set_settings_save_action(Some(counting));
+
+    // A slider edit arms the write, which waits out the delay.
+    window.invoke_sliders_changed();
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(300));
+    assert_eq!(writes.get(), 0, "the write waits out the delay");
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(800));
+    assert_eq!(
+        writes.get(),
+        1,
+        "the write lands a second after the last edit"
+    );
+
+    // The pushes that are not edits arm nothing: Load Defaults and Revert to
+    // Saved show a state without committing it, and a burst collapses into
+    // one write rather than one per event.
+    window.invoke_load_defaults();
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(1500));
+    assert_eq!(
+        writes.get(),
+        1,
+        "a preview that is not an edit writes nothing"
+    );
+
+    // Back to the inert write the fixture installed, for the tests after.
+    let inert: sunlit_earth::ui_callbacks::SettingsSaveAction = Rc::new(|_, _| {});
+    ui_callbacks::set_settings_save_action(Some(inert));
 }

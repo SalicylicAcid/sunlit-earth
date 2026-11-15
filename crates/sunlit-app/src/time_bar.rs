@@ -411,7 +411,7 @@ fn act(window: &MainWindow, link: &EngineLink, action: Action) {
 fn set_time(window: &MainWindow, link: &EngineLink, at: OffsetDateTime) {
     ui_callbacks::set_fixed_time(window, at);
     ui_callbacks::update_datetime_labels(window);
-    link.push_params(window);
+    link.push_params_as_edit(window);
     let mut view = window.get_time_bar();
     if view.excursion {
         link.send(EngineCommand::Excursion(ExcursionCommand::End));
@@ -774,7 +774,7 @@ fn register_setting(window: &MainWindow, link: &EngineLink) {
             settings.instant = slint::SharedString::new();
             win.set_datetime(settings);
             ui_callbacks::update_datetime_labels(&win);
-            engine.push_params(&win);
+            engine.push_params_as_edit(&win);
             engine.send(EngineCommand::Excursion(ExcursionCommand::End));
             refresh(&win);
         }

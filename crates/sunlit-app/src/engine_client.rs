@@ -163,6 +163,15 @@ impl EngineLink {
         self.send(EngineCommand::UpdateParams(Box::new(params)));
         crate::time_bar::refresh(window);
     }
+
+    /// Push params, then arm the debounced settings save: the shape of every
+    /// user edit. A startup push and a Load Defaults push call
+    /// [`EngineLink::push_params`] instead, since neither is an edit — a
+    /// preview that costs nothing on disk is the point of both.
+    pub fn push_params_as_edit(&self, window: &MainWindow) {
+        self.push_params(window);
+        crate::ui_callbacks::arm_settings_save(window, self);
+    }
 }
 
 /// Build the engine event callback that feeds a Slint window.
