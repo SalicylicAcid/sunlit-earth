@@ -595,6 +595,100 @@ pub(crate) fn tiles_per_side(px: u32) -> u32 {
 }
 
 impl EumetsatCloudSource {
+    /// One round, with its phase and per-hemisphere progress lines raised
+    /// while it works. `fetch_if_changed` clears them on the way out.
+    fn fetch_round(&self) -> Result<Option<CloudImage>, String> {
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        let px = self.px();
+        let started = Instant::now();
+        let deadline = started + ROUND_BUDGET;
+
+        // The stored pair is served from disk on this instance's first fetch
+        // — a parameter or algorithm change arrives as a new instance, and
+        // its first fetch reprocesses rather than downloads again — and on
+        // any poll inside the window a round can still be young in: upstream
+        // cannot have published anything the pair does not hold.
+        let cached_raw = self.load_raw_pair(px);
+        let first = self.first_fetch.swap(false, Ordering::SeqCst);
+        let serves_from_disk = cached_raw
+            .as_ref()
+            .is_some_and(|pair| first || Self::round_is_fresh(pair));
+        if let Some(pair) = &cached_raw
+            && serves_from_disk
+        {
+            if self.derived_matches(px, &pair.hashes.0, &pair.hashes.1) {
+                info!(
+                    px,
+                    fresh = !first,
+                    "the stored raw pair and its derivation are still current"
+                );
+                return Ok(None);
+            }
+            self.set_phase("processing locally");
+            info!(
+                px,
+                first, "reprocessing the stored raw pair without the network"
+            );
+            let west = decode_png(&pair.west, px)?;
+            let east = decode_png(&pair.east, px)?;
+            let bytes =
+                self.process_and_store(px, &west, &east, &pair.hashes.0, &pair.hashes.1, started)?;
+            return Ok(Some(CloudImage {
+                bytes: Download::new(bytes),
+                etag: None,
+                last_modified: None,
+            }));
+        }
+
+        // Both hemispheres of one round, fetched in parallel over the one
+        // deadline: the two requests share nothing but the budget, so a slow
+        // west no longer holds the east's start. Only a complete pair goes on
+        // to processing, so no half a map is ever stitched to history.
+        self.set_phase("downloading the two hemispheres");
+        let (west, east) = std::thread::scope(|scope| {
+            let west = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[0].0, 0, HEMISPHERES[0].1, px, deadline)
+            });
+            let east = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[1].0, 1, HEMISPHERES[1].1, px, deadline)
+            });
+            (west.join(), east.join())
+        });
+        let west = west.map_err(|_| "the west hemisphere's fetch panicked".to_owned())?;
+        let east = east.map_err(|_| "the east hemisphere's fetch panicked".to_owned())?;
+        let (west_body, west) = west?;
+        info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
+        let (east_body, east) = east?;
+        info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
+        // A stop that landed mid-round drops it here rather than committing a
+        // round the user asked to be rid of: the next poll starts over.
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        self.set_phase("processing the round");
+        let west_sha = sha256_hex(&west_body);
+        let east_sha = sha256_hex(&east_body);
+        // Upstream unchanged and the derivation current: nothing to report,
+        // and nothing to process.
+        if let Some(pair) = &cached_raw
+            && west_body == pair.west
+            && east_body == pair.east
+            && self.derived_matches(px, &pair.hashes.0, &pair.hashes.1)
+        {
+            debug!(px, "the upstream round matches the stored one");
+            return Ok(None);
+        }
+        self.store_raw_pair(px, &west_body, &east_body)?;
+        let bytes = self.process_and_store(px, &west, &east, &west_sha, &east_sha, started)?;
+        Ok(Some(CloudImage {
+            bytes: Download::new(bytes),
+            etag: None,
+            last_modified: None,
+        }))
+    }
+
     pub fn new(settings: EumetsatSettings, cache_dir: Option<std::path::PathBuf>) -> Self {
         let user_agent = format!("sunlit.earth/{}", env!("CARGO_PKG_VERSION"));
         let agent = ureq::Agent::config_builder()
@@ -790,7 +884,6 @@ impl EumetsatCloudSource {
             // cancel-abort may carry no recorded failure at all, the workers
             // having simply stopped between tiles.
             if self.cancelled() {
-                self.set_phase("");
                 return Err(Self::stop_error());
             }
             if abort.load(Ordering::SeqCst) {
@@ -1056,95 +1149,14 @@ impl CloudSource for EumetsatCloudSource {
     }
 
     fn fetch_if_changed(&self, _known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
-        if self.cancelled() {
-            return Err(Self::stop_error());
-        }
-        let px = self.px();
-        let started = Instant::now();
-        let deadline = started + ROUND_BUDGET;
-
-        // The stored pair is served from disk on this instance's first fetch
-        // — a parameter or algorithm change arrives as a new instance, and
-        // its first fetch reprocesses rather than downloads again — and on
-        // any poll inside the window a round can still be young in: upstream
-        // cannot have published anything the pair does not hold.
-        let cached_raw = self.load_raw_pair(px);
-        let first = self.first_fetch.swap(false, Ordering::SeqCst);
-        let serves_from_disk = cached_raw
-            .as_ref()
-            .is_some_and(|pair| first || Self::round_is_fresh(pair));
-        if let Some(pair) = &cached_raw
-            && serves_from_disk
-        {
-            if self.derived_matches(px, &pair.hashes.0, &pair.hashes.1) {
-                info!(
-                    px,
-                    fresh = !first,
-                    "the stored raw pair and its derivation are still current"
-                );
-                return Ok(None);
-            }
-            self.set_phase("processing locally");
-            info!(
-                px,
-                first, "reprocessing the stored raw pair without the network"
-            );
-            let west = decode_png(&pair.west, px)?;
-            let east = decode_png(&pair.east, px)?;
-            let bytes =
-                self.process_and_store(px, &west, &east, &pair.hashes.0, &pair.hashes.1, started)?;
-            return Ok(Some(CloudImage {
-                bytes: Download::new(bytes),
-                etag: None,
-                last_modified: None,
-            }));
-        }
-
-        // Both hemispheres of one round, fetched in parallel over the one
-        // deadline: the two requests share nothing but the budget, so a slow
-        // west no longer holds the east's start. Only a complete pair goes on
-        // to processing, so no half a map is ever stitched to history.
-        self.set_phase("downloading the two hemispheres");
-        let (west, east) = std::thread::scope(|scope| {
-            let west = scope.spawn(|| {
-                self.fetch_hemisphere(HEMISPHERES[0].0, 0, HEMISPHERES[0].1, px, deadline)
-            });
-            let east = scope.spawn(|| {
-                self.fetch_hemisphere(HEMISPHERES[1].0, 1, HEMISPHERES[1].1, px, deadline)
-            });
-            (west.join(), east.join())
-        });
-        let west = west.map_err(|_| "the west hemisphere's fetch panicked".to_owned())?;
-        let east = east.map_err(|_| "the east hemisphere's fetch panicked".to_owned())?;
-        let (west_body, west) = west?;
-        info!(elapsed = ?started.elapsed(), px, "the west hemisphere arrived");
-        let (east_body, east) = east?;
-        info!(elapsed = ?started.elapsed(), px, "both hemispheres arrived");
-        // A stop that landed mid-round drops it here rather than committing a
-        // round the user asked to be rid of: the next poll starts over.
-        if self.cancelled() {
-            self.set_phase("");
-            return Err(Self::stop_error());
-        }
-        let west_sha = sha256_hex(&west_body);
-        let east_sha = sha256_hex(&east_body);
-        // Upstream unchanged and the derivation current: nothing to report,
-        // and nothing to process.
-        if let Some(pair) = &cached_raw
-            && west_body == pair.west
-            && east_body == pair.east
-            && self.derived_matches(px, &pair.hashes.0, &pair.hashes.1)
-        {
-            debug!(px, "the upstream round matches the stored one");
-            return Ok(None);
-        }
-        self.store_raw_pair(px, &west_body, &east_body)?;
-        let bytes = self.process_and_store(px, &west, &east, &west_sha, &east_sha, started)?;
-        Ok(Some(CloudImage {
-            bytes: Download::new(bytes),
-            etag: None,
-            last_modified: None,
-        }))
+        let outcome = self.fetch_round();
+        // Whatever the round came to, it is over: the phase and the download
+        // lines named what it was doing while it ran. Without this the last
+        // phase outlives the round — "64/64 tiles" hanging on the status line
+        // for an hour — and hides the worker's own answer, which is what
+        // ready, stopped and retrying are.
+        self.set_phase("");
+        outcome
     }
 
     fn describe(&self) -> String {
@@ -2296,6 +2308,42 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "the round waited on the barrier, so the fetches were sequential: {elapsed:?}"
         );
+    }
+
+    /// A finished round leaves nothing behind: the phase and the download
+    /// lines are the round's, and an idle source says nothing, which is what
+    /// lets the worker's own status — ready, stopped, a retry's delay — be
+    /// the answer between rounds.
+    #[test]
+    fn a_finished_round_leaves_no_status_behind() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        *source.size.lock().expect("the size lock") = 16;
+        let (agent, _calls) = stub_agent(|_| Ok(png_response(16, 128)));
+        source.agent = agent;
+        source
+            .fetch_if_changed(None)
+            .expect("the round succeeds")
+            .expect("a map comes out");
+        assert_eq!(
+            source.status(),
+            None,
+            "an idle source says nothing after a round"
+        );
+
+        // The same is true of the round after it, whether it comes back
+        // unchanged or fails on its way out.
+        source.fetch_if_changed(None).expect("the next round runs");
+        assert_eq!(source.status(), None, "nothing after an unchanged round");
+        let (agent, _calls) = stub_agent(|_| {
+            Ok(Response::builder()
+                .status(403)
+                .body(Body::builder().data(Vec::new()))
+                .unwrap())
+        });
+        source.agent = agent;
+        assert!(source.fetch_if_changed(None).is_err(), "the round fails");
+        assert_eq!(source.status(), None, "nothing after a failed round");
     }
 
     #[test]
