@@ -275,6 +275,11 @@ export component MainWindow inherits Window {
     in-out property <string> cloud-source-status;
     in-out property <bool> cloud-source-busy;
     in-out property <bool> cloud-source-override;
+    // The minutes between checks of the cloud source, and the reset target
+    // for them. The source's own gate still decides whether a check
+    // downloads anything.
+    in-out property <float> cloud-poll-mins;
+    in property <float> cloud-poll-defaults;
     in-out property <CelestialSettings> celestial;
     in-out property <AtmosphereSettings> atmosphere;
     in-out property <LightingSettings> lighting;
@@ -306,6 +311,7 @@ export component MainWindow inherits Window {
     callback apply-cloud-source(CloudSourceSettings);
     callback refresh-clouds();
     callback abort-clouds();
+    callback cloud-poll-changed();
     callback msaa-changed();
     callback texture-changed();
     callback texture-resolution-changed();
@@ -1557,14 +1563,17 @@ export component MainWindow inherits Window {
                         SettingGroup {
                             title: "Clouds";
                             modified: root.clouds != root.defaults.clouds
-                                || root.cloud-source != root.cloud-source-defaults;
+                                || root.cloud-source != root.cloud-source-defaults
+                                || root.cloud-poll-mins != root.cloud-poll-defaults;
                             reset => {
                                 root.clouds = root.defaults.clouds;
                                 // Pure assignments first, so the panel restores
                                 // even where the apply callback is not wired.
                                 root.cloud-source = root.cloud-source-defaults;
                                 root.cloud-source-draft = root.cloud-source-defaults;
+                                root.cloud-poll-mins = root.cloud-poll-defaults;
                                 root.sliders-changed();
+                                root.cloud-poll-changed();
                                 root.apply-cloud-source(root.cloud-source-defaults);
                             }
                             VerticalLayout {
@@ -1575,6 +1584,20 @@ export component MainWindow inherits Window {
                                     hint: "Master switch for the cloud layer. While it is off, no new download or decode starts.";
                                     checked <=> root.clouds.enabled;
                                     toggled => { root.sliders-changed(); }
+                                }
+
+                                cloud-poll-slider := SettingRow {
+                                    label: "Check every";
+                                    hint: "Minutes between checks of the cloud source. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery.";
+                                    minimum: 5;
+                                    maximum: 1440;
+                                    value <=> root.cloud-poll-mins;
+                                    default-value: root.cloud-poll-defaults;
+                                    value-text: round(root.cloud-poll-mins) + " min";
+                                    changed => {
+                                        root.cloud-poll-changed();
+                                        root.sliders-changed();
+                                    }
                                 }
 
                                 cloud-source-combo := SettingCombo {

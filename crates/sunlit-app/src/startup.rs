@@ -136,7 +136,7 @@ pub(crate) fn engine_config(
         texture_resolution,
         clock: Arc::new(SystemClock::new()),
         cloud,
-        cloud_poll_interval: cloud_fetcher::poll_interval(),
+        cloud_poll_interval: cloud_fetcher::poll_interval(config.cloud_poll_mins),
         cache_dir: cloud_fetcher::cache_dir(),
         auto_refresh: config
             .auto_refresh_enabled

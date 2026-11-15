@@ -1432,3 +1432,60 @@ mod runtime_switch {
         );
     }
 }
+
+/// A smaller interval set at runtime asks for the next check sooner: half an
+/// hour of nothing under the hourly default, then one fetch inside the five
+/// minutes the new interval names. The schedule is the engine tick's own
+/// bookkeeping, so the command lands where the polls are decided.
+#[test]
+fn a_runtime_interval_change_asks_for_the_next_check_sooner() {
+    let _gpu = gpu();
+    let source = Arc::new(CountingClouds::new(false));
+    let bands = source.inner.serve_bands();
+    let _ = &bands;
+    let clock = Arc::new(MockClock::new(time::OffsetDateTime::UNIX_EPOCH));
+    let harness = Harness::start(|config| {
+        config.params = switched(true);
+        config.cloud = Some(Arc::clone(&source) as Arc<dyn CloudSource>);
+        config.clock = Arc::clone(&clock) as Arc<dyn sunlit_core::engine::clock::Clock>;
+        config.cloud_poll_interval = POLL;
+    });
+
+    let wait_for_fetches = |source: &CountingClouds, want: u64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if source.fetches() >= want {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    };
+
+    harness.advance(&clock, POLL);
+    assert!(wait_for_fetches(&source, 1), "the first tick polls");
+
+    // Half an hour under the hourly default: no second fetch. The worker
+    // answers its first run before this window closes.
+    harness.advance(&clock, Duration::from_mins(30));
+    std::thread::sleep(Duration::from_millis(200));
+    let after_first = source.fetches();
+
+    // The new interval, five minutes from whenever the engine processes the
+    // command: four minutes of clock leave it still ahead of the deadline
+    // (the engine's own handling delay is milliseconds), two more cross it —
+    // where the hourly default would have asked for another half hour.
+    harness.engine.set_cloud_poll_interval(5);
+    harness.advance(&clock, Duration::from_mins(4));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        source.fetches(),
+        after_first,
+        "the new deadline is not yet due"
+    );
+    harness.advance(&clock, Duration::from_mins(6));
+    assert!(
+        wait_for_fetches(&source, after_first + 1),
+        "the smaller interval asks"
+    );
+}

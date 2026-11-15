@@ -98,6 +98,14 @@ impl Default for QualityTier {
 /// not a setting.
 pub(crate) const SUN_FLARE_MAX: f32 = 1.0;
 
+/// The floor of the cloud check interval, in minutes. Five is also the
+/// worker's own first retry delay, so a check more often than this would
+/// only stack requests the backoff is already pacing.
+pub const CLOUD_POLL_MINS_MIN: u32 = 5;
+/// The ceiling: every source's own cadence is an hour or shorter, so a
+/// longer check would never see anything new.
+pub const CLOUD_POLL_MINS_MAX: u32 = 1440;
+
 /// The resolution setting's values, widest first.
 ///
 /// Each is the width of the map the finest surface tile level matches: 8192 the
@@ -267,6 +275,11 @@ pub struct AppConfig {
     #[serde(deserialize_with = "CloudSourceConfig::deserialize_value")]
     pub cloud_source: CloudSourceConfig,
     pub clouds_enabled: bool,
+    /// Minutes between checks of the cloud source. The source's own gate —
+    /// the raw pair's age, or the round list — still decides whether a check
+    /// downloads anything, so a small value here costs small requests, not
+    /// imagery downloads.
+    pub cloud_poll_mins: u32,
     pub cloud_opacity: f32,
     pub cloud_opacity_night: f32,
     pub cloud_haze_equator: f32,
@@ -462,6 +475,12 @@ impl AppConfig {
         // there, so a file holding more would draw a flare nothing on screen
         // can bring back.
         self.sun_flare = self.sun_flare.clamp(0.0, SUN_FLARE_MAX);
+        // Five minutes is the floor a round's own retries already respect; a
+        // day is the point past which the hourly defaults of every source
+        // make a longer check meaningless.
+        self.cloud_poll_mins = self
+            .cloud_poll_mins
+            .clamp(CLOUD_POLL_MINS_MIN, CLOUD_POLL_MINS_MAX);
     }
 
     /// The monitor the wallpaper plan is anchored to, or `None` for the primary.
@@ -499,6 +518,7 @@ impl Default for AppConfig {
             fresnel_exp: 4.0,
             cloud_source: CloudSourceConfig::default(),
             clouds_enabled: true,
+            cloud_poll_mins: 60,
             cloud_opacity: 0.85,
             cloud_opacity_night: 0.45,
             cloud_haze_equator: 0.9,
@@ -814,6 +834,24 @@ mod tests {
         }
     }
 
+    /// The check interval rides the same sanitize clamp as the rest: a file
+    /// may hold anything, and what the app uses is between five minutes and
+    /// a day.
+    #[test]
+    fn cloud_poll_mins_is_clamped_on_load() {
+        for (raw, expected) in [(3u32, 5u32), (60, 60), (1440, 1440), (5000, 1440)] {
+            let scratch = ScratchDir::new("cloud_poll_mins");
+            let path = scratch.join("config.toml");
+            fs::write(
+                &path,
+                format!("version = 4\n[sunlit.earth]\ncloud_poll_mins = {raw}\n"),
+            )
+            .unwrap();
+            let config = load_config_from(&path);
+            assert_eq!(config.cloud_poll_mins, expected, "{raw}");
+        }
+    }
+
     #[test]
     fn cloud_source_invalid_subtables_restore_only_the_source() {
         let scratch = ScratchDir::new("cloud_source_invalid");
@@ -972,6 +1010,7 @@ mod tests {
             fresnel_exp: 3.0,
             cloud_source: CloudSourceConfig::default(),
             clouds_enabled: false,
+            cloud_poll_mins: 60,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.45,
             cloud_haze_equator: 0.4,
@@ -1220,6 +1259,7 @@ sky_fov = 111.0
             fresnel_exp: 4.0,
             cloud_source: CloudSourceConfig::default(),
             clouds_enabled: false,
+            cloud_poll_mins: 60,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.95,
             cloud_haze_equator: 0.3,

@@ -109,7 +109,7 @@ The main window has three menus. On Windows they are in the window's own menu ba
 
 On macOS the App menu is the one the toolkit makes for every app, with the app's own About Sunlit Earth and Quit Sunlit Earth in it. Its Hide (⌘H) hides the window without the tray menu noticing, so the tray's first entry still says Hide afterwards: choosing it once puts things right, and choosing it again shows the window.
 
-The tray menu has Show or Hide, whichever the window needs next, then Refresh Now, Refresh Clouds, Auto-refresh and Start on login, then Check for Updates…, Website, About and Quit. On Windows and Linux a click on the tray icon also shows or hides the window; on macOS a click opens the menu.
+The tray menu has Show or Hide, whichever the window needs next, then Update Wallpaper Now, Update Clouds Now, Auto-refresh and Start on login, then Check for Updates…, Website, About and Quit. On Windows and Linux a click on the tray icon also shows or hides the window; on macOS a click opens the menu.
 
 ## Checking for updates
 

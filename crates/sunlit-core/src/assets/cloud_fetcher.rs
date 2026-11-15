@@ -37,7 +37,6 @@ pub(crate) fn no_notify() -> NotifyFn {
     Arc::new(|| {})
 }
 
-const POLL_INTERVAL: Duration = Duration::from_hours(1);
 /// First delay after a failed poll. Doubles up to [`MAX_RETRY_DELAY`].
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(15);
 /// Ceiling for the retry backoff, so a service outage does not turn into an
@@ -115,27 +114,29 @@ pub(crate) fn cloud_variant(resolution: u32) -> (u32, u32) {
 /// Resolve the poll interval from an optional environment override.
 ///
 /// Values that do not parse as a positive number of seconds are ignored
-/// with a warning and the compiled-in interval is used instead.
-fn resolve_poll_interval(raw: Option<&str>) -> Duration {
-    let Some(value) = raw else {
-        return POLL_INTERVAL;
-    };
+/// with a warning and the config's minutes are used instead. `None` is "no
+/// usable override".
+fn resolve_poll_interval(raw: Option<&str>) -> Option<Duration> {
+    let value = raw?;
     match value.trim().parse::<u64>() {
-        Ok(secs) if secs > 0 => Duration::from_secs(secs),
+        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
         _ => {
             warn!(
                 value,
                 env = ENV_POLL_SECS,
-                "invalid poll interval, using default"
+                "invalid poll interval, using the config value"
             );
-            POLL_INTERVAL
+            None
         }
     }
 }
 
-/// The configured poll interval, honoring `SUNLIT_EARTH_CLOUD_POLL_SECS`.
-pub fn poll_interval() -> Duration {
+/// The configured poll interval: the env override when it holds, else the
+/// config's minutes. `SUNLIT_EARTH_CLOUD_POLL_SECS` stays the strongest
+/// voice, as it has been since before the setting existed.
+pub fn poll_interval(mins: u32) -> Duration {
     resolve_poll_interval(crate::env_override(ENV_POLL_SECS).as_deref())
+        .unwrap_or_else(|| Duration::from_mins(u64::from(mins)))
 }
 
 /// The cache directory, as [`crate::user_state::cache_dir`] resolves it.
@@ -779,14 +780,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_poll_interval_without_override_uses_constant() {
-        assert_eq!(resolve_poll_interval(None), POLL_INTERVAL);
+    fn resolve_poll_interval_without_override_yields_none() {
+        assert_eq!(resolve_poll_interval(None), None);
     }
 
     #[test]
     fn resolve_poll_interval_parses_seconds() {
-        assert_eq!(resolve_poll_interval(Some("5")), Duration::from_secs(5));
-        assert_eq!(resolve_poll_interval(Some(" 42 ")), Duration::from_secs(42));
+        assert_eq!(
+            resolve_poll_interval(Some("5")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            resolve_poll_interval(Some(" 42 ")),
+            Some(Duration::from_secs(42))
+        );
     }
 
     #[test]
@@ -794,7 +801,7 @@ mod tests {
         for value in ["0", "-1", "abc", "1.5", ""] {
             assert_eq!(
                 resolve_poll_interval(Some(value)),
-                POLL_INTERVAL,
+                None,
                 "expected fallback for {value:?}"
             );
         }

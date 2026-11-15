@@ -619,6 +619,23 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
             ));
         }
     });
+
+    // The check interval is the other one: it decides when the cloud worker
+    // is asked, not what any frame draws. The debounced save the slider's
+    // own sliders-changed arms reads the same property back into the config.
+    let window_weak = window.as_weak();
+    let engine = link.clone();
+    window.on_cloud_poll_changed(move || {
+        if let Some(win) = window_weak.upgrade() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a clamped interval in minutes is far inside the u32 range"
+            )]
+            let mins = win.get_cloud_poll_mins().round().clamp(5.0, 1440.0) as u32;
+            engine.send(EngineCommand::SetCloudPollInterval(mins));
+        }
+    });
 }
 
 /// Register action callbacks: set wallpaper, load defaults, reset.
@@ -890,6 +907,16 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
         reason = "an interval in minutes is far inside the f32 mantissa"
     )]
     window.set_auto_refresh_interval(config.auto_refresh_interval_minutes as f32);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an interval in minutes is far inside the f32 mantissa"
+    )]
+    window.set_cloud_poll_mins(config.cloud_poll_mins as f32);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an interval in minutes is far inside the f32 mantissa"
+    )]
+    window.set_cloud_poll_defaults(config::AppConfig::default().cloud_poll_mins as f32);
 
     update_datetime_labels(window);
 }
@@ -1540,6 +1567,13 @@ pub fn read_config_from_window_onto(
     }
     read_params_from_window(window, aa_counts).write_to_config(&mut config);
     config.cloud_source = cloud_source_config_from(&window.get_cloud_source());
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a clamped interval in minutes is far inside the u32 range"
+    )]
+    let poll_mins = window.get_cloud_poll_mins().round().clamp(5.0, 1440.0) as u32;
+    config.cloud_poll_mins = poll_mins;
     config
 }
 

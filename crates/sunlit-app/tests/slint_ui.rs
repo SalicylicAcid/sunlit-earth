@@ -10251,6 +10251,35 @@ fn every_slider_producible_draft_applies_inside_the_domain() {
     }
 }
 
+/// The check-interval slider reaches the engine as its command, and the
+/// debounced save reads it into the config; the defaults push puts the
+/// one-hour default back.
+#[test]
+fn test_the_cloud_poll_slider_saves_and_reaches_the_engine() {
+    let SourceWindow { window, link, sent } = create_source_window();
+    // The changed callback is a change registration, not an action one.
+    ui_callbacks::register_change_callbacks(&window, &link);
+    approx::assert_relative_eq!(window.get_cloud_poll_mins(), 60.0);
+    assert!(param_row_present(&window, "MainWindow::cloud-poll-slider"));
+
+    window.set_cloud_poll_mins(10.0);
+    window.invoke_cloud_poll_changed();
+    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    assert!(
+        sent.iter().any(|command| matches!(
+            command,
+            sunlit_core::engine::EngineCommand::SetCloudPollInterval(10)
+        )),
+        "the changed callback sends the interval"
+    );
+    let config = ui_callbacks::read_config_from_window(&window, &link);
+    assert_eq!(config.cloud_poll_mins, 10);
+
+    // The defaults push restores the one-hour default along with the rest.
+    ui_callbacks::apply_config_to_window(&window, &sunlit_core::config::AppConfig::default());
+    approx::assert_relative_eq!(window.get_cloud_poll_mins(), 60.0);
+}
+
 /// An edit arms the debounced settings write: one write a second after the
 /// last edit, and none at all from the pushes that are not edits, which is
 /// what keeps a preview and a defaults load free of writes.

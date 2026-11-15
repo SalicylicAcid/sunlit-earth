@@ -553,6 +553,7 @@ impl Engine {
             EngineCommand::SetCloudSource(config) => self.set_cloud_source(config.as_ref()),
             EngineCommand::RefreshClouds => self.refresh_clouds(),
             EngineCommand::AbortClouds => self.abort_clouds(),
+            EngineCommand::SetCloudPollInterval(mins) => self.set_cloud_poll_interval(mins),
             EngineCommand::DisplaysChanged => {
                 // Trailing rather than leading: every hint pushes the deadline
                 // out, so a burst is one query at the end of it.
@@ -792,6 +793,18 @@ impl Engine {
         cloud.abort();
         cloud.owed = false;
         info!("the cloud fetch was asked to stop");
+    }
+
+    /// Set the minutes between checks of the cloud source. The worker's
+    /// schedule is the engine tick's own bookkeeping, so this is where the
+    /// new interval lands; a check already owed stays owed.
+    fn set_cloud_poll_interval(&mut self, mins: u32) {
+        let Some(cloud) = self.cloud.as_mut() else {
+            return;
+        };
+        let interval = Duration::from_mins(u64::from(mins.max(crate::config::CLOUD_POLL_MINS_MIN)));
+        cloud.schedule.set_interval(interval, self.clock.elapsed());
+        info!(mins, "the cloud check interval was set");
     }
 
     fn set_cloud_source(&mut self, config: &CloudSourceConfig) {

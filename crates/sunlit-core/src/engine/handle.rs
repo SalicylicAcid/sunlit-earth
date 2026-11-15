@@ -203,6 +203,13 @@ impl EngineHandle {
         self.send(EngineCommand::AbortClouds);
     }
 
+    /// Set the minutes between checks of the cloud source, in place of the
+    /// one-hour default. The source's own gate still decides whether a
+    /// check downloads anything.
+    pub fn set_cloud_poll_interval(&self, mins: u32) {
+        self.send(EngineCommand::SetCloudPollInterval(mins));
+    }
+
     /// Description of the selected GPU adapter, for the UI's renderer label.
     pub fn adapter_info(&self) -> &str {
         &self.adapter.info

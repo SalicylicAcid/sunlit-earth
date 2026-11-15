@@ -87,6 +87,11 @@ pub enum EngineCommand {
     /// at its nearest check point and the run ends without a retry, the next
     /// check left to the regular schedule. A click between runs is harmless.
     AbortClouds,
+    /// Set the minutes between checks of the cloud source, in place of the
+    /// one-hour default. Not part of `UpdateParams`: it decides when the
+    /// worker is asked, not what any frame draws. A session with no cloud
+    /// worker ignores this.
+    SetCloudPollInterval(u32),
     /// Replace the mode and the anchor a wallpaper is planned with.
     ///
     /// Not part of `UpdateParams` for the same reason `SetTextureResolution` is
