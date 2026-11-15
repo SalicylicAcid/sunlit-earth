@@ -90,6 +90,23 @@ Same visual characteristics as GDPS (discrete opacity levels, sharp edges) but a
 
 **Tested and rejected.** GIBS returns colormapped visualizations (252-entry rainbow encoding cloud phase + COT), not raw data. Built a colormap reversal pipeline -- technically recovered COT values but output was very noisy. Aqua+Terra combined coverage: only 52.2% (47.8% swath gaps). The combination of colormap quantization artifacts and massive gaps makes this fundamentally unsuitable.
 
+### NSMC GEOS_IRX via the NSMC WMS
+
+**Tested 2026-11-15, shipped as the third in-app source** (see [2026-11-15-nsmc-cloud-source-plan.md](2026-11-15-nsmc-cloud-source-plan.md)).
+
+- **URL:** `https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/compose` (GetMap) and `.../wms/ability?request=GetCapabilities`; the interface is officially documented at <http://www.nsmc.org.cn/nsmc/cn/image/wms.html>
+- **Resolution:** 4096x2048 full-globe (the service's own ceiling; larger full-globe renders and the JPEG format come back blank)
+- **Update frequency:** hourly, latency under an hour (at 06:48 UTC the 06:00 round was up)
+- **Format:** RGBA PNG whose **alpha channel carries a continuous cloud fraction** (0 clear/no-data to 255 deepest convection); the RGB channels are a binary echo
+- **Coverage:** global equirectangular to roughly +/-60 latitude; the polar bands are alpha zero and need filling
+- **License/attribution:** attribution to NSMC (CMA) required by the app's own policy; the service is free (`Fees=none`) and unauthenticated
+
+**Test result:** the alpha channel is the cleanest cloud-fraction input of any source evaluated -- no multi-channel heuristic like matteason needs, no quantization like the NWP fields, infrared so night works. ITCZ cores, fronts and cirrus all read as continuous coverage. The polar no-data bands fill by stretching the outermost data rows (the same latitude-shift approximation the EUMETSAT trim makes).
+
+**Service quirks the client must live with:** errors return 200 with an empty or blank body (never an HTTP error or an exception page), JPEG-format full-globe requests return a fixed blank image, and full-globe renders past 4K do too. The round list endpoint (`.../animation/datatime/mongodb?dataCode=GEO_MULT_GBAL_L2_GGM_IRX_GLL_YYYYMMDD_HHmm_4000M.PNG&hourRange=24`) is the change detector.
+
+**Verdict:** the most balanced free source measured -- institutional reliability, hourly, continuous, night-capable. Weaker than the EUMETSAT native source only in update cadence (60 vs 15 minutes) and polar coverage handling.
+
 ---
 
 ## Evaluated but Not Tested
@@ -159,6 +176,7 @@ Compositing GOES + MTG + Himawari COD would produce excellent dayside results bu
 | **GFS TCDC** | 1440x721 | 6h | None | Full | GRIB2 → PNG | NOAA |
 | **GDPS TCDC** | 2400x1201 | 12h | None | Full | GRIB2 → PNG | ECCC |
 | **ECMWF IFS TCC** | 1440x721 | 6h | None | Full | GRIB2 → PNG | ECMWF |
+| **NSMC GEOS_IRX** | 4096x2048 | 1h | None (alpha is cloud fraction) | None (+/-60, filled) | Alpha + fill + levels | NSMC (CMA) |
 | **SatCORPS GCC** | ~12000x6000 | 1h | None (COD) | Full (GEO+LEO) | NetCDF → PNG | NASA (not yet public) |
 
 ---
@@ -196,6 +214,7 @@ The ultimate source: 3 km, hourly, global, cloud optical depth, polar coverage. 
 | `scripts/fetch_gmgsi_clouds.py` | NOAA GMGSI LW | Working. NetCDF remap + levels (floor=60, ceil=215, gamma=0.7) + 8K upscale. |
 | `scripts/fetch_gfs_clouds.py` | GFS TCDC | Working. GRIB2 byte-range download + rasterio decode. |
 | `scripts/fetch_gdps_clouds.py` | ECCC GDPS TCDC | Working. Single-file GRIB2 download + rasterio decode. |
+| in-app `assets/nsmc.rs` | NSMC GEOS_IRX | Working (2026-11-15). The Clouds source row's third option; alpha coverage + polar fill + levels, no script. |
 
 All scripts use `uv run` with PEP 723 inline dependencies.
 
@@ -222,6 +241,7 @@ All scripts use `uv run` with PEP 723 inline dependencies.
 ### Satellite Products
 - <https://registry.opendata.aws/noaa-goes/> -- GOES ABI data on AWS
 - <https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi> -- NASA GIBS WMS
+- <http://www.nsmc.org.cn/nsmc/cn/image/wms.html> -- the NSMC WMS-style interface's documentation (GEOS_IRX, shipped in-app 2026-11)
 - <https://data.eumetsat.int/product/EO:EUM:DAT:MSG:CLM> -- MSG Cloud Mask
 - <https://view.eumetsat.int/geoserver/wms> -- EUMETView WMS
 - <https://www.goes-r.gov/products/baseline-cloud-opt-depth.html> -- GOES COD

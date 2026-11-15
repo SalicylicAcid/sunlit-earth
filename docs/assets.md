@@ -34,7 +34,7 @@ Advanced → Rendering selects a maximum texture width of 8192, 4096, or 2048. F
 
 Nothing is cached on disk for a downscale. The Milky Way panorama is halved in memory on each load at 2048, and earlier versions' `texture_cache/` directory is deleted from the cache directory at startup. The tile packs the Earth is drawn from are built from the cube faces on first use and cached; see [architecture.md](architecture.md#texture-resolution) for validation, measurements, and loading behavior.
 
-Cloud imagery downloads at runtime from [Matteason](https://clouds.matteason.co.uk) and is cached. The same resolution setting selects the cloud image size, reducing download size and texture memory at lower resolutions. Existing clouds remain visible while the new size downloads or when connectivity is unavailable. Setting `SUNLIT_EARTH_NO_CLOUDS` disables cloud fetching entirely. `SUNLIT_EARTH_CLOUD_URL` overrides the selected provider URL. All location and polling overrides are listed in [architecture.md](architecture.md#environment-knobs).
+Cloud imagery downloads at runtime from the configured cloud source — [Matteason](https://clouds.matteason.co.uk) by default, or the app's own EUMETSAT or NSMC pipelines (see [usage.md](usage.md), The cloud source) — and is cached. The same resolution setting selects the cloud image size, reducing download size and texture memory at lower resolutions. Existing clouds remain visible while the new size downloads or when connectivity is unavailable. Setting `SUNLIT_EARTH_NO_CLOUDS` disables cloud fetching entirely. `SUNLIT_EARTH_CLOUD_URL` overrides the selected provider URL. All location and polling overrides are listed in [architecture.md](architecture.md#environment-knobs).
 
 ## Preparing assets
 
