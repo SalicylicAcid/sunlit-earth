@@ -90,6 +90,7 @@ impl std::ops::Deref for Download {
 pub enum CloudWait {
     Existing,
     LongFetch,
+    SlowFetch,
 }
 
 impl CloudWait {
@@ -97,6 +98,7 @@ impl CloudWait {
         match self {
             Self::Existing => Duration::from_secs(60),
             Self::LongFetch => Duration::from_mins(26),
+            Self::SlowFetch => Duration::from_mins(5),
         }
     }
 }
@@ -123,6 +125,10 @@ pub fn resolve(
         CloudSourceMode::Remote => Arc::new(HttpCloudSource::from_config(effective.remote)),
         CloudSourceMode::Eumetsat => Arc::new(super::eumetsat::EumetsatCloudSource::new(
             effective.eumetsat,
+            cache_dir.map(std::path::Path::to_path_buf),
+        )),
+        CloudSourceMode::Nsmc => Arc::new(super::nsmc::NsmcCloudSource::new(
+            effective.nsmc,
             cache_dir.map(std::path::Path::to_path_buf),
         )),
     }
@@ -177,6 +183,21 @@ impl CloudTarget {
         Self {
             cache_key: key,
             wait: CloudWait::LongFetch,
+        }
+    }
+
+    /// Identity of a native NSMC round, hashed under its own prefix the same
+    /// way [`CloudTarget::eumetsat`](Self::eumetsat) is: the layer and the
+    /// map size name the entry, the derivation parameters stay out of it.
+    pub(crate) fn nsmc(identity: &str) -> Self {
+        use std::fmt::Write;
+        let mut key = "clouds_cache_nsmc_".to_owned();
+        for byte in Sha256::digest(identity.as_bytes()) {
+            let _ = write!(key, "{byte:02x}");
+        }
+        Self {
+            cache_key: key,
+            wait: CloudWait::SlowFetch,
         }
     }
 }
@@ -469,6 +490,7 @@ mod tests {
         assert_eq!(wide.wait, CloudWait::Existing);
         assert_eq!(CloudWait::Existing.duration(), Duration::from_secs(60));
         assert_eq!(CloudWait::LongFetch.duration(), Duration::from_mins(26));
+        assert_eq!(CloudWait::SlowFetch.duration(), Duration::from_mins(5));
     }
 
     #[test]

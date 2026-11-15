@@ -14,7 +14,7 @@ use crate::scene::scene_time::SceneTime;
 pub mod clouds;
 mod migrate;
 
-pub use clouds::{CloudSourceConfig, CloudSourceMode, EumetsatSettings};
+pub use clouds::{CloudSourceConfig, CloudSourceMode, EumetsatSettings, NsmcSettings};
 mod window_geometry;
 
 use migrate::{CONFIG_VERSION, Migrated, migrate};
@@ -790,15 +790,17 @@ mod tests {
 
     #[test]
     fn cloud_source_round_trips_both_modes_and_all_parameters() {
-        for mode in ["remote", "eumetsat"] {
+        for mode in ["remote", "eumetsat", "nsmc"] {
             let scratch = ScratchDir::new("cloud_source_roundtrip");
             let path = scratch.join("config.toml");
             let source = format!(
-                "mode = '{mode}'\nremote_url = 'https://example.org/{{size}}.jpg?token=secret'\n[eumetsat]\nfloor = 61\nceiling = 179\ngamma = 0.7\nblur = 1.5\n"
+                "mode = '{mode}'\nremote_url = 'https://example.org/{{size}}.jpg?token=secret'\n[eumetsat]\nfloor = 61\nceiling = 179\ngamma = 0.7\nblur = 1.5\n[nsmc]\nfloor = 7\nceiling = 249\ngamma = 1.3\nblur = 2.5\n"
             );
             let text = format!(
                 "version = 4\n[sunlit.earth]\nlongitude = 42.0\n[sunlit.earth.cloud_source]\n{}",
-                source.replace("[eumetsat]", "[sunlit.earth.cloud_source.eumetsat]")
+                source
+                    .replace("[eumetsat]", "[sunlit.earth.cloud_source.eumetsat]")
+                    .replace("[nsmc]", "[sunlit.earth.cloud_source.nsmc]")
             );
             fs::write(&path, text).unwrap();
             let config = load_config_from(&path);
@@ -832,6 +834,12 @@ mod tests {
             "[cloud_source.eumetsat]\nblur = -0.1",
             "[cloud_source.eumetsat]\nblur = 10.1",
             "[cloud_source.eumetsat]\nblur = inf",
+            "[cloud_source.nsmc]\nfloor = 180\nceiling = 180",
+            "[cloud_source.nsmc]\nfloor = 5\nceiling = 5",
+            "[cloud_source.nsmc]\ngamma = 0.09",
+            "[cloud_source.nsmc]\ngamma = 4.01",
+            "[cloud_source.nsmc]\nblur = -0.1",
+            "[cloud_source.nsmc]\nblur = 10.1",
         ] {
             let source = source.replace("[cloud_source", "[sunlit.earth.cloud_source");
             fs::write(&path, format!("version = 4\n[sunlit.earth]\nlongitude = 42.0\ntexture_resolution = 2048\n{source}\n")).unwrap();

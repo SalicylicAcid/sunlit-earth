@@ -8,6 +8,7 @@ pub mod cube_layout;
 pub mod cube_names;
 pub mod eumetsat;
 pub mod mailbox;
+pub mod nsmc;
 pub mod stars;
 pub mod texture_loader;
 pub mod tiles;

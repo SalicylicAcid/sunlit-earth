@@ -14,6 +14,7 @@ pub enum CloudSourceMode {
     #[default]
     Eumetsat,
     Remote,
+    Nsmc,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,12 +37,36 @@ impl Default for EumetsatSettings {
     }
 }
 
+/// The NSMC source's derivation curve, over the mosaic's alpha coverage.
+/// The service already ships a cloud-fraction-like intensity, so the defaults
+/// pass it through unchanged and tuning is left to the sliders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NsmcSettings {
+    pub floor: u8,
+    pub ceiling: u8,
+    pub gamma: f64,
+    pub blur: f64,
+}
+
+impl Default for NsmcSettings {
+    fn default() -> Self {
+        Self {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloudSourceConfig {
     pub mode: CloudSourceMode,
     pub remote_url: String,
     pub eumetsat: EumetsatSettings,
+    pub nsmc: NsmcSettings,
 }
 
 impl Default for CloudSourceConfig {
@@ -50,6 +75,7 @@ impl Default for CloudSourceConfig {
             mode: CloudSourceMode::default(),
             remote_url: DEFAULT_REMOTE_URL.to_owned(),
             eumetsat: EumetsatSettings::default(),
+            nsmc: NsmcSettings::default(),
         }
     }
 }
@@ -60,6 +86,7 @@ pub struct EffectiveCloudSource {
     pub mode: CloudSourceMode,
     pub remote: RemoteCloudUrl,
     pub eumetsat: EumetsatSettings,
+    pub nsmc: NsmcSettings,
 }
 
 #[derive(Clone)]
@@ -109,6 +136,7 @@ impl CloudSourceConfig {
                         template: false,
                     },
                     eumetsat: saved.eumetsat,
+                    nsmc: saved.nsmc,
                 };
             }
             warn!(
@@ -123,6 +151,7 @@ impl CloudSourceConfig {
                 template: true,
             },
             eumetsat: saved.eumetsat,
+            nsmc: saved.nsmc,
         }
     }
 
@@ -134,12 +163,18 @@ impl CloudSourceConfig {
 
     fn valid(&self) -> bool {
         let settings = &self.eumetsat;
+        let nsmc = &self.nsmc;
         valid_remote_url(&self.remote_url, true)
             && settings.floor < settings.ceiling
             && settings.gamma.is_finite()
             && (0.1..=4.0).contains(&settings.gamma)
             && settings.blur.is_finite()
             && (0.0..=10.0).contains(&settings.blur)
+            && nsmc.floor < nsmc.ceiling
+            && nsmc.gamma.is_finite()
+            && (0.1..=4.0).contains(&nsmc.gamma)
+            && nsmc.blur.is_finite()
+            && (0.0..=10.0).contains(&nsmc.blur)
     }
 
     /// Isolate schema errors in this field, rather than failing the entire file.
@@ -343,5 +378,40 @@ mod tests {
             assert_eq!(effective.mode, CloudSourceMode::Eumetsat);
             assert_eq!(effective.eumetsat, config.eumetsat);
         }
+    }
+
+    #[test]
+    fn nsmc_settings_follow_the_same_curve_rules() {
+        let mut config = CloudSourceConfig {
+            mode: CloudSourceMode::Nsmc,
+            ..CloudSourceConfig::default()
+        };
+        assert!(config.valid());
+        let effective = config.resolve(None);
+        assert_eq!(effective.mode, CloudSourceMode::Nsmc);
+        assert_eq!(effective.nsmc, config.nsmc);
+        config.nsmc = NsmcSettings {
+            floor: 10,
+            ceiling: 10,
+            gamma: 1.0,
+            blur: 0.0,
+        };
+        assert!(!config.valid());
+        for (gamma, blur) in [(0.1, 0.0), (4.0, 10.0)] {
+            config.nsmc = NsmcSettings {
+                floor: 0,
+                ceiling: 255,
+                gamma,
+                blur,
+            };
+            assert!(config.valid());
+        }
+        config.nsmc = NsmcSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 4.1,
+            blur: 0.0,
+        };
+        assert!(!config.valid());
     }
 }

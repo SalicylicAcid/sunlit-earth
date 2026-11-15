@@ -189,6 +189,18 @@ mod tests {
                 .cache_key
                 .starts_with("clouds_cache_eumetsat_")
         );
+        let nsmc = CloudSourceConfig {
+            mode: CloudSourceMode::Nsmc,
+            ..saved.clone()
+        };
+        let nsmc_source = cloud_source(&nsmc, false, None).expect("the NSMC source connects");
+        assert!(
+            nsmc_source.describe().starts_with("nsmc GEOS_IRX"),
+            "{}",
+            nsmc_source.describe()
+        );
+        let nsmc_target = nsmc_source.prepare(8192);
+        assert!(nsmc_target.cache_key.starts_with("clouds_cache_nsmc_"));
         let source = cloud_source(
             &native,
             false,

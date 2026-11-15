@@ -84,8 +84,10 @@ export struct CloudSettings {
 
 // Where the cloud imagery comes from. Independent of `CloudSettings`: those
 // are shader parameters, this is the pipeline's input, and the two are saved,
-// applied and reset separately. `mode` is 0 for a remote image and 1 for the
-// native EUMETSAT pipeline.
+// applied and reset separately. `mode` is 0 for the native EUMETSAT pipeline,
+// 1 for a remote image and 2 for the native NSMC pipeline. The EUMETSAT rows
+// run on `floor`/`ceiling`/`gamma`/`blur`, the NSMC rows on their `nsmc-`
+// twins: each source carries its own derivation curve.
 export struct CloudSourceSettings {
     mode: int,
     remote-url: string,
@@ -93,6 +95,10 @@ export struct CloudSourceSettings {
     ceiling: float,
     gamma: float,
     blur: float,
+    nsmc-floor: float,
+    nsmc-ceiling: float,
+    nsmc-gamma: float,
+    nsmc-blur: float,
 }
 
 export struct SkySettings {
@@ -1573,10 +1579,11 @@ export component MainWindow inherits Window {
 
                                 cloud-source-combo := SettingCombo {
                                     label: "Source";
-                                    hint: "Where the cloud imagery comes from: a remote image, or the EUMETSAT infrared layer processed on this machine.";
+                                    hint: "Where the cloud imagery comes from: a remote image, the EUMETSAT infrared layer, or the NSMC geostationary mosaic, the native ones processed on this machine.";
                                     model: [
                                         "EUMETSAT (this machine)",
                                         "Remote image",
+                                        "NSMC (this machine)",
                                     ];
                                     current-index <=> root.cloud-source-draft.mode;
                                     enabled: !root.cloud-source-override;
@@ -1642,6 +1649,56 @@ export component MainWindow inherits Window {
                                         value <=> root.cloud-source-draft.blur;
                                         default-value: root.cloud-source-defaults.blur;
                                         value-text: round(root.cloud-source-draft.blur * 10) / 10;
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                }
+
+                                if root.cloud-source-draft.mode == 2 :
+                                VerticalLayout {
+                                    spacing: 4px;
+
+                                    nsmc-floor-slider := SettingRow {
+                                        label: "IR floor";
+                                        hint: "Coverage at or below this counts as clear sky. The mosaic's alpha already is a cloud fraction, so 0 keeps it as served.";
+                                        indent: 8px;
+                                        minimum: 0;
+                                        maximum: 254;
+                                        value <=> root.cloud-source-draft.nsmc-floor;
+                                        default-value: root.cloud-source-defaults.nsmc-floor;
+                                        value-text: round(root.cloud-source-draft.nsmc-floor);
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    nsmc-ceiling-slider := SettingRow {
+                                        label: "IR ceiling";
+                                        hint: "Coverage at or above this counts as full cloud.";
+                                        indent: 8px;
+                                        minimum: 1;
+                                        maximum: 255;
+                                        value <=> root.cloud-source-draft.nsmc-ceiling;
+                                        default-value: root.cloud-source-defaults.nsmc-ceiling;
+                                        value-text: round(root.cloud-source-draft.nsmc-ceiling);
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    nsmc-gamma-slider := SettingRow {
+                                        label: "Gamma";
+                                        hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
+                                        indent: 8px;
+                                        minimum: 10;
+                                        maximum: 400;
+                                        value <=> root.cloud-source-draft.nsmc-gamma;
+                                        default-value: root.cloud-source-defaults.nsmc-gamma;
+                                        value-text: round(root.cloud-source-draft.nsmc-gamma * 100) / 100;
+                                        enabled: !root.cloud-source-override;
+                                    }
+                                    nsmc-blur-slider := SettingRow {
+                                        label: "Blur";
+                                        hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
+                                        indent: 8px;
+                                        minimum: 0;
+                                        maximum: 100;
+                                        value <=> root.cloud-source-draft.nsmc-blur;
+                                        default-value: root.cloud-source-defaults.nsmc-blur;
+                                        value-text: round(root.cloud-source-draft.nsmc-blur * 10) / 10;
                                         enabled: !root.cloud-source-override;
                                     }
                                 }

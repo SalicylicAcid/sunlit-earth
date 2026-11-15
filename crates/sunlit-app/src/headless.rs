@@ -26,7 +26,8 @@ const RENDER_TEXTURE_TIMEOUT: Duration = Duration::from_mins(2);
 const CLOUD_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// The cloud wait this run's source names, when there is one: a minute for a
-/// remote image, the native generation budget for EUMETSAT.
+/// remote image, five minutes for the NSMC mosaic's server-side render, the
+/// native generation budget for EUMETSAT.
 fn cloud_timeout(config: &AppConfig) -> Duration {
     let env = sunlit_core::env_override(sunlit_core::config::clouds::ENV_CLOUD_URL);
     if env.as_deref().is_some_and(|v| !v.trim().is_empty()) || !config.clouds_enabled {

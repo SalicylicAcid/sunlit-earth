@@ -83,12 +83,12 @@ const REST_SLICE: Duration = Duration::from_millis(100);
     clippy::cast_precision_loss,
     reason = "a byte count is far inside the f64 mantissa"
 )]
-fn mib(bytes: usize) -> String {
+pub(crate) fn mib(bytes: usize) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// A transfer speed in the unit that reads best for it.
-fn speed_text(bytes_per_second: f64) -> String {
+pub(crate) fn speed_text(bytes_per_second: f64) -> String {
     if bytes_per_second >= 1024.0 * 1024.0 {
         format!("{:.1} MiB/s", bytes_per_second / (1024.0 * 1024.0))
     } else {
@@ -478,6 +478,7 @@ fn decode_png(body: &[u8], px: u32) -> Result<GrayMap, String> {
 }
 
 /// Why a hemisphere fetch failed, and whether trying again can help.
+#[derive(Debug)]
 pub(crate) enum FetchError {
     /// A transport failure, a 5xx, a 429, or a body read that died: worth
     /// another attempt within the budget.
@@ -1339,14 +1340,14 @@ impl EumetsatCloudSource {
 
 /// Write `bytes` to `path` through a temporary file, the metadata's commit
 /// point: readers see either the previous file or the complete new one.
-fn write_committed(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_committed(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("the temporary write failed: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("the commit failed: {e}"))
 }
 
 /// The SHA-256 of `bytes`, as lowercase hex.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hex = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {
@@ -1428,7 +1429,7 @@ fn encode_png(map: &GrayMap) -> Vec<u8> {
     out
 }
 
-fn retry_after_header(headers: &ureq::http::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after_header(headers: &ureq::http::HeaderMap) -> Option<Duration> {
     let value = headers.get("Retry-After")?.to_str().ok()?;
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }

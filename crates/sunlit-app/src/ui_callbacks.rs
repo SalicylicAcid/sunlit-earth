@@ -921,10 +921,15 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
         ceiling: f32::from(config.eumetsat.ceiling),
         gamma: config.eumetsat.gamma as f32,
         blur: config.eumetsat.blur as f32,
+        nsmc_floor: f32::from(config.nsmc.floor),
+        nsmc_ceiling: f32::from(config.nsmc.ceiling),
+        nsmc_gamma: config.nsmc.gamma as f32,
+        nsmc_blur: config.nsmc.blur as f32,
     };
     match config.mode {
         config::CloudSourceMode::Eumetsat => build(0),
         config::CloudSourceMode::Remote => build(1),
+        config::CloudSourceMode::Nsmc => build(2),
     }
 }
 
@@ -942,13 +947,26 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
         gamma: f64::from(settings.gamma),
         blur: f64::from(settings.blur),
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the slider's rounded values, all inside the ranges it clamps"
+    )]
+    let nsmc = config::NsmcSettings {
+        floor: settings.nsmc_floor.round() as u8,
+        ceiling: settings.nsmc_ceiling.round() as u8,
+        gamma: f64::from(settings.nsmc_gamma),
+        blur: f64::from(settings.nsmc_blur),
+    };
     config::CloudSourceConfig {
         mode: match settings.mode {
             0 => config::CloudSourceMode::Eumetsat,
+            2 => config::CloudSourceMode::Nsmc,
             _ => config::CloudSourceMode::Remote,
         },
         remote_url: settings.remote_url.to_string(),
         eumetsat,
+        nsmc,
     }
 }
 

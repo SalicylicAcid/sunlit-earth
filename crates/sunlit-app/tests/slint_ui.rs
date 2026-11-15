@@ -9820,7 +9820,10 @@ fn test_cloud_source_section_pushes_the_saved_config() {
     } = create_source_window();
     let defaults = sunlit_core::config::CloudSourceConfig::default();
     let applied = window.get_cloud_source();
-    assert_eq!(applied.mode, 0, "the default source is the remote one");
+    assert_eq!(
+        applied.mode, 0,
+        "the default source is the native EUMETSAT one"
+    );
     assert_eq!(
         applied.remote_url.as_str(),
         defaults.remote_url,
@@ -9830,6 +9833,10 @@ fn test_cloud_source_section_pushes_the_saved_config() {
     approx::assert_relative_eq!(applied.ceiling, 180.0);
     approx::assert_relative_eq!(applied.gamma, 0.8);
     approx::assert_relative_eq!(applied.blur, 0.0);
+    approx::assert_relative_eq!(applied.nsmc_floor, 0.0);
+    approx::assert_relative_eq!(applied.nsmc_ceiling, 255.0);
+    approx::assert_relative_eq!(applied.nsmc_gamma, 1.0);
+    approx::assert_relative_eq!(applied.nsmc_blur, 0.0);
     assert_eq!(
         window.get_cloud_source_draft(),
         window.get_cloud_source(),
@@ -9863,10 +9870,24 @@ fn test_cloud_source_rows_follow_the_draft_mode() {
     ));
 
     let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    window.set_cloud_source_draft(draft);
+    assert!(
+        param_row_present(&window, "MainWindow::nsmc-floor-slider"),
+        "the NSMC parameters show once the mode is NSMC"
+    );
+    assert!(
+        !param_row_present(&window, "MainWindow::cloud-floor-slider"),
+        "the EUMETSAT parameters hide for the NSMC source"
+    );
+    assert!(!url_row(&window));
+
+    let mut draft = window.get_cloud_source_draft();
     draft.mode = 0;
     window.set_cloud_source_draft(draft);
     assert!(!url_row(&window));
     assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
+    assert!(!param_row_present(&window, "MainWindow::nsmc-floor-slider"));
 }
 
 #[test]
@@ -9958,6 +9979,44 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
         config.cloud_source.eumetsat.floor, 61,
         "a save reads the applied value"
     );
+    assert!(
+        window.get_cloud_source_status().starts_with("Applied"),
+        "the status says the apply went out: {:?}",
+        window.get_cloud_source_status()
+    );
+}
+
+/// The NSMC draft applies the same way the other two do: the engine switch
+/// carries the mode and its own derivation curve, and the save reads the
+/// applied value.
+#[test]
+fn test_a_nsmc_draft_switches_and_saves_the_nsmc_mode() {
+    let SourceWindow { window, link, sent } = create_source_window();
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    // 0.5 is exact in f32, which the sliders' values travel through.
+    draft.nsmc_gamma = 1.5;
+    draft.nsmc_floor = 10.0;
+    window.set_cloud_source_draft(draft.clone());
+    window.invoke_apply_cloud_source(draft.clone());
+
+    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    let switched = sent.iter().find_map(|command| match command {
+        sunlit_core::engine::EngineCommand::SetCloudSource(config) => Some(config),
+        _ => None,
+    });
+    let switched = switched.expect("the apply switches the engine");
+    assert_eq!(switched.mode, sunlit_core::config::CloudSourceMode::Nsmc);
+    approx::assert_relative_eq!(switched.nsmc.gamma, 1.5);
+    assert_eq!(switched.nsmc.floor, 10);
+    assert_eq!(
+        window.get_cloud_source_draft(),
+        window.get_cloud_source(),
+        "the draft lands on the applied value once it is applied"
+    );
+    let config = ui_callbacks::read_config_from_window(&window, &link);
+    approx::assert_relative_eq!(config.cloud_source.nsmc.gamma, 1.5);
+    assert_eq!(config.cloud_source.nsmc.floor, 10);
     assert!(
         window.get_cloud_source_status().starts_with("Applied"),
         "the status says the apply went out: {:?}",
