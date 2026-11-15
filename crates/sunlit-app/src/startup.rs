@@ -159,7 +159,10 @@ mod tests {
     #[test]
     fn saved_remote_source_and_runtime_override_reach_startup() {
         use sunlit_core::config::{CloudSourceConfig, CloudSourceMode};
+        // The mode is named: the config default is the native EUMETSAT one,
+        // and this case is about a saved remote URL.
         let saved = CloudSourceConfig {
+            mode: CloudSourceMode::Remote,
             remote_url: "https://saved.org/{size}/map?token=saved".to_owned(),
             ..CloudSourceConfig::default()
         };
