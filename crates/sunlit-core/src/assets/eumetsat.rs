@@ -21,7 +21,7 @@
 use std::io::Cursor;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use image::ImageEncoder;
@@ -65,6 +65,11 @@ pub(crate) const JPEG_QUALITY: u8 = 88;
 /// rate limiter delays excess requests by a second rather than refusing
 /// them, so the grid's extra requests are tolerated.
 pub(crate) const TILE_PX: u32 = 512;
+/// How many tile requests one hemisphere keeps in flight. The two hemisphere
+/// threads run side by side, so the round peaks at twice this many
+/// concurrent requests — well inside the service's rate limit, which delays
+/// excess requests by a second rather than refusing them.
+pub(crate) const TILE_WORKERS: u32 = 4;
 /// How often a download refreshes its progress line: often enough to look
 /// alive, rare enough that the status event stays a rarity.
 const DOWNLOAD_REPORT_EVERY: Duration = Duration::from_millis(500);
@@ -636,8 +641,9 @@ impl EumetsatCloudSource {
     /// against the server. Small tiles make that survivable: a completed
     /// tile is kept, only the failed ones are retried — first within their
     /// own attempt budget, then in a second pass over whatever is left.
-    /// Tiles that no pass reaches fail the round; the worker's backoff
-    /// starts a fresh one.
+    /// [`TILE_WORKERS`] fetch tiles of one hemisphere concurrently, and the
+    /// two hemisphere threads run side by side. Tiles that no pass reaches
+    /// fail the round; the worker's backoff starts a fresh one.
     ///
     /// Returns the stitched hemisphere re-encoded as PNG — what the raw pair
     /// stores — beside the decoded map. No tile starts after `deadline`.
@@ -652,41 +658,84 @@ impl EumetsatCloudSource {
         let tiles = tiles_per_side(px);
         let tile_px = px / tiles;
         let total = (tiles * tiles) as usize;
-        let mut canvas = vec![0.0f32; (px * px) as usize];
-        let mut remaining: Vec<(u32, u32)> = {
+        let canvas = Mutex::new(vec![0.0f32; (px * px) as usize]);
+        let done = AtomicUsize::new(0);
+        let mut queue: Vec<(u32, u32)> = {
             let coords = |i: u32| (0..i).flat_map(move |r| (0..i).map(move |c| (r, c)));
             coords(tiles).collect()
         };
-        let mut done = 0usize;
         for pass in 1..=2 {
-            let mut failed = Vec::new();
-            for &(row, col) in &remaining {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "EUMETSAT {name} hemisphere: the round budget is spent with                          {}/{total} tiles unfetched",
-                        total - done
-                    ));
+            let pending = Mutex::new(std::collections::VecDeque::from(queue.clone()));
+            let failed = Mutex::new(Vec::new());
+            // A permanent refusal applies to the layer, not the tile: every
+            // other tile would refuse too, so the workers stop at once.
+            let abort = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for _ in 0..TILE_WORKERS {
+                    scope.spawn(|| {
+                        loop {
+                            if abort.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let Some((row, col)) = pending
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .pop_front()
+                            else {
+                                return;
+                            };
+                            match self
+                                .fetch_tile(name, index, bbox, row, col, tiles, tile_px, deadline)
+                            {
+                                Ok(tile) => {
+                                    let mut grid =
+                                        canvas.lock().unwrap_or_else(PoisonError::into_inner);
+                                    paste_tile(&mut grid, px, &tile, row, col, tile_px, tiles);
+                                    drop(grid);
+                                    let done = done.fetch_add(1, Ordering::SeqCst) + 1;
+                                    self.set_progress(
+                                        index,
+                                        &format!("{name}: {done}/{total} tiles"),
+                                    );
+                                }
+                                Err(FetchError::Permanent(message)) => {
+                                    abort.store(true, Ordering::SeqCst);
+                                    failed
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .push((row, col, message));
+                                    return;
+                                }
+                                Err(FetchError::Transient(message, _)) => {
+                                    failed
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .push((row, col, message));
+                                }
+                            }
+                        }
+                    });
                 }
-                self.set_progress(
-                    index,
-                    &format!("{name}: {done}/{total} tiles (pass {pass}, attempting {row},{col})"),
-                );
-                match self.fetch_tile(name, index, bbox, row, col, tiles, tile_px, deadline) {
-                    Ok(tile) => {
-                        paste_tile(&mut canvas, px, &tile, row, col, tile_px, tiles);
-                        done += 1;
-                        self.set_progress(index, &format!("{name}: {done}/{total} tiles"));
-                    }
-                    Err(FetchError::Permanent(message)) => {
-                        return Err(format!("EUMETSAT {name} hemisphere: {message}"));
-                    }
-                    Err(FetchError::Transient(message, _)) => failed.push((row, col, message)),
-                }
+            });
+            if abort.load(Ordering::SeqCst) {
+                let failed = failed.into_inner().unwrap_or_default();
+                let Some((_, _, message)) = failed.first() else {
+                    unreachable!("an abort is only set with a recorded failure");
+                };
+                return Err(format!("EUMETSAT {name} hemisphere: {message}"));
             }
+            let failed = failed.into_inner().unwrap_or_default();
             if failed.is_empty() {
-                let map = GrayMap::new(px, px, canvas).expect("the tiled rectangle");
+                let pixels = canvas.into_inner().unwrap_or_default();
+                let map = GrayMap::new(px, px, pixels).expect("the tiled rectangle");
                 let png = encode_png(&map);
                 return Ok((png, map));
+            }
+            let shortfall = total - done.load(Ordering::SeqCst) - failed.len();
+            if shortfall > 0 {
+                return Err(format!(
+                    "EUMETSAT {name} hemisphere: the round budget is spent with                      {shortfall}/{total} tiles unfetched"
+                ));
             }
             if pass == 2 {
                 let names: Vec<String> = failed
@@ -700,7 +749,7 @@ impl EumetsatCloudSource {
                     names.join("; ")
                 ));
             }
-            remaining = failed.iter().map(|(r, c, _)| (*r, *c)).collect();
+            queue = failed.iter().map(|(r, c, _)| (*r, *c)).collect();
         }
         unreachable!("both passes return")
     }
@@ -2068,6 +2117,55 @@ mod tests {
             .build()
             .new_agent();
         (agent, calls)
+    }
+
+    /// The tiles of one hemisphere fetch concurrently: the stub holds the
+    /// first tile request until a peer arrives (2 s grace). A sequential
+    /// fetch would hold it alone, time out into a 403, and fail the round.
+    #[test]
+    fn tiles_fetch_concurrently() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.retry_delays = [Duration::ZERO, Duration::ZERO];
+        let (peer_tx, peer_rx) = crossbeam_channel::bounded::<()>(1);
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let peer_tx = Mutex::new(Some(peer_tx));
+        let peer_rx = Mutex::new(peer_rx);
+        let (agent, calls) = {
+            let arrived = Arc::clone(&arrived);
+            stub_agent(move |_| {
+                if arrived.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let wait = peer_rx
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .recv_timeout(Duration::from_secs(2));
+                    if wait.is_err() {
+                        return Ok(Response::builder()
+                            .status(403)
+                            .body(Body::builder().data(Vec::new()))
+                            .unwrap());
+                    }
+                } else if let Some(tx) = peer_tx
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                Ok(png_response(512, 128))
+            })
+        };
+        source.agent = agent;
+        let (_, map) = source
+            .fetch_hemisphere(
+                "west",
+                0,
+                "-90,-180,90,0",
+                1024,
+                Instant::now() + ROUND_BUDGET,
+            )
+            .expect("the peers arrive and every tile serves");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(map.width(), 1024);
     }
 
     #[test]

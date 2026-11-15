@@ -7,7 +7,6 @@ pub mod cloud_source;
 pub mod cube_layout;
 pub mod cube_names;
 pub mod eumetsat;
-pub mod gibs;
 pub mod mailbox;
 pub mod stars;
 pub mod texture_loader;

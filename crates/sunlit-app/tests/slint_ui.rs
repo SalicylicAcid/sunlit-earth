@@ -9836,55 +9836,31 @@ fn test_cloud_source_section_pushes_the_saved_config() {
 #[test]
 fn test_cloud_source_rows_follow_the_draft_mode() {
     let SourceWindow { window, .. } = create_source_window();
-    // Remote: the URL row is up, the EUMETSAT parameters are not.
-    assert!(url_row(&window), "the URL row shows for a remote source");
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-floor-slider"
-    ));
+    // The default draft is Eumetsat: the IR parameters are up, the URL row
+    // is not.
+    assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
+    assert!(
+        !url_row(&window),
+        "the URL row is hidden for the native source"
+    );
 
     let mut draft = window.get_cloud_source_draft();
     draft.mode = 1;
     window.set_cloud_source_draft(draft);
     assert!(
-        !url_row(&window),
-        "the URL row goes once the mode is native"
+        url_row(&window),
+        "the URL row shows once the mode is remote"
     );
-    assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
-    assert!(param_row_present(
+    assert!(!param_row_present(
         &window,
-        "MainWindow::cloud-ceiling-slider"
+        "MainWindow::cloud-floor-slider"
     ));
-    assert!(param_row_present(&window, "MainWindow::cloud-gamma-slider"));
-    assert!(param_row_present(&window, "MainWindow::cloud-blur-slider"));
 
     let mut draft = window.get_cloud_source_draft();
     draft.mode = 0;
     window.set_cloud_source_draft(draft);
-    assert!(url_row(&window));
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-floor-slider"
-    ));
-    // GIBS: neither the URL row nor the IR parameters apply to it.
-    let mut draft = window.get_cloud_source_draft();
-    draft.mode = 2;
-    window.set_cloud_source_draft(draft);
     assert!(!url_row(&window));
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-floor-slider"
-    ));
-
-    // GIBS: neither the URL row nor the IR parameters apply to it.
-    let mut draft = window.get_cloud_source_draft();
-    draft.mode = 2;
-    window.set_cloud_source_draft(draft);
-    assert!(!url_row(&window));
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-floor-slider"
-    ));
+    assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
 }
 
 #[test]
@@ -9937,32 +9913,6 @@ fn test_an_invalid_draft_is_refused_entirely() {
     approx::assert_relative_eq!(window.get_cloud_source_draft().floor, 200.0);
 }
 
-#[test]
-fn test_a_gibs_draft_switches_and_saves_the_gibs_mode() {
-    let SourceWindow { window, link, sent } = create_source_window();
-    let mut draft = window.get_cloud_source_draft();
-    draft.mode = 2;
-    window.set_cloud_source_draft(draft.clone());
-    window.invoke_apply_cloud_source(draft.clone());
-
-    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
-    let switched = sent
-        .iter()
-        .find_map(|command| match command {
-            sunlit_core::engine::EngineCommand::SetCloudSource(config) => Some(config),
-            _ => None,
-        })
-        .expect("the apply switches the engine");
-    assert_eq!(switched.mode, sunlit_core::config::CloudSourceMode::Gibs);
-    assert_eq!(window.get_cloud_source().mode, 2);
-    let config = ui_callbacks::read_config_from_window(&window, &link);
-    assert_eq!(
-        config.cloud_source.mode,
-        sunlit_core::config::CloudSourceMode::Gibs,
-        "a save reads the applied GIBS mode"
-    );
-}
-
 /// The valid apply switches the engine, pushes the applied value and reads
 /// it back as the save would. The file the save writes is covered by the e2e
 /// runs, which isolate `SUNLIT_EARTH_CONFIG` in a child process: this process
@@ -9972,6 +9922,8 @@ fn test_a_gibs_draft_switches_and_saves_the_gibs_mode() {
 fn test_apply_switches_the_engine_and_reads_the_applied_value() {
     let SourceWindow { window, link, sent } = create_source_window();
     let mut draft = window.get_cloud_source_draft();
+    // The default source is the native one; switching to the remote image
+    // exercises the same apply path.
     draft.mode = 1;
     draft.floor = 61.0;
     // 0.5 is exact in f32, which the sliders' values travel through.
@@ -9985,10 +9937,7 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
         _ => None,
     });
     let switched = switched.expect("the apply switches the engine");
-    assert_eq!(
-        switched.mode,
-        sunlit_core::config::CloudSourceMode::Eumetsat
-    );
+    assert_eq!(switched.mode, sunlit_core::config::CloudSourceMode::Remote);
 
     approx::assert_relative_eq!(switched.eumetsat.gamma, 0.5);
     // The applied value is what the draft asked for.

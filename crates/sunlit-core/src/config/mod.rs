@@ -779,7 +779,7 @@ mod tests {
         let config = load_and_upgrade(&path);
         assert_relative_eq!(config.longitude, 42.0);
         let saved = toml::Value::try_from(&config).unwrap();
-        assert_eq!(saved["cloud_source"]["mode"].as_str(), Some("remote"));
+        assert_eq!(saved["cloud_source"]["mode"].as_str(), Some("eumetsat"));
         assert_eq!(
             saved["cloud_source"]["remote_url"].as_str(),
             Some("https://clouds.matteason.co.uk/images/{size}/clouds.jpg")

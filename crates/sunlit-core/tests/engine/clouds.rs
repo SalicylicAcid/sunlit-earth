@@ -1290,6 +1290,9 @@ mod runtime_switch {
 
     fn config_for(url: String) -> CloudSourceConfig {
         CloudSourceConfig {
+            // Explicit: the default mode is the native EUMETSAT source, and
+            // these cases exercise the remote one against the local stub.
+            mode: sunlit_core::config::CloudSourceMode::Remote,
             remote_url: url,
             ..CloudSourceConfig::default()
         }

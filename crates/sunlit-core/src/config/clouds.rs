@@ -12,9 +12,8 @@ pub const ENV_CLOUD_URL: &str = "SUNLIT_EARTH_CLOUD_URL";
 #[serde(rename_all = "lowercase")]
 pub enum CloudSourceMode {
     #[default]
-    Remote,
     Eumetsat,
-    Gibs,
+    Remote,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ pub struct CloudSourceConfig {
 impl Default for CloudSourceConfig {
     fn default() -> Self {
         Self {
-            mode: CloudSourceMode::Remote,
+            mode: CloudSourceMode::default(),
             remote_url: DEFAULT_REMOTE_URL.to_owned(),
             eumetsat: EumetsatSettings::default(),
         }
