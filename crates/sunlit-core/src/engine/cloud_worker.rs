@@ -313,12 +313,16 @@ pub(super) fn spawn_cloud_worker(
         current,
         status,
         wait_ms,
-        // Poll immediately on the first tick, then on the configured interval.
+        // The startup check rides `owed` below, so the schedule itself starts
+        // one interval out: rolling it from the first tick instead would owe
+        // a second check right after the startup one.
         schedule: Schedule {
             interval,
-            next: now,
+            next: now + interval,
         },
-        owed: false,
+        // The startup check is owed whatever auto-refresh says: it feeds the
+        // first wallpaper, which is a wallpaper update even with the timer off.
+        owed: true,
         answer,
         enabled,
         abandoned,

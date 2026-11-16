@@ -861,7 +861,11 @@ impl Engine {
             if cloud.take_abandoned() {
                 cloud.owed = true;
             }
-            if cloud.schedule.due(now) {
+            // Scheduled checks follow the wallpaper's timer: with auto-refresh
+            // off there is no next wallpaper a new map would reach, so a poll
+            // that falls due stays unowed until the timer is on. The startup
+            // check and the manual ones do not pass through here.
+            if self.auto_refresh.is_some() && cloud.schedule.due(now) {
                 cloud.owed = true;
             }
             // Retry on the next tick rather than waiting out another whole

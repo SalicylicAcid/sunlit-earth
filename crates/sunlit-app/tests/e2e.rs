@@ -826,6 +826,16 @@ fn test_hidden_window_cloud_updates_do_not_grow_memory() {
 
     let (port, stub) = spawn_cloud_stub(cloud_fixture_jpeg(FIXTURE_WIDTH, FIXTURE_HEIGHT));
 
+    // Scheduled cloud checks follow auto-refresh, so this case turns the
+    // timer on; its 30-minute interval keeps a wallpaper publish out of the
+    // window while the one-second cloud polls run.
+    let config = isolated_config_path();
+    fs::write(
+        &config,
+        "[sunlit.earth]\nauto_refresh_enabled = true\nauto_refresh_interval_minutes = 30\n",
+    )
+    .expect("write the throwaway config");
+
     // Windowed, so there is no tray icon and no single-instance mutex, while
     // hiding over IPC still reaches the same state. The empty textures
     // directory leaves the JXL slots unloaded, so cloud frames are the only
@@ -839,6 +849,7 @@ fn test_hidden_window_cloud_updates_do_not_grow_memory() {
             textures_dir.to_str().expect("non-UTF-8 temp path"),
         ])
         .with_clouds()
+        .config(config)
         .env("SUNLIT_EARTH_SYNC_LOG", "1")
         .env(
             "SUNLIT_EARTH_CLOUD_URL",

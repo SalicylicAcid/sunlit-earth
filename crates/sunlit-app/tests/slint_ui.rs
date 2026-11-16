@@ -10338,6 +10338,41 @@ fn test_show_clouds_hides_the_whole_source_section() {
     assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
 }
 
+/// The paused-checks note answers to both switches that gate a scheduled
+/// check: it shows only while the layer is on and the wallpaper timer is off.
+#[test]
+fn test_the_paused_checks_note_follows_auto_refresh() {
+    let SourceWindow { window, .. } = create_source_window();
+    window.set_clouds({
+        let mut clouds = window.get_clouds();
+        clouds.enabled = true;
+        clouds
+    });
+    window.set_auto_refresh_enabled(false);
+    assert!(param_row_present(
+        &window,
+        "MainWindow::cloud-checks-paused-note"
+    ));
+
+    window.set_auto_refresh_enabled(true);
+    assert!(
+        !param_row_present(&window, "MainWindow::cloud-checks-paused-note"),
+        "the timer is on, so the checks are not paused"
+    );
+
+    // With the layer off the whole section is hidden, note included.
+    window.set_auto_refresh_enabled(false);
+    window.set_clouds({
+        let mut clouds = window.get_clouds();
+        clouds.enabled = false;
+        clouds
+    });
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-checks-paused-note"
+    ));
+}
+
 /// An edit arms the debounced settings write: one write a second after the
 /// last edit, and none at all from the pushes that are not edits, which is
 /// what keeps a preview and a defaults load free of writes.

@@ -134,6 +134,10 @@ impl Harness {
             crossbeam_channel::unbounded();
         let mut config = EngineConfig::headless((512, 256));
         config.params = test_params();
+        // Scheduled cloud checks follow auto-refresh, so the harness keeps it
+        // on unless a case says otherwise; its own publish is a year out,
+        // beyond any window a case steps, and joins no wallpaper count.
+        config.auto_refresh = Some(Duration::from_hours(24 * 365));
         config.on_event = Arc::new(move |event| {
             let _ = tx.send(event);
         });

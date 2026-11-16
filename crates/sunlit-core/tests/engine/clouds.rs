@@ -486,6 +486,59 @@ fn a_switched_off_cloud_layer_fetches_nothing_until_it_is_switched_on() {
     );
 }
 
+/// Scheduled cloud checks follow the wallpaper's timer: with auto-refresh
+/// off the startup check still feeds the first wallpaper and a manual refresh
+/// still fetches, but polls that fall due are not made. Turning the timer on
+/// makes the overdue check at once rather than an interval later, and turning
+/// it off pauses the schedule again.
+#[test]
+fn scheduled_cloud_checks_follow_auto_refresh() {
+    let _gpu = gpu();
+    let source = Arc::new(CountingClouds::new(false));
+    let clock = Arc::new(MockClock::new(time::OffsetDateTime::UNIX_EPOCH));
+    let harness = Harness::start(|config| {
+        config.params = switched(true);
+        config.cloud = Some(Arc::clone(&source) as Arc<dyn CloudSource>);
+        config.clock = Arc::clone(&clock) as Arc<dyn sunlit_core::engine::clock::Clock>;
+        config.cloud_poll_interval = POLL;
+        config.auto_refresh = None;
+    });
+
+    source.wait_for_fetches(1, "the startup check with the timer off");
+    for _ in 0..2 {
+        harness.advance(&clock, POLL);
+    }
+    assert_eq!(
+        source.fetches_after_quiet(),
+        1,
+        "a scheduled check while auto-refresh is off"
+    );
+
+    harness.engine.send(EngineCommand::RefreshClouds);
+    source.wait_for_fetches(2, "the manual refresh with the timer off");
+
+    // A year out, so the timer's own publish stays beyond anything this case
+    // steps and the fetch counted next is the cloud schedule's alone.
+    let year = Duration::from_hours(24 * 365);
+    harness.engine.send(EngineCommand::SetAutoRefresh {
+        enabled: true,
+        interval: year,
+    });
+    harness.advance(&clock, Duration::ZERO);
+    source.wait_for_fetches(3, "the overdue check when the timer comes on");
+
+    harness.engine.send(EngineCommand::SetAutoRefresh {
+        enabled: false,
+        interval: year,
+    });
+    harness.advance(&clock, POLL);
+    assert_eq!(
+        source.fetches_after_quiet(),
+        3,
+        "a scheduled check after the timer went off again"
+    );
+}
+
 /// Switching the layer off ends a poll that is backing off after a failure:
 /// no further attempt is made while it is off, and switching it back on sends
 /// the poll at once rather than when the backoff would have run out.

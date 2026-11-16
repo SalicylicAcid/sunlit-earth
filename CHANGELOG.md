@@ -8,6 +8,7 @@ Notable changes to Sunlit Earth, for people who use it. The GitHub release pages
 - Bugfix: a saved window geometry larger than its monitor no longer reopens the window as a tall narrow strip hanging off the screen. The size is capped to the monitor's work area at startup; the saved position is kept.
 - The tray menu's two refresh entries are now named for what they update: "Update Wallpaper Now" and "Update Clouds Now".
 - The cloud check interval is a setting: the Clouds group's "Check every" field, whole minutes from five to a day around the hourly default, typed or stepped rather than dragged, reaching the running engine without a restart. The source controls show only while Show clouds is on, and the Source list reads EUMETSAT, NSMC, Remote image.
+- Scheduled cloud checks now follow Auto-refresh wallpaper: with the timer off there is no next wallpaper a new map would reach, so the checks pause (the Clouds group says so) and turning the timer on checks at once. The startup check and Refresh now are unaffected.
 
 ## [0.5.0] - 2026-10-25
 

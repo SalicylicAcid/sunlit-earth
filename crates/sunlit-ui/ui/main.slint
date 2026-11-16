@@ -1040,7 +1040,7 @@ export component MainWindow inherits Window {
 
                     SettingCheck {
                         text: "Auto-refresh wallpaper";
-                        hint: "Set the wallpaper again on a timer, so the sunlit half of the globe keeps up with the real one.";
+                        hint: "Set the wallpaper again on a timer, so the sunlit half of the globe keeps up with the real one. Scheduled cloud checks follow this timer too.";
                         checked <=> root.auto-refresh-enabled;
                         toggled => { root.auto-refresh-changed(); }
                     }
@@ -1621,7 +1621,7 @@ export component MainWindow inherits Window {
                                                 root.sliders-changed();
                                             }
                                             Tooltip {
-                                                Hint { text: "Minutes between checks of the cloud source, 5 to 1440. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery."; }
+                                                Hint { text: "Minutes between checks of the cloud source, 5 to 1440. Checks run on schedule only while Auto-refresh wallpaper is on; Refresh now always checks. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery."; }
                                             }
                                         }
 
@@ -1629,6 +1629,13 @@ export component MainWindow inherits Window {
                                             text: "min";
                                             vertical-alignment: center;
                                         }
+                                    }
+
+                                    if !root.auto-refresh-enabled : cloud-checks-paused-note := Text {
+                                        text: "Scheduled checks are paused while Auto-refresh wallpaper is off; Refresh now still checks.";
+                                        wrap: word-wrap;
+                                        font-size: 11px;
+                                        color: Palette.foreground.with-alpha(0.7);
                                     }
 
                                     cloud-source-combo := SettingCombo {
