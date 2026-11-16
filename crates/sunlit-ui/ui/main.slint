@@ -99,6 +99,7 @@ export struct CloudSourceSettings {
     nsmc-ceiling: float,
     nsmc-gamma: float,
     nsmc-blur: float,
+    nsmc-cap: float,
 }
 
 export struct SkySettings {
@@ -1760,6 +1761,18 @@ export component MainWindow inherits Window {
                                             value <=> root.cloud-source-draft.nsmc-blur;
                                             default-value: root.cloud-source-defaults.nsmc-blur;
                                             value-text: round(root.cloud-source-draft.nsmc-blur) / 10;
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        nsmc-cap-slider := SettingRow {
+                                            label: "Peak";
+                                            hint: "The coverage the thickest cloud is drawn at. Below one, a storm core keeps its shape instead of flattening into solid white; the thin cloud stays where it was.";
+                                            indent: 8px;
+                                            minimum: 30;
+                                            maximum: 100;
+                                            value <=> root.cloud-source-draft.nsmc-cap;
+                                            default-value: root.cloud-source-defaults.nsmc-cap;
+                                            value-text: round(root.cloud-source-draft.nsmc-cap) / 100;
+                                            value-width: 35px;
                                             enabled: !root.cloud-source-override;
                                         }
                                     }

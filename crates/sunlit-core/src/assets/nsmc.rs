@@ -219,6 +219,7 @@ struct DerivedMeta {
     ceiling: u8,
     gamma: f64,
     blur: f64,
+    cap: f32,
     sha256: String,
 }
 
@@ -692,6 +693,7 @@ impl NsmcCloudSource {
             && meta.ceiling == s.ceiling
             && meta.gamma == s.gamma
             && meta.blur == s.blur
+            && meta.cap == s.cap
             && meta.sha256 == sha256
     }
 
@@ -745,6 +747,7 @@ impl NsmcCloudSource {
                 ceiling: self.settings.ceiling,
                 gamma: self.settings.gamma,
                 blur: self.settings.blur,
+                cap: self.settings.cap,
                 sha256: sha256.to_owned(),
             };
             let meta =
@@ -956,12 +959,21 @@ fn to_coverage(image: &GrayMap, settings: &NsmcSettings) -> GrayMap {
     let floor = f64::from(settings.floor) / 255.0;
     let span = f64::from(settings.ceiling) / 255.0 - floor;
     let gamma = settings.gamma as f32;
+    // The shoulder's shape: `v / (1 + (1 / cap - 1) v)` keeps its slope of one
+    // at zero and approaches `cap` from below, so a thin deck keeps the value
+    // the curve gave it and a saturated core comes down off the rail.
+    let shoulder = (1.0 / settings.cap - 1.0).max(0.0);
     let pixels = image
         .pixels()
         .iter()
         .map(|&v| {
             let t = ((f64::from(v) - floor) / span).clamp(0.0, 1.0) as f32;
-            t.powf(gamma)
+            let shaped = t.powf(gamma);
+            if shoulder > 0.0 {
+                shaped / (1.0 + shoulder * shaped)
+            } else {
+                shaped
+            }
         })
         .collect();
     GrayMap::new(image.width(), image.height(), pixels).expect("same rectangle")
@@ -1296,6 +1308,7 @@ mod tests {
             ceiling: 255,
             gamma: 1.0,
             blur: 0.0,
+            cap: 1.0,
         }
     }
 
@@ -1319,13 +1332,43 @@ mod tests {
                 covered(alpha)
             );
         }
-        assert!(covered(255) > 0.99);
+        // The shoulder holds the densest cloud under the cap rather than at
+        // 1, and the thin end still clears the floor.
+        assert_relative_eq!(covered(255), NsmcSettings::default().cap, epsilon = 1e-5);
         let mut last = 0.0;
         for alpha in (0..=255).step_by(3) {
             let value = covered(alpha);
             assert!(value >= last, "the curve is monotone at {alpha}");
             last = value;
         }
+    }
+
+    /// The shoulder pulls the deepest cloud off full white and leaves the thin
+    /// end where the curve put it, which is what keeps a typhoon core from
+    /// flattening into one white blob.
+    #[test]
+    fn the_shoulder_caps_the_densest_cloud_and_leaves_the_thin_alone() {
+        let map = GrayMap::new(3, 1, vec![0.1, 0.5, 1.0]).unwrap();
+        let plain = NsmcSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+            cap: 1.0,
+        };
+        let capped = NsmcSettings {
+            cap: 0.8,
+            ..plain.clone()
+        };
+        let open = to_coverage(&map, &plain);
+        let shaped = to_coverage(&map, &capped);
+        assert_relative_eq!(open.pixels()[2], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(shaped.pixels()[2], 0.8, epsilon = 1e-6);
+        // 0.1 / (1 + 0.25 * 0.1) and 0.5 / (1 + 0.25 * 0.5).
+        assert_relative_eq!(shaped.pixels()[0], 0.097_561, epsilon = 1e-5);
+        assert_relative_eq!(shaped.pixels()[1], 0.444_444, epsilon = 1e-5);
+        assert!(shaped.pixels()[0] < open.pixels()[0]);
+        assert!(shaped.pixels()[1] < open.pixels()[1]);
     }
 
     #[test]
@@ -1336,6 +1379,7 @@ mod tests {
             ceiling: 204,
             gamma: 2.0,
             blur: 0.0,
+            cap: 1.0,
         };
         let covered = to_coverage(&map, &settings);
         // floor 51/255 = 0.2, ceiling 204/255 = 0.8: 0.0 and 0.2 clamp low,

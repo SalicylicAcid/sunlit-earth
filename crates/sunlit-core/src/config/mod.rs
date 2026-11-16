@@ -14,7 +14,9 @@ use crate::scene::scene_time::SceneTime;
 pub mod clouds;
 mod migrate;
 
-pub use clouds::{CloudSourceConfig, CloudSourceMode, EumetsatSettings, NsmcSettings};
+pub use clouds::{
+    CloudCurve, CloudCurves, CloudSourceConfig, CloudSourceMode, EumetsatSettings, NsmcSettings,
+};
 mod window_geometry;
 
 use migrate::{CONFIG_VERSION, Migrated, migrate};
@@ -282,15 +284,30 @@ pub struct AppConfig {
     pub cloud_poll_mins: u32,
     pub cloud_opacity: f32,
     pub cloud_opacity_night: f32,
-    pub cloud_haze_equator: f32,
-    pub cloud_haze_pole: f32,
     pub cloud_haze_latitude: f32,
     pub cloud_haze_band: f32,
-    pub cloud_floor_land: f32,
-    pub cloud_gamma_land: f32,
-    pub cloud_floor_ocean: f32,
-    pub cloud_gamma_ocean: f32,
     pub cloud_night: f32,
+    /// One render curve per source, each with its own floor, gamma and haze
+    /// removal: the map's scale is a property of the source, so a curve tuned
+    /// on one is stored against it and comes back when it is picked again.
+    pub cloud_curves: CloudCurves,
+    // The active source's curve, read out of `cloud_curves` on load and on a
+    // source switch, and written back into it on save. They are what
+    // `SceneParams` carries and what the panel's sliders edit, and
+    // `load_active_curve` and `store_curve_for` are the only two things that
+    // move them across.
+    #[serde(skip)]
+    pub cloud_haze_equator: f32,
+    #[serde(skip)]
+    pub cloud_haze_pole: f32,
+    #[serde(skip)]
+    pub cloud_floor_land: f32,
+    #[serde(skip)]
+    pub cloud_gamma_land: f32,
+    #[serde(skip)]
+    pub cloud_floor_ocean: f32,
+    #[serde(skip)]
+    pub cloud_gamma_ocean: f32,
 
     // Atmosphere
     pub atmo_enabled: bool,
@@ -481,6 +498,65 @@ impl AppConfig {
         self.cloud_poll_mins = self
             .cloud_poll_mins
             .clamp(CLOUD_POLL_MINS_MIN, CLOUD_POLL_MINS_MAX);
+        for mode in [
+            CloudSourceMode::Eumetsat,
+            CloudSourceMode::Remote,
+            CloudSourceMode::Nsmc,
+        ] {
+            self.cloud_curves.for_mode_mut(mode).clamp();
+        }
+        self.load_active_curve();
+    }
+
+    /// Put the active source's curve in the six fields `SceneParams` reads.
+    ///
+    /// One direction of the two-step this config keeps: the file holds a curve
+    /// per source, and the flat fields the rest of the app reads are the one
+    /// for the source in force. This fills them on load and on a source
+    /// switch, [`Self::store_curve_for`] writes them back, so a curve edited
+    /// on one source lands in that source's table only.
+    pub fn load_active_curve(&mut self) {
+        let curve = self.cloud_curves.for_mode(self.cloud_source.mode);
+        self.cloud_haze_equator = curve.haze_equator;
+        self.cloud_haze_pole = curve.haze_pole;
+        self.cloud_floor_land = curve.floor_land;
+        self.cloud_gamma_land = curve.gamma_land;
+        self.cloud_floor_ocean = curve.floor_ocean;
+        self.cloud_gamma_ocean = curve.gamma_ocean;
+    }
+
+    /// The other direction: the six flat fields become `mode`'s entry of the
+    /// table. Called on the copy about to be written, so the file always holds
+    /// what the window is drawing, and by a source switch, which files the
+    /// curve it is leaving under the source it was tuned on.
+    pub fn store_curve_for(&mut self, mode: CloudSourceMode) {
+        let curve = CloudCurve {
+            haze_equator: self.cloud_haze_equator,
+            haze_pole: self.cloud_haze_pole,
+            floor_land: self.cloud_floor_land,
+            gamma_land: self.cloud_gamma_land,
+            floor_ocean: self.cloud_floor_ocean,
+            gamma_ocean: self.cloud_gamma_ocean,
+        };
+        *self.cloud_curves.for_mode_mut(mode) = curve;
+    }
+
+    /// The active source's entry, for the copy about to be written.
+    fn store_active_curve(&mut self) {
+        self.store_curve_for(self.cloud_source.mode);
+    }
+
+    /// Every setting at its shipped default, with `mode`'s cloud curve.
+    ///
+    /// What the panel's reset buttons go back to: the curve is per source, so
+    /// resetting the land floor on NSMC has to land on NSMC's default rather
+    /// than on the brightness map's quarter.
+    #[must_use]
+    pub fn defaults_for(mode: CloudSourceMode) -> Self {
+        let mut config = Self::default();
+        config.cloud_source.mode = mode;
+        config.load_active_curve();
+        config
     }
 
     /// The monitor the wallpaper plan is anchored to, or `None` for the primary.
@@ -521,14 +597,18 @@ impl Default for AppConfig {
             cloud_poll_mins: 60,
             cloud_opacity: 0.85,
             cloud_opacity_night: 0.45,
-            cloud_haze_equator: 0.9,
-            cloud_haze_pole: 1.3,
             cloud_haze_latitude: 55.0,
             cloud_haze_band: 25.0,
-            cloud_floor_land: 0.25,
-            cloud_gamma_land: 0.5,
-            cloud_floor_ocean: 0.1,
-            cloud_gamma_ocean: 0.75,
+            cloud_curves: CloudCurves::default(),
+            // The default source is EUMETSAT, so these start at its curve;
+            // `sanitize` reads them out of `cloud_curves` for whichever source
+            // the file names.
+            cloud_haze_equator: CloudCurve::BRIGHTNESS.haze_equator,
+            cloud_haze_pole: CloudCurve::BRIGHTNESS.haze_pole,
+            cloud_floor_land: CloudCurve::BRIGHTNESS.floor_land,
+            cloud_gamma_land: CloudCurve::BRIGHTNESS.gamma_land,
+            cloud_floor_ocean: CloudCurve::BRIGHTNESS.floor_ocean,
+            cloud_gamma_ocean: CloudCurve::BRIGHTNESS.gamma_ocean,
             cloud_night: 0.20,
             atmo_enabled: true,
             rayleigh_intensity: 0.5,
@@ -736,11 +816,11 @@ pub fn save_config(config: &AppConfig) {
 
 /// Save config to a specific path (used by both the public API and tests).
 fn save_config_to(config: &AppConfig, path: &Path) {
+    let mut earth = config.clone();
+    earth.store_active_curve();
     let file = ConfigFile {
         version: CONFIG_VERSION,
-        sunlit: SunlitSection {
-            earth: config.clone(),
-        },
+        sunlit: SunlitSection { earth },
     };
     crate::files::write_toml(&file, path, "config");
 }
@@ -811,10 +891,38 @@ mod tests {
             saved["cloud_source"]["remote_url"].as_str(),
             Some("https://clouds.matteason.co.uk/images/{size}/clouds.jpg")
         );
-        assert_eq!(CONFIG_VERSION, 5);
+        assert_eq!(CONFIG_VERSION, 7);
         // The step ran and kept the file's bytes; the section it never had
         // still comes from the source's own defaults.
         assert!(backup_path(&path, CONFIG_VERSION - 1).exists());
+    }
+
+    /// The point of the per-source table: a curve tuned on one source stays
+    /// there, and switching back finds it again.
+    #[test]
+    fn each_source_keeps_its_own_cloud_curve() {
+        let scratch = ScratchDir::new("config_curves");
+        let path = scratch.join("config.toml");
+        let mut config = AppConfig {
+            cloud_source: CloudSourceConfig {
+                mode: CloudSourceMode::Nsmc,
+                ..CloudSourceConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        config.load_active_curve();
+        assert_relative_eq!(config.cloud_floor_land, 0.05);
+        config.cloud_floor_land = 0.2;
+        save_config_to(&config, &path);
+
+        let mut reloaded = load_config_from(&path);
+        assert_relative_eq!(reloaded.cloud_floor_land, 0.2);
+        reloaded.cloud_source.mode = CloudSourceMode::Eumetsat;
+        reloaded.load_active_curve();
+        assert_relative_eq!(reloaded.cloud_floor_land, 0.25);
+        reloaded.cloud_source.mode = CloudSourceMode::Nsmc;
+        reloaded.load_active_curve();
+        assert_relative_eq!(reloaded.cloud_floor_land, 0.2);
     }
 
     #[test]
@@ -823,7 +931,7 @@ mod tests {
             let scratch = ScratchDir::new("cloud_source_roundtrip");
             let path = scratch.join("config.toml");
             let source = format!(
-                "mode = '{mode}'\nremote_url = 'https://example.org/{{size}}.jpg?token=secret'\n[eumetsat]\nfloor = 61\nceiling = 179\ngamma = 0.7\nblur = 1.5\n[nsmc]\nfloor = 7\nceiling = 249\ngamma = 1.3\nblur = 2.5\n"
+                "mode = '{mode}'\nremote_url = 'https://example.org/{{size}}.jpg?token=secret'\n[eumetsat]\nfloor = 61\nceiling = 179\ngamma = 0.7\nblur = 1.5\n[nsmc]\nfloor = 7\nceiling = 249\ngamma = 1.3\nblur = 2.5\ncap = 0.75\n"
             );
             let text = format!(
                 "version = 4\n[sunlit.earth]\nlongitude = 42.0\n[sunlit.earth.cloud_source]\n{}",
@@ -977,8 +1085,22 @@ mod tests {
     #[test]
     fn serde_round_trip() {
         let config = AppConfig::default();
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
+        // The file's shape, and the two steps a save and a load put the six
+        // active-curve fields through, since they are derived rather than
+        // stored.
+        let mut file = ConfigFile {
+            version: CONFIG_VERSION,
+            sunlit: SunlitSection {
+                earth: config.clone(),
+            },
+        };
+        file.sunlit.earth.store_active_curve();
+        let toml_str = toml::to_string_pretty(&file).unwrap();
+        let mut parsed = toml::from_str::<ConfigFile>(&toml_str)
+            .unwrap()
+            .sunlit
+            .earth;
+        parsed.sanitize();
         assert_eq!(config, parsed);
     }
 
@@ -992,6 +1114,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one field per line, which is the whole point: a new one cannot hide"
+    )]
     fn serde_round_trip_non_default() {
         let config = AppConfig {
             longitude: 42.5,
@@ -1022,6 +1148,26 @@ mod tests {
             cloud_poll_mins: 60,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.45,
+            // The active source's curve, and the other two beside it: the six
+            // flat fields below are the EUMETSAT entry by construction.
+            cloud_curves: CloudCurves {
+                eumetsat: CloudCurve {
+                    haze_equator: 0.4,
+                    haze_pole: 1.7,
+                    floor_land: 0.2,
+                    gamma_land: 0.3,
+                    floor_ocean: 0.05,
+                    gamma_ocean: 1.4,
+                },
+                remote: CloudCurve {
+                    floor_land: 0.35,
+                    ..CloudCurve::BRIGHTNESS
+                },
+                nsmc: CloudCurve {
+                    haze_pole: 0.6,
+                    ..CloudCurve::NSMC
+                },
+            },
             cloud_haze_equator: 0.4,
             cloud_haze_pole: 1.7,
             cloud_haze_latitude: 45.0,
@@ -1087,8 +1233,22 @@ mod tests {
             export_jpeg_quality: 75,
             export_path: "/pictures/globe".to_owned(),
         };
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: AppConfig = toml::from_str(&toml_str).unwrap();
+        // The file's shape, and the two steps a save and a load put the six
+        // active-curve fields through, since they are derived rather than
+        // stored.
+        let mut file = ConfigFile {
+            version: CONFIG_VERSION,
+            sunlit: SunlitSection {
+                earth: config.clone(),
+            },
+        };
+        file.sunlit.earth.store_active_curve();
+        let toml_str = toml::to_string_pretty(&file).unwrap();
+        let mut parsed = toml::from_str::<ConfigFile>(&toml_str)
+            .unwrap()
+            .sunlit
+            .earth;
+        parsed.sanitize();
         assert_eq!(config, parsed);
     }
 
@@ -1271,6 +1431,24 @@ sky_fov = 111.0
             cloud_poll_mins: 60,
             cloud_opacity: 0.6,
             cloud_opacity_night: 0.95,
+            cloud_curves: CloudCurves {
+                eumetsat: CloudCurve {
+                    haze_equator: 0.3,
+                    haze_pole: 1.6,
+                    floor_land: 0.15,
+                    gamma_land: 0.5,
+                    floor_ocean: 0.35,
+                    gamma_ocean: 1.2,
+                },
+                remote: CloudCurve {
+                    gamma_ocean: 1.7,
+                    ..CloudCurve::BRIGHTNESS
+                },
+                nsmc: CloudCurve {
+                    floor_land: 0.12,
+                    ..CloudCurve::NSMC
+                },
+            },
             cloud_haze_equator: 0.3,
             cloud_haze_pole: 1.6,
             cloud_haze_latitude: 55.0,

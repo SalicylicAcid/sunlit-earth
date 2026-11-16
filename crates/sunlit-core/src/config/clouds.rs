@@ -17,6 +17,110 @@ pub enum CloudSourceMode {
     Nsmc,
 }
 
+/// The render curve one cloud source's map is drawn through: what `fs_cloud`
+/// takes off as haze, and the floor and gamma it applies after that, each in a
+/// land and an ocean value.
+///
+/// Every source serves a different quantity on the same 0-1 scale, so this
+/// belongs to the source rather than to the window. A brightness map has a
+/// clear-sky veil over cold ground and needs a floor under it; NSMC's alpha is
+/// an overlay opacity that is already zero where the sky is clear, and a floor
+/// under it only eats thin cloud. `docs/rendering.md` has the shader's side.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudCurve {
+    pub haze_equator: f32,
+    pub haze_pole: f32,
+    pub floor_land: f32,
+    pub gamma_land: f32,
+    pub floor_ocean: f32,
+    pub gamma_ocean: f32,
+}
+
+impl CloudCurve {
+    /// What an infrared brightness map needs: clear mid-latitude land reads
+    /// about 0.8 of full scale, so the haze removal takes the region's own
+    /// level off and the floor catches what it leaves.
+    pub const BRIGHTNESS: Self = Self {
+        haze_equator: 0.9,
+        haze_pole: 1.3,
+        floor_land: 0.25,
+        gamma_land: 1.0,
+        floor_ocean: 0.1,
+        gamma_ocean: 0.75,
+    };
+
+    /// What the NSMC mosaic needs: its alpha is zero over clear sky and its
+    /// own curve has already lifted the thin cloud, so the land floor is a
+    /// noise gate rather than a veil remover, a twentieth instead of a
+    /// quarter.
+    pub const NSMC: Self = Self {
+        floor_land: 0.05,
+        // Above one the thin end is lifted, which is what a mosaic whose
+        // median alpha is a tenth of the scale needs over land.
+        gamma_land: 1.2,
+        ..Self::BRIGHTNESS
+    };
+}
+
+impl Default for CloudCurve {
+    fn default() -> Self {
+        Self::BRIGHTNESS
+    }
+}
+
+/// One [`CloudCurve`] per source, so switching sources switches the curve with
+/// it and a curve tuned on one source is waiting when the user comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudCurves {
+    pub eumetsat: CloudCurve,
+    pub remote: CloudCurve,
+    pub nsmc: CloudCurve,
+}
+
+impl CloudCurves {
+    #[must_use]
+    pub fn for_mode(&self, mode: CloudSourceMode) -> CloudCurve {
+        match mode {
+            CloudSourceMode::Eumetsat => self.eumetsat,
+            CloudSourceMode::Remote => self.remote,
+            CloudSourceMode::Nsmc => self.nsmc,
+        }
+    }
+
+    pub fn for_mode_mut(&mut self, mode: CloudSourceMode) -> &mut CloudCurve {
+        match mode {
+            CloudSourceMode::Eumetsat => &mut self.eumetsat,
+            CloudSourceMode::Remote => &mut self.remote,
+            CloudSourceMode::Nsmc => &mut self.nsmc,
+        }
+    }
+}
+
+impl Default for CloudCurves {
+    fn default() -> Self {
+        Self {
+            eumetsat: CloudCurve::BRIGHTNESS,
+            remote: CloudCurve::BRIGHTNESS,
+            nsmc: CloudCurve::NSMC,
+        }
+    }
+}
+
+impl CloudCurve {
+    /// Hold the curve inside the ranges the panel's sliders offer, so a file
+    /// cannot hand the shader a value no slider reaches.
+    pub fn clamp(&mut self) {
+        self.haze_equator = self.haze_equator.clamp(0.0, 2.0);
+        self.haze_pole = self.haze_pole.clamp(0.0, 2.0);
+        self.floor_land = self.floor_land.clamp(0.0, 0.5);
+        self.floor_ocean = self.floor_ocean.clamp(0.0, 0.5);
+        self.gamma_land = self.gamma_land.clamp(0.1, 2.0);
+        self.gamma_ocean = self.gamma_ocean.clamp(0.1, 2.0);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EumetsatSettings {
@@ -63,6 +167,13 @@ pub struct NsmcSettings {
     pub ceiling: u8,
     pub gamma: f64,
     pub blur: f64,
+    /// The coverage the mosaic's deepest cloud maps to, the top of a soft
+    /// shoulder over the curve's result: it leaves the thin end almost where
+    /// it was and pulls the saturated cores down. One is no shoulder, and the
+    /// row ships there: a typhoon core reading as solid white is the honest
+    /// picture of an overcast top, and turning it below one is a choice about
+    /// seeing its structure instead. `to_coverage` has the curve.
+    pub cap: f32,
 }
 
 impl Default for NsmcSettings {
@@ -72,6 +183,7 @@ impl Default for NsmcSettings {
             ceiling: 165,
             gamma: 0.3,
             blur: 0.0,
+            cap: 1.0,
         }
     }
 }
@@ -191,6 +303,8 @@ impl CloudSourceConfig {
             && (0.1..=4.0).contains(&nsmc.gamma)
             && nsmc.blur.is_finite()
             && (0.0..=10.0).contains(&nsmc.blur)
+            && nsmc.cap.is_finite()
+            && (0.3..=1.0).contains(&nsmc.cap)
     }
 
     /// Isolate schema errors in this field, rather than failing the entire file.
@@ -411,6 +525,7 @@ mod tests {
             ceiling: 10,
             gamma: 1.0,
             blur: 0.0,
+            cap: 0.8,
         };
         assert!(!config.valid());
         for (gamma, blur) in [(0.1, 0.0), (4.0, 10.0)] {
@@ -419,6 +534,7 @@ mod tests {
                 ceiling: 255,
                 gamma,
                 blur,
+                cap: 0.8,
             };
             assert!(config.valid());
         }
@@ -427,6 +543,7 @@ mod tests {
             ceiling: 255,
             gamma: 4.1,
             blur: 0.0,
+            cap: 0.8,
         };
         assert!(!config.valid());
     }

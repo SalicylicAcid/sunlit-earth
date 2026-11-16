@@ -13,7 +13,9 @@ use crate::scene::scene_time::{SceneTime, instant_of_override};
 /// One step from the version at its index in [`MIGRATIONS`] to the next.
 type Migration = fn(&mut Table, &mut ChangeLog);
 
-const MIGRATIONS: [Migration; 5] = [v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5];
+const MIGRATIONS: [Migration; 7] = [
+    v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7,
+];
 
 /// The version this build writes, and the one a file reaches after loading.
 #[expect(
@@ -188,6 +190,96 @@ fn v4_to_v5(earth: &mut Table, log: &mut ChangeLog) {
     }
     for &(key, _, new) in &NSMC_CURVE {
         set_number(nsmc, key, new, &format!("cloud_source.nsmc.{key}"), log);
+    }
+}
+
+/// The land gamma version 6 lifted from the half it shipped with, which drew
+/// the land's coverage squared and so kept only the dense cloud tops. A file
+/// that has moved it keeps what it holds: half of a tuned land curve says
+/// nothing about the picture above the new one either way, and 1 is where the
+/// exponent is the identity rather than a look.
+fn v5_to_v6(earth: &mut Table, log: &mut ChangeLog) {
+    change_default(
+        earth,
+        "cloud_gamma_land",
+        Value::Float(0.5),
+        Value::Float(1.0),
+        log,
+    );
+}
+
+/// The six keys the cloud curve kept flat until version 7, and the names they
+/// take inside a source's table.
+const CURVE_KEYS: [(&str, &str); 6] = [
+    ("cloud_haze_equator", "haze_equator"),
+    ("cloud_haze_pole", "haze_pole"),
+    ("cloud_floor_land", "floor_land"),
+    ("cloud_gamma_land", "gamma_land"),
+    ("cloud_floor_ocean", "floor_ocean"),
+    ("cloud_gamma_ocean", "gamma_ocean"),
+];
+
+/// What the six flat keys held for a brightness map in version 6, in
+/// [`CURVE_KEYS`] order. Written out rather than read off
+/// [`CloudCurve::BRIGHTNESS`](crate::config::CloudCurve::BRIGHTNESS), which is
+/// today's curve and free to move: a step judges the file it migrates, not the
+/// build that reads it.
+const BRIGHTNESS_V6: [f64; 6] = [0.9, 1.3, 0.25, 1.0, 0.1, 0.75];
+
+/// The cloud curve moves under the source it was tuned on: one set of values
+/// was never right for a brightness map and an overlay opacity at once, and
+/// the renderer's floor and gamma are read off whichever source is in force.
+///
+/// A curve the user tuned becomes the entry of the source the file runs, so
+/// that install keeps the picture it had. A file still holding the shipped
+/// brightness values is not a tuning at all: those keys go and every source
+/// takes its own default, which is what gives an NSMC install the land floor
+/// its map wants without the user retuning anything.
+fn v6_to_v7(earth: &mut Table, log: &mut ChangeLog) {
+    let values: Vec<(&str, &str, Value)> = CURVE_KEYS
+        .iter()
+        .filter_map(|(flat, nested)| {
+            earth
+                .get(*flat)
+                .map(|value| (*flat, *nested, value.clone()))
+        })
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+    let shipped = values.len() == BRIGHTNESS_V6.len()
+        && values
+            .iter()
+            .zip(BRIGHTNESS_V6)
+            .all(|((_, _, value), default)| {
+                number_of(value).is_some_and(|v| (v - default).abs() <= f64::EPSILON)
+            });
+    if shipped {
+        for (flat, _, _) in &values {
+            remove_key(earth, flat, log);
+        }
+        return;
+    }
+    let mode = match earth.get("cloud_source") {
+        Some(Value::Table(source)) => match source.get("mode") {
+            Some(Value::String(mode)) => mode.clone(),
+            _ => "eumetsat".to_owned(),
+        },
+        _ => "eumetsat".to_owned(),
+    };
+    let mut curve = Table::new();
+    for (flat, nested, _) in &values {
+        if let Some(value) = earth.remove(*flat) {
+            log.record(flat, Some(value.clone()), None);
+            curve.insert((*nested).to_owned(), value);
+        }
+    }
+    let curves = earth
+        .entry("cloud_curves")
+        .or_insert_with(|| Value::Table(Table::new()));
+    if let Value::Table(curves) = curves {
+        log.record("cloud_curves", None, Some(Value::Table(curve.clone())));
+        curves.insert(mode, Value::Table(curve));
     }
 }
 
@@ -583,7 +675,12 @@ mod tests {
         assert!(migrated.changes.iter().all(|c| c.from_version >= 2));
         let earth = doc["sunlit"]["earth"].as_table().unwrap();
         assert_eq!(earth["cloud_floor"].as_float(), Some(0.4));
-        assert_eq!(earth["cloud_haze_equator"].as_float(), Some(0.3));
+        // Version 7 moved the haze and the floor and gamma under the source
+        // they were tuned on; the file names no source, so it is the default.
+        assert_eq!(
+            earth["cloud_curves"]["eumetsat"]["haze_equator"].as_float(),
+            Some(0.3)
+        );
     }
 
     #[test]
@@ -601,7 +698,17 @@ mod tests {
         assert!(migrated.changes.iter().all(|c| c.from_version >= 1));
         let mut earth = doc["sunlit"]["earth"].as_table().unwrap().clone();
         earth.remove("scene_time");
-        assert_eq!(earth, with_cloud_settings_v2(""));
+        // Version 6 lifted the land gamma from the half version 2 shipped, and
+        // version 7 then dropped the six curve keys outright: together they are
+        // the shipped brightness curve, which is not a tuning, so each source
+        // takes its own default rather than inheriting this one.
+        assert_eq!(
+            earth,
+            self::earth(
+                "cloud_haze_latitude = 55.0
+cloud_haze_band = 25.0"
+            )
+        );
     }
 
     // --- the time setting ---
@@ -851,6 +958,99 @@ mod tests {
             let mut table = earth(source);
             assert!(apply(v4_to_v5, &mut table).is_empty(), "{source}");
         }
+    }
+
+    // --- v5_to_v6 ---
+
+    #[test]
+    fn the_land_gamma_moves_from_its_old_default_only() {
+        for (source, expected) in [
+            ("cloud_gamma_land = 0.5", Some(1.0)),
+            (
+                "cloud_gamma_land = 0.5
+cloud_floor_land = 0.4",
+                Some(1.0),
+            ),
+            ("cloud_gamma_land = 1.5", None),
+            ("cloud_gamma_land = 1", None),
+            ("", None),
+        ] {
+            let mut table = earth(source);
+            let changes = apply(v5_to_v6, &mut table);
+            match expected {
+                Some(value) => {
+                    assert_eq!(
+                        table.get("cloud_gamma_land"),
+                        Some(&Value::Float(value)),
+                        "{source}"
+                    );
+                    assert_eq!(changes.len(), 1, "{source}");
+                    assert_eq!(changes[0].key, "cloud_gamma_land");
+                }
+                None => assert!(changes.is_empty(), "{source}"),
+            }
+        }
+    }
+
+    // --- v6_to_v7 ---
+
+    #[test]
+    fn the_flat_curve_moves_under_the_source_the_file_runs() {
+        for (source, entry) in [
+            (
+                "cloud_source = { mode = 'nsmc' }
+cloud_floor_land = 0.05
+cloud_gamma_land = 1.0",
+                "nsmc",
+            ),
+            ("cloud_floor_land = 0.25", "eumetsat"),
+            (
+                "cloud_source = { mode = 'remote' }
+cloud_haze_pole = 1.5",
+                "remote",
+            ),
+        ] {
+            let mut table = earth(source);
+            let changes = apply(v6_to_v7, &mut table);
+            assert!(!table.contains_key("cloud_floor_land"), "{source}");
+            assert!(!table.contains_key("cloud_haze_pole"), "{source}");
+            let moved = &table["cloud_curves"][entry];
+            assert_eq!(
+                changes.len(),
+                changes.iter().filter(|c| c.to.is_none()).count() + 1,
+                "{source}"
+            );
+            assert!(
+                table["cloud_curves"].as_table().unwrap().len() == 1,
+                "{source}"
+            );
+            assert!(
+                moved.as_table().is_some_and(|t| !t.is_empty()),
+                "{source}: nothing under {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_brightness_curve_goes_and_each_source_takes_its_own() {
+        let mut table = earth(
+            "cloud_source = { mode = 'nsmc' }
+             cloud_haze_equator = 0.9
+cloud_haze_pole = 1.3
+             cloud_floor_land = 0.25
+cloud_gamma_land = 1.0
+             cloud_floor_ocean = 0.1
+cloud_gamma_ocean = 0.75",
+        );
+        apply(v6_to_v7, &mut table);
+        assert_eq!(table, earth("cloud_source = { mode = 'nsmc' }"));
+    }
+
+    #[test]
+    fn a_file_without_a_flat_curve_gains_no_table() {
+        let mut table = earth("longitude = 42.0");
+        assert!(apply(v6_to_v7, &mut table).is_empty());
+        assert!(!table.contains_key("cloud_curves"));
     }
 
     // --- versions ---

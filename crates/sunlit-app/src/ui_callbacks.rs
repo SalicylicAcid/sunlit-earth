@@ -677,7 +677,7 @@ pub fn register_action_callbacks(
             let Some(win) = window_weak.upgrade() else {
                 return;
             };
-            config::save_config(&read_config_from_window(&win, &engine));
+            write_settings(&win, &engine, || read_config_from_window(&win, &engine));
             engine.push_params(&win);
             engine.send(EngineCommand::RenderWallpaperNow);
         });
@@ -771,7 +771,7 @@ pub fn register_display_callbacks(
             mode: displays::mode_from_window(&win),
             anchor,
         });
-        config::save_config(&read_config_from_window(&win, &engine));
+        write_settings(&win, &engine, || read_config_from_window(&win, &engine));
     });
 }
 
@@ -888,7 +888,13 @@ pub fn register_color_text(window: &MainWindow) {
 /// `AppConfig::default()`, whichever config the values come from, and no other
 /// place in the app or in `main.slint` states a default.
 pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
-    window.set_defaults(scene_settings(&SceneParams::default()));
+    set_session_curves(config.cloud_curves);
+    // The reset targets follow the source in force: a curve is per source, so
+    // the land floor's reset on NSMC is NSMC's default, not the brightness
+    // map's quarter.
+    window.set_defaults(scene_settings(&SceneParams::from_config(
+        &AppConfig::defaults_for(config.cloud_source.mode),
+    )));
     window.set_time_zone_utc(config.time_zone == config::TimeZoneChoice::Utc);
     apply_params_to_window(window, &SceneParams::from_config(config));
     apply_cloud_source_to_window(window, &config.cloud_source);
@@ -951,6 +957,7 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
         nsmc_ceiling: f32::from(config.nsmc.ceiling),
         nsmc_gamma: (config.nsmc.gamma * 100.0) as f32,
         nsmc_blur: (config.nsmc.blur * 10.0) as f32,
+        nsmc_cap: config.nsmc.cap * 100.0,
     };
     // The combo's order: EUMETSAT, NSMC, Remote image.
     match config.mode {
@@ -962,6 +969,15 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
 
 /// The window's struct, back into a configuration, for validation, the
 /// engine's switch and the save.
+/// The source list's order: EUMETSAT (0), NSMC (1), Remote image (2).
+fn source_mode(mode: i32) -> config::CloudSourceMode {
+    match mode {
+        0 => config::CloudSourceMode::Eumetsat,
+        1 => config::CloudSourceMode::Nsmc,
+        _ => config::CloudSourceMode::Remote,
+    }
+}
+
 fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSourceConfig {
     #[expect(
         clippy::cast_possible_truncation,
@@ -984,14 +1000,10 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
         ceiling: settings.nsmc_ceiling.round() as u8,
         gamma: f64::from(settings.nsmc_gamma.round()) / 100.0,
         blur: f64::from(settings.nsmc_blur.round()) / 10.0,
+        cap: settings.nsmc_cap.round() / 100.0,
     };
     config::CloudSourceConfig {
-        // The combo's order: EUMETSAT (0), NSMC (1), Remote image (2).
-        mode: match settings.mode {
-            0 => config::CloudSourceMode::Eumetsat,
-            1 => config::CloudSourceMode::Nsmc,
-            _ => config::CloudSourceMode::Remote,
-        },
+        mode: source_mode(settings.mode),
         remote_url: settings.remote_url.to_string(),
         eumetsat,
         nsmc,
@@ -1003,21 +1015,48 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
 /// touches nothing. The export gate is cleared here, so the sheet can never
 /// reuse the previous target's ready state after a switch.
 fn apply_cloud_source(win: &MainWindow, engine: &EngineLink, draft: &CloudSourceSettings) {
-    let config = cloud_source_config_from(draft);
-    if !config.is_valid() {
+    let source = cloud_source_config_from(draft);
+    if !source.is_valid() {
         win.set_cloud_source_status(
-            "The source is not valid: the URL must be HTTP or HTTPS without embedded              credentials, and 0 <= floor < ceiling <= 255, gamma in [0.1, 4], blur in              [0, 10]. Nothing was applied."
+            "The source is not valid: the URL must be HTTP or HTTPS without embedded              credentials, 0 <= floor < ceiling <= 255, gamma in [0.1, 4], blur in              [0, 10], and the NSMC peak in [0.3, 1]. Nothing was applied."
                 .into(),
         );
         return;
     }
-    engine.set_cloud_source(config.clone());
+    // The curve on screen was tuned on the source being left, so it is filed
+    // under that source before the switch adopts the new one's.
+    let leaving = source_mode(win.get_cloud_source().mode);
+    engine.set_cloud_source(source.clone());
     CLOUDS.drawn.store(false, Ordering::Relaxed);
     // The push resets the section, including its status line; the applied
     // note goes out after it, so the two do not race for the same property.
-    apply_cloud_source_to_window(win, &config);
+    apply_cloud_source_to_window(win, &source);
+    let mut saved = read_config_from_window(win, engine);
+    saved.cloud_curves = session_curves(&saved);
+    saved.store_curve_for(leaving);
+    saved.load_active_curve();
+    set_session_curves(saved.cloud_curves);
+    push_cloud_curve_to_window(win, &saved);
+    engine.push_params(win);
     win.set_cloud_source_status("Applied; the map is on its way.".into());
-    config::save_config(&read_config_from_window(win, engine));
+    write_settings(win, engine, || saved);
+}
+
+/// What a source switch does to the cloud curve: the panel's six rows take the
+/// newly applied source's floor, gamma and haze removal, and so do its reset
+/// targets, which is what makes one source's tuning stay off another's picture.
+fn push_cloud_curve_to_window(win: &MainWindow, config: &AppConfig) {
+    let mut clouds = win.get_clouds();
+    clouds.haze.equator = config.cloud_haze_equator;
+    clouds.haze.pole = config.cloud_haze_pole;
+    clouds.land.floor = config.cloud_floor_land;
+    clouds.land.gamma = config.cloud_gamma_land;
+    clouds.ocean.floor = config.cloud_floor_ocean;
+    clouds.ocean.gamma = config.cloud_gamma_ocean;
+    win.set_clouds(clouds);
+    win.set_defaults(scene_settings(&SceneParams::from_config(
+        &AppConfig::defaults_for(config.cloud_source.mode),
+    )));
 }
 
 /// The engine's cloud status line, handed to the window on the UI thread.
@@ -1059,6 +1098,22 @@ thread_local! {
     /// process must never write the developer's own configuration.
     static SETTINGS_SAVE_ACTION: RefCell<Option<SettingsSaveAction>> =
         const { RefCell::new(None) };
+    /// Every source's cloud curve, as this session carries them. The file is
+    /// where they persist, but a switch reads and files them here: a curve
+    /// must survive being switched away from even when the write behind it is
+    /// still in flight, and a test process never writes one at all.
+    static CLOUD_CURVES: RefCell<Option<config::CloudCurves>> = const { RefCell::new(None) };
+}
+
+/// The curves the session carries, seeded from `config` the first time it is
+/// asked.
+fn session_curves(config: &AppConfig) -> config::CloudCurves {
+    CLOUD_CURVES.with(|slot| *slot.borrow_mut().get_or_insert(config.cloud_curves))
+}
+
+/// Replace them, which a switch and every whole-config load do.
+fn set_session_curves(curves: config::CloudCurves) {
+    CLOUD_CURVES.with(|slot| *slot.borrow_mut() = Some(curves));
 }
 
 /// Arm the debounced settings write: an edit's state lands on disk a second
@@ -1083,15 +1138,23 @@ pub(crate) fn arm_settings_save(window: &MainWindow, engine: &EngineLink) {
 
 /// What an armed settings save does when it fires.
 fn run_settings_save(window: &slint::Weak<MainWindow>, engine: &EngineLink) {
-    let action = SETTINGS_SAVE_ACTION.with(|slot| slot.borrow().clone());
     let Some(win) = window.upgrade() else {
         return;
     };
+    write_settings(&win, engine, || read_config_from_window(&win, engine));
+}
+
+/// The one door a save leaves by.
+///
+/// A test's own action stands in for the write, which a test process must
+/// never do against the developer's configuration; every path that saves goes
+/// through here, the source switch included, which used to write the file
+/// itself and so let a test suite overwrite it.
+fn write_settings(win: &MainWindow, engine: &EngineLink, config: impl FnOnce() -> AppConfig) {
+    let action = SETTINGS_SAVE_ACTION.with(|slot| slot.borrow().clone());
     match action {
-        // A test's own action stands in for the write, which a test process
-        // must never do against the developer's configuration.
-        Some(action) => action(&win, engine),
-        None => config::save_config(&read_config_from_window(&win, engine)),
+        Some(action) => action(win, engine),
+        None => config::save_config(&config()),
     }
 }
 

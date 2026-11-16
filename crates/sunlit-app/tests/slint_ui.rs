@@ -9989,6 +9989,48 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
 /// The NSMC draft applies the same way the other two do: the engine switch
 /// carries the mode and its own derivation curve, and the save reads the
 /// applied value.
+/// A source switch carries the whole curve, and brings a tuned one back: the
+/// six values under the source list follow the source, and the ones the user
+/// changed on the way stay filed under the source they were changed on.
+#[test]
+fn a_source_switch_carries_the_curve_and_brings_a_tuned_one_back() {
+    let SourceWindow {
+        window,
+        link: _,
+        sent: _,
+    } = create_source_window();
+
+    let mut to_nsmc = window.get_cloud_source();
+    to_nsmc.mode = 1;
+    window.set_cloud_source_draft(to_nsmc.clone());
+    window.invoke_apply_cloud_source(to_nsmc.clone());
+    let shipped = window.get_clouds().land.floor;
+    approx::assert_relative_eq!(shipped, sunlit_core::config::CloudCurve::NSMC.floor_land);
+
+    // Tune the land floor on NSMC only.
+    let mut clouds = window.get_clouds();
+    clouds.land.floor = 0.2;
+    window.set_clouds(clouds);
+    window.invoke_sliders_changed();
+
+    // EUMETSAT brings its own curve with it.
+    let mut to_eumetsat = window.get_cloud_source();
+    to_eumetsat.mode = 0;
+    window.set_cloud_source_draft(to_eumetsat.clone());
+    window.invoke_apply_cloud_source(to_eumetsat.clone());
+    approx::assert_relative_eq!(
+        window.get_clouds().land.floor,
+        sunlit_core::config::CloudCurve::BRIGHTNESS.floor_land
+    );
+
+    // And NSMC's tuned 0.2 is still filed there.
+    let mut back = window.get_cloud_source();
+    back.mode = 1;
+    window.set_cloud_source_draft(back.clone());
+    window.invoke_apply_cloud_source(back);
+    approx::assert_relative_eq!(window.get_clouds().land.floor, 0.2);
+}
+
 #[test]
 fn test_a_nsmc_draft_switches_and_saves_the_nsmc_mode() {
     let SourceWindow { window, link, sent } = create_source_window();
@@ -10017,6 +10059,19 @@ fn test_a_nsmc_draft_switches_and_saves_the_nsmc_mode() {
     let config = ui_callbacks::read_config_from_window(&window, &link);
     approx::assert_relative_eq!(config.cloud_source.nsmc.gamma, 1.5);
     assert_eq!(config.cloud_source.nsmc.floor, 10);
+    // The render curve travels with the source: the panel and the config take
+    // NSMC's own floor, not the quarter the brightness maps need.
+    approx::assert_relative_eq!(
+        window.get_clouds().land.floor,
+        config.cloud_curves.nsmc.floor_land
+    );
+    approx::assert_relative_eq!(config.cloud_floor_land, config.cloud_curves.nsmc.floor_land);
+    // And the reset beside the slider goes back to the source's own default,
+    // not to the quarter a brightness map wants.
+    approx::assert_relative_eq!(
+        window.get_defaults().clouds.land.floor,
+        sunlit_core::config::CloudCurve::NSMC.floor_land
+    );
     assert!(
         window.get_cloud_source_status().starts_with("Applied"),
         "the status says the apply went out: {:?}",
@@ -10222,6 +10277,7 @@ fn every_slider_producible_draft_applies_inside_the_domain() {
                 nsmc_ceiling: f32::from(ceiling),
                 nsmc_gamma: gamma,
                 nsmc_blur: blur,
+                nsmc_cap: 80.0,
             };
             window.set_cloud_source(applied);
             let config = ui_callbacks::read_config_from_window(&window, &link);
