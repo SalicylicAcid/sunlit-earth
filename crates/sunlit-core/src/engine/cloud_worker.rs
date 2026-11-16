@@ -135,7 +135,10 @@ impl CloudWorker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        current.and_then(|source| source.status()).unwrap_or(coarse)
+        let (phase, note) = current.map_or((None, None), |source| {
+            (source.status(), source.settled_note())
+        });
+        compose_status(&coarse, phase, note)
     }
 
     /// How long a client waits for the source in force to answer once.
@@ -179,6 +182,21 @@ impl CloudWorker {
             return false;
         }
         true
+    }
+}
+
+/// The status line the window shows, from what the three parts know: the
+/// source's own phase wins while it has one, since that is the finer account
+/// of the same run, and a source that names its imagery appends it to the
+/// worker's coarse line otherwise. On the failure line too, where what is on
+/// screen is a round older than the attempt that just failed.
+fn compose_status(coarse: &str, phase: Option<String>, note: Option<String>) -> String {
+    if let Some(phase) = phase {
+        return phase;
+    }
+    match note {
+        Some(note) => format!("{coarse} — {note}"),
+        None => coarse.to_owned(),
     }
 }
 
@@ -769,6 +787,34 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// The status line is the source's own phase while it has one, and the
+    /// worker's coarse state — extended by whatever the source names — when it
+    /// does not.
+    #[test]
+    fn a_sources_phase_wins_and_its_note_extends_the_coarse_line() {
+        let round = || Some("round 2026-11-16 05:00 UTC".to_owned());
+        assert_eq!(
+            compose_status("the cloud map is ready", None, None),
+            "the cloud map is ready"
+        );
+        assert_eq!(
+            compose_status(
+                "the cloud map is ready",
+                Some("downloading the mosaic".to_owned()),
+                round()
+            ),
+            "downloading the mosaic"
+        );
+        assert_eq!(
+            compose_status("the cloud map is ready", None, round()),
+            "the cloud map is ready — round 2026-11-16 05:00 UTC"
+        );
+        assert_eq!(
+            compose_status("the last poll failed; retrying in 30s", None, round()),
+            "the last poll failed; retrying in 30s — round 2026-11-16 05:00 UTC"
+        );
     }
 
     /// No pair arrives over a window long enough for a healthy fetch.

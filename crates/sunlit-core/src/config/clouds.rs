@@ -38,8 +38,24 @@ impl Default for EumetsatSettings {
 }
 
 /// The NSMC source's derivation curve, over the mosaic's alpha coverage.
-/// The service already ships a cloud-fraction-like intensity, so the defaults
-/// pass it through unchanged and tuning is left to the sliders.
+///
+/// The curve is not a taste: it puts the mosaic on the scale `fs_cloud`
+/// expects. That shader's floor and gamma were tuned against an infrared
+/// *brightness* map, where clear tropical ocean reads near zero and clear
+/// mid-latitude land around 0.8, so a land pixel under 0.25 of full scale is
+/// discarded outright (`docs/rendering.md`, the haze removal). The mosaic's
+/// alpha is an overlay opacity instead, and a low one: over one round, 39% of
+/// its pixels are exactly zero, the median is 10 of 255 and the ninetieth
+/// percentile 97. Passed through unchanged, nearly four fifths of the globe
+/// sits under that floor and no cloud is drawn at all, which is what the
+/// source shipped with and what the sliders are for.
+///
+/// The defaults below map the alpha's usable range onto the whole scale:
+/// `ceiling` 165 is where the mosaic's deep convection begins to saturate, and
+/// `gamma` 0.30 lifts the thin end clear of the floor. Measured against a
+/// round of the same hour, the resulting map's percentiles are 110, 217 and
+/// 255 at the 50th, 90th and 99th, against the EUMETSAT map's 121, 217 and
+/// 255, so the two sources render at comparable weight.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NsmcSettings {
@@ -53,8 +69,8 @@ impl Default for NsmcSettings {
     fn default() -> Self {
         Self {
             floor: 0,
-            ceiling: 255,
-            gamma: 1.0,
+            ceiling: 165,
+            gamma: 0.3,
             blur: 0.0,
         }
     }

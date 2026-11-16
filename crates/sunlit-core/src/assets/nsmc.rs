@@ -247,6 +247,10 @@ pub struct NsmcCloudSource {
     /// The download's progress line, written as the body moves and composed
     /// into the status when it is read.
     progress: Mutex<Option<String>>,
+    /// The round the last settled fetch left on screen, `YYYYMMDDhhmm`, for
+    /// the idle status line. Only a round whose map is in hand is written
+    /// here, so a failed attempt leaves the previous one in place.
+    round: Mutex<Option<String>>,
     /// The user stop the fetch worker hands over: set while a running round
     /// is wanted gone, checked between rounds, inside every chunk read and
     /// between the derivation's stages. Behind a lock so
@@ -278,6 +282,7 @@ impl NsmcCloudSource {
             retry_delays: RETRY_DELAYS,
             phase: Mutex::new(String::new()),
             progress: Mutex::new(None),
+            round: Mutex::new(None),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             agent,
         }
@@ -300,6 +305,34 @@ impl NsmcCloudSource {
 
     fn set_progress(&self, line: &str) {
         *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Some(line.to_owned());
+    }
+
+    /// Record the round whose map is now the one on screen.
+    fn settle(&self, round: &str) {
+        *self.round.lock().unwrap_or_else(PoisonError::into_inner) = Some(round.to_owned());
+    }
+
+    /// A settled round as the status line shows it: `2026-11-16 05:00 UTC`.
+    ///
+    /// The service publishes in UTC while the window's clock may be set to
+    /// the local zone, so the zone is spelled out rather than left to be
+    /// assumed. A round that is not the twelve digits the list promises is
+    /// passed through as it stands.
+    fn round_text(round: &str) -> String {
+        if round.len() != 12 {
+            return round.to_owned();
+        }
+        let at = |range: std::ops::Range<usize>| {
+            round
+                .get(range)
+                .filter(|part| part.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let (Some(year), Some(month), Some(day), Some(hour), Some(minute)) =
+            (at(0..4), at(4..6), at(6..8), at(8..10), at(10..12))
+        else {
+            return round.to_owned();
+        };
+        format!("{year}-{month}-{day} {hour}:{minute} UTC")
     }
 
     fn size(&self) -> (u32, u32) {
@@ -526,6 +559,7 @@ impl NsmcCloudSource {
                     round = %latest,
                     "the stored raw mosaic and its derivation are still current"
                 );
+                self.settle(&latest);
                 return Ok(None);
             }
             self.set_phase("processing locally");
@@ -536,6 +570,7 @@ impl NsmcCloudSource {
             let alpha = decode_alpha(&raw.bytes)?;
             let bytes =
                 self.derive_store_and_encode(&alpha, width, height, &raw.sha256, started)?;
+            self.settle(&latest);
             return Ok(Some(CloudImage {
                 bytes: Download::new(bytes),
                 etag: None,
@@ -561,10 +596,12 @@ impl NsmcCloudSource {
             && self.derived_matches(width, height, &raw.sha256)
         {
             debug!(round = %latest, "the upstream round matches the stored one");
+            self.settle(&latest);
             return Ok(None);
         }
         self.store_raw(&body, &latest)?;
         let bytes = self.derive_store_and_encode(&alpha, width, height, &sha, started)?;
+        self.settle(&latest);
         Ok(Some(CloudImage {
             bytes: Download::new(bytes),
             etag: None,
@@ -954,6 +991,17 @@ impl CloudSource for NsmcCloudSource {
         }
     }
 
+    /// The round last settled on, so the idle line says which hour is drawn.
+    /// Nothing here is cleared on a failure: what the window shows when an
+    /// attempt fails is precisely that older round.
+    fn settled_note(&self) -> Option<String> {
+        self.round
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .map(|round| format!("round {}", Self::round_text(round)))
+    }
+
     fn prepare(&self, resolution: u32) -> CloudTarget {
         let (width, height) = cloud_variant(resolution);
         *self
@@ -1240,6 +1288,46 @@ mod tests {
         assert_eq!(down, vec![200; 4 * 2]);
     }
 
+    /// The curve that leaves the mosaic's alpha as it is, for the tests that
+    /// assert on the pipeline rather than on the shipped tuning.
+    fn pass_through() -> NsmcSettings {
+        NsmcSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+        }
+    }
+
+    /// The shipped curve is the one the renderer can actually draw: `fs_cloud`
+    /// discards a land pixel under 0.25 of full scale, so the mosaic's own
+    /// median alpha — 10 of 255 over a November round — has to come out above
+    /// that line or the layer shows nothing. The pass-through this source
+    /// shipped with failed exactly that.
+    #[test]
+    fn the_shipped_curve_carries_the_mosaics_thin_cloud_past_the_renderers_floor() {
+        let map = |alpha: u8| {
+            GrayMap::new(1, 1, vec![f32::from(alpha) / 255.0]).expect("a one pixel map")
+        };
+        let covered = |alpha: u8| to_coverage(&map(alpha), &NsmcSettings::default()).pixels()[0];
+
+        assert_relative_eq!(covered(0), 0.0, epsilon = 1e-6);
+        for alpha in [10, 32, 64, 97] {
+            assert!(
+                covered(alpha) > 0.25,
+                "alpha {alpha} lands at {}",
+                covered(alpha)
+            );
+        }
+        assert!(covered(255) > 0.99);
+        let mut last = 0.0;
+        for alpha in (0..=255).step_by(3) {
+            let value = covered(alpha);
+            assert!(value >= last, "the curve is monotone at {alpha}");
+            last = value;
+        }
+    }
+
     #[test]
     fn coverage_maps_alpha_through_the_levels_curve() {
         let map = GrayMap::new(4, 1, vec![0.0, 0.5, 0.8, 1.0]).unwrap();
@@ -1256,6 +1344,21 @@ mod tests {
         assert_relative_eq!(covered.pixels()[1], 0.25);
         assert_relative_eq!(covered.pixels()[2], 1.0);
         assert_relative_eq!(covered.pixels()[3], 1.0);
+    }
+
+    #[test]
+    fn the_settled_round_reads_as_a_utc_instant_and_is_unset_until_one_settles() {
+        assert_eq!(
+            NsmcCloudSource::round_text("202611160500"),
+            "2026-11-16 05:00 UTC"
+        );
+        // Anything that is not the twelve digits the list promises is passed
+        // through rather than guessed at.
+        for odd in ["", "2026111", "2026-11-16", "20261116050x", "2026111605000"] {
+            assert_eq!(NsmcCloudSource::round_text(odd), odd);
+        }
+        let source = NsmcCloudSource::new(NsmcSettings::default(), None);
+        assert_eq!(source.settled_note(), None);
     }
 
     #[test]
@@ -1317,11 +1420,7 @@ mod tests {
                 panic!("unexpected request: {uri}");
             }
         });
-        let source = test_source(
-            NsmcSettings::default(),
-            Some(scratch.path().to_path_buf()),
-            agent,
-        );
+        let source = test_source(pass_through(), Some(scratch.path().to_path_buf()), agent);
         source.prepare(2048);
         let image = source
             .fetch_if_changed(None)
@@ -1343,10 +1442,20 @@ mod tests {
         ] {
             assert!(scratch.join(name).exists(), "{name} missing");
         }
+        // The status line can name the hour it is drawing from here on, and a
+        // poll that changes nothing keeps naming it.
+        assert_eq!(
+            source.settled_note().as_deref(),
+            Some("round 2026-11-14 23:00 UTC")
+        );
         // The second poll names the same round: one list request, no
         // mosaic, no image.
         assert!(source.fetch_if_changed(None).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 3, "list only");
+        assert_eq!(
+            source.settled_note().as_deref(),
+            Some("round 2026-11-14 23:00 UTC")
+        );
     }
 
     #[test]

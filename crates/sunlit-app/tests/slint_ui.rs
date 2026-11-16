@@ -9834,8 +9834,8 @@ fn test_cloud_source_section_pushes_the_saved_config() {
     approx::assert_relative_eq!(applied.gamma, 80.0);
     approx::assert_relative_eq!(applied.blur, 0.0);
     approx::assert_relative_eq!(applied.nsmc_floor, 0.0);
-    approx::assert_relative_eq!(applied.nsmc_ceiling, 255.0);
-    approx::assert_relative_eq!(applied.nsmc_gamma, 100.0);
+    approx::assert_relative_eq!(applied.nsmc_ceiling, 165.0);
+    approx::assert_relative_eq!(applied.nsmc_gamma, 30.0);
     approx::assert_relative_eq!(applied.nsmc_blur, 0.0);
     assert_eq!(
         window.get_cloud_source_draft(),

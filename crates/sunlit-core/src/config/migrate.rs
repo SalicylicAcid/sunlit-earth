@@ -13,7 +13,7 @@ use crate::scene::scene_time::{SceneTime, instant_of_override};
 /// One step from the version at its index in [`MIGRATIONS`] to the next.
 type Migration = fn(&mut Table, &mut ChangeLog);
 
-const MIGRATIONS: [Migration; 4] = [v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4];
+const MIGRATIONS: [Migration; 5] = [v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5];
 
 /// The version this build writes, and the one a file reaches after loading.
 #[expect(
@@ -91,15 +91,7 @@ fn v2_to_v3(earth: &mut Table, log: &mut ChangeLog) {
         }
         return;
     }
-    let number = |key: &str| match earth.get(key) {
-        Some(Value::Float(value)) => Some(*value),
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "an hour, a day of the year or a year"
-        )]
-        Some(Value::Integer(value)) => Some(*value as f64),
-        _ => None,
-    };
+    let number = |key: &str| earth.get(key).and_then(number_of);
     let scene_time = if earth.get("use_custom_datetime") == Some(&Value::Boolean(true)) {
         #[expect(
             clippy::cast_possible_truncation,
@@ -162,6 +154,43 @@ fn v3_to_v4(earth: &mut Table, log: &mut ChangeLog) {
     convert(earth, "offset_x", log, |offset| offset * TUNED_ASPECT);
 }
 
+/// Each key of the NSMC derivation curve version 5 replaced, the value it had
+/// and the one it ships with.
+///
+/// The old curve passed the mosaic's alpha through unchanged, which left more
+/// than four fifths of the globe under the renderer's floor and drew no cloud
+/// at all; the new one maps the alpha's usable range onto the whole scale. The
+/// reasoning and the measurements are on
+/// [`NsmcSettings`](crate::config::NsmcSettings).
+const NSMC_CURVE: [(&str, f64, f64); 2] = [("ceiling", 255.0, 165.0), ("gamma", 1.0, 0.3)];
+
+/// The NSMC curve moves to the calibrated one, for a file that still holds the
+/// pass-through it shipped with.
+///
+/// The two keys move together or not at all. Unlike a default of its own, a
+/// curve is one setting: half of it taken to the new numbers would brighten a
+/// picture its owner chose, so a file whose `ceiling` or `gamma` has moved
+/// keeps both. `floor` and `blur` did not move at all.
+fn v4_to_v5(earth: &mut Table, log: &mut ChangeLog) {
+    let Some(Value::Table(source)) = earth.get_mut("cloud_source") else {
+        return;
+    };
+    let Some(Value::Table(nsmc)) = source.get_mut("nsmc") else {
+        return;
+    };
+    let pass_through = NSMC_CURVE.iter().all(|&(key, old, _)| {
+        nsmc.get(key)
+            .and_then(number_of)
+            .is_some_and(|value| (value - old).abs() <= f64::EPSILON)
+    });
+    if !pass_through {
+        return;
+    }
+    for &(key, _, new) in &NSMC_CURVE {
+        set_number(nsmc, key, new, &format!("cloud_source.nsmc.{key}"), log);
+    }
+}
+
 /// Replace a number `key` holds with `convert` of it, as a float.
 fn convert(earth: &mut Table, key: &str, log: &mut ChangeLog, to: impl Fn(f64) -> f64) {
     let old = match earth.get(key) {
@@ -177,6 +206,46 @@ fn convert(earth: &mut Table, key: &str, log: &mut ChangeLog, to: impl Fn(f64) -
 fn remove_key(earth: &mut Table, key: &str, log: &mut ChangeLog) {
     if let Some(previous) = earth.remove(key) {
         log.record(key, Some(previous), None);
+    }
+}
+
+/// Put `new` in the number `key` holds, logged under its whole path and
+/// keeping the TOML type the file wrote.
+///
+/// The type matters: `floor` and `ceiling` are `u8` and a float where an
+/// integer belongs fails the whole `cloud_source` section, which would reset
+/// the source, its mode and every tuned parameter rather than just this key.
+fn set_number(table: &mut Table, key: &str, new: f64, path: &str, log: &mut ChangeLog) {
+    let Some(previous) = table.get(key).cloned() else {
+        return;
+    };
+    let replacement = if new.fract() == 0.0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a whole number of a bound the file already held in 8 bits"
+        )]
+        Value::Integer(new as i64)
+    } else {
+        Value::Float(new)
+    };
+    if previous == replacement {
+        return;
+    }
+    table.insert(key.to_owned(), replacement.clone());
+    log.record(path, Some(previous), Some(replacement));
+}
+
+/// A TOML number as an `f64`, whether the file wrote it as a float or an
+/// integer.
+fn number_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(value) => Some(*value),
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "an hour, a day of the year, a year or a channel bound"
+        )]
+        Value::Integer(value) => Some(*value as f64),
+        _ => None,
     }
 }
 
@@ -715,6 +784,73 @@ mod tests {
         let (table, changes) = short_edge_step("sky_fov = \"wide\"\n");
         assert_eq!(table.get("sky_fov"), Some(&Value::String("wide".into())));
         assert_eq!(changes, [] as [Change; 0]);
+    }
+
+    // --- v4_to_v5 ---
+
+    fn nsmc_curve(source: &str) -> (Table, Vec<Change>) {
+        let mut table = earth(&format!("[cloud_source.nsmc]\n{source}"));
+        let changes = apply(v4_to_v5, &mut table);
+        (table, changes)
+    }
+
+    #[test]
+    fn the_pass_through_nsmc_curve_becomes_the_calibrated_one() {
+        for source in [
+            "floor = 0\nceiling = 255\ngamma = 1.0\nblur = 0.0\n",
+            // Hand-written floats where the fields are integers.
+            "floor = 0.0\nceiling = 255.0\ngamma = 1.0\n",
+        ] {
+            let (table, changes) = nsmc_curve(source);
+            let nsmc = table["cloud_source"]["nsmc"].as_table().unwrap();
+            assert_eq!(nsmc["ceiling"], Value::Integer(165), "{source}");
+            assert_eq!(nsmc["gamma"], Value::Float(0.3), "{source}");
+            assert_eq!(number_of(&nsmc["floor"]), Some(0.0), "{source}");
+            let keys: Vec<&str> = changes.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(
+                keys,
+                ["cloud_source.nsmc.ceiling", "cloud_source.nsmc.gamma"],
+                "{source}"
+            );
+            let from = number_of(changes[0].from.as_ref().unwrap());
+            assert_eq!(from, Some(255.0), "{source}");
+        }
+    }
+
+    /// The migrated section still parses as one: `ceiling` is a `u8` and a
+    /// float there would fail the section and take the mode and every tuned
+    /// parameter down with it.
+    #[test]
+    fn the_migrated_curve_still_deserializes_into_the_source() {
+        use crate::config::{CloudSourceConfig, NsmcSettings};
+
+        let (table, _) = nsmc_curve("floor = 0\nceiling = 255\ngamma = 1.0\nblur = 0.0\n");
+        let config: CloudSourceConfig = table["cloud_source"].clone().try_into().unwrap();
+        assert_eq!(config.nsmc, NsmcSettings::default());
+    }
+
+    #[test]
+    fn a_tuned_nsmc_curve_and_a_file_without_one_are_left_alone() {
+        for source in [
+            "floor = 0\nceiling = 120\ngamma = 1.0\nblur = 0.0\n",
+            "floor = 0\nceiling = 255\ngamma = 2.0\nblur = 0.0\n",
+            "floor = 10\nblur = 1.5\n",
+            "ceiling = \"dense\"\n",
+            "",
+        ] {
+            let (table, changes) = nsmc_curve(source);
+            let original = earth(&format!("[cloud_source.nsmc]\n{source}"));
+            assert_eq!(table, original, "{source}");
+            assert!(changes.is_empty(), "{source}: {changes:?}");
+        }
+        let (table, changes) = nsmc_curve("");
+        assert_eq!(table, earth("[cloud_source.nsmc]\n"));
+        assert!(changes.is_empty());
+        // No section at all, and a section that is not a table.
+        for source in ["[sunlit.earth]", "cloud_source = 3"] {
+            let mut table = earth(source);
+            assert!(apply(v4_to_v5, &mut table).is_empty(), "{source}");
+        }
     }
 
     // --- versions ---

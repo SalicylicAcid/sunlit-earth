@@ -232,6 +232,15 @@ pub trait CloudSource: Send + Sync {
         None
     }
 
+    /// Which imagery the last settled fetch left on screen, when the source
+    /// names it. Appended to the worker's coarse status, so the idle line says
+    /// what is drawn rather than only that something is: a source that
+    /// publishes one dated round an hour needs it, since a stale map and a
+    /// current one look exactly alike otherwise.
+    fn settled_note(&self) -> Option<String> {
+        None
+    }
+
     /// Fetch the current image if it differs from `known_etag`.
     ///
     /// Returns `Ok(None)` when the source is unchanged.

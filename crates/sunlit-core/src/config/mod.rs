@@ -792,10 +792,17 @@ mod tests {
     }
 
     #[test]
-    fn cloud_source_old_files_default_without_a_schema_bump() {
+    fn a_file_without_the_cloud_source_section_takes_its_defaults() {
         let scratch = ScratchDir::new("cloud_source_old");
         let path = scratch.join("config.toml");
-        fs::write(&path, "version = 4\n[sunlit.earth]\nlongitude = 42.0\n").unwrap();
+        fs::write(
+            &path,
+            format!(
+                "version = {}\n[sunlit.earth]\nlongitude = 42.0\n",
+                CONFIG_VERSION - 1
+            ),
+        )
+        .unwrap();
         let config = load_and_upgrade(&path);
         assert_relative_eq!(config.longitude, 42.0);
         let saved = toml::Value::try_from(&config).unwrap();
@@ -804,8 +811,10 @@ mod tests {
             saved["cloud_source"]["remote_url"].as_str(),
             Some("https://clouds.matteason.co.uk/images/{size}/clouds.jpg")
         );
-        assert_eq!(CONFIG_VERSION, 4);
-        assert!(!backup_path(&path, 4).exists());
+        assert_eq!(CONFIG_VERSION, 5);
+        // The step ran and kept the file's bytes; the section it never had
+        // still comes from the source's own defaults.
+        assert!(backup_path(&path, CONFIG_VERSION - 1).exists());
     }
 
     #[test]

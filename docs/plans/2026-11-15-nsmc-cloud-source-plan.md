@@ -35,3 +35,9 @@ The cloud source evaluation ([2026-03-19-cloud-data-sources.md](2026-03-19-cloud
 
 - Verified live: GetCapabilities and GetMap unauthenticated, hourly cadence, the alpha semantics, the blank-image quirks, the round list. The unit tests (fixture agent, no network) cover the round flow, the derivation, the caches, the cancel and the error classes.
 - Not verified: the source in the running window against the live service on any platform, and on Linux/macOS at the window. The engine-level machinery is shared with the EUMETSAT source and covered by the existing engine tests.
+
+## Update, 2026-11-16: the curve did not survive the renderer
+
+The pass-through defaults this plan settled on drew almost nothing. `fs_cloud`'s floor and gamma were tuned for an infrared *brightness* map — clear mid-latitude land around 0.8 of full scale — while the mosaic's alpha is an overlay opacity with a median of 10 of 255 and 39% of its pixels at exactly zero, so nearly four fifths of the globe fell under the land floor of 0.25 and a cloudy region such as southern China rendered as clear sky. Measured over the 05:00 UTC round of 2026-11-16, the derived map's 50th and 90th percentiles were 21 and 104 against the EUMETSAT map's 121 and 217.
+
+The default curve is now `floor 0, ceiling 165, gamma 0.30`, which lands the same round at 110 and 217; a config file still holding the pass-through is migrated to it, and `NsmcSettings`' doc comment carries the measurements. The status line also names the settled round (`round 2026-11-16 05:00 UTC`), since the window gave no way to tell an hour-old map from a current one.
