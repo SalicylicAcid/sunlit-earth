@@ -85,7 +85,7 @@ export struct CloudSettings {
 // Where the cloud imagery comes from. Independent of `CloudSettings`: those
 // are shader parameters, this is the pipeline's input, and the two are saved,
 // applied and reset separately. `mode` is 0 for the native EUMETSAT pipeline,
-// 1 for a remote image and 2 for the native NSMC pipeline. The EUMETSAT rows
+// 1 for the native NSMC pipeline and 2 for a remote image. The EUMETSAT rows
 // run on `floor`/`ceiling`/`gamma`/`blur`, the NSMC rows on their `nsmc-`
 // twins: each source carries its own derivation curve.
 export struct CloudSourceSettings {
@@ -278,8 +278,8 @@ export component MainWindow inherits Window {
     // The minutes between checks of the cloud source, and the reset target
     // for them. The source's own gate still decides whether a check
     // downloads anything.
-    in-out property <float> cloud-poll-mins;
-    in property <float> cloud-poll-defaults;
+    in-out property <int> cloud-poll-mins;
+    in property <int> cloud-poll-defaults;
     in-out property <CelestialSettings> celestial;
     in-out property <AtmosphereSettings> atmosphere;
     in-out property <LightingSettings> lighting;
@@ -1581,198 +1581,229 @@ export component MainWindow inherits Window {
 
                                 SettingCheck {
                                     text: "Show clouds";
-                                    hint: "Master switch for the cloud layer. While it is off, no new download or decode starts.";
+                                    hint: "Master switch for the cloud layer. While it is off, no new download or decode starts, and the source controls hide with the layer.";
                                     checked <=> root.clouds.enabled;
                                     toggled => { root.sliders-changed(); }
                                 }
 
-                                cloud-poll-slider := SettingRow {
-                                    label: "Check every";
-                                    hint: "Minutes between checks of the cloud source. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery.";
-                                    minimum: 5;
-                                    maximum: 1440;
-                                    value <=> root.cloud-poll-mins;
-                                    default-value: root.cloud-poll-defaults;
-                                    value-text: round(root.cloud-poll-mins) + " min";
-                                    changed => {
-                                        root.cloud-poll-changed();
-                                        root.sliders-changed();
-                                    }
-                                }
-
-                                cloud-source-combo := SettingCombo {
-                                    label: "Source";
-                                    hint: "Where the cloud imagery comes from: a remote image, the EUMETSAT infrared layer, or the NSMC geostationary mosaic, the native ones processed on this machine.";
-                                    model: [
-                                        "EUMETSAT (this machine)",
-                                        "Remote image",
-                                        "NSMC (this machine)",
-                                    ];
-                                    current-index <=> root.cloud-source-draft.mode;
-                                    enabled: !root.cloud-source-override;
-                                }
-
-                                if root.cloud-source-draft.mode == 1 :
-                                VerticalLayout {
-                                    cloud-url := LineEdit {
-                                        min-width: 0;
-                                        accessible-label: "Remote cloud image URL";
-                                        text <=> root.cloud-source-draft.remote-url;
-                        // The text is a draft: nothing fetches until Apply.
-                                        enabled: !root.cloud-source-override;
-                                        Tooltip {
-                                            Hint { text: "HTTP or HTTPS. {size} becomes the map's width by height, a fixed URL is used as it is. Applied, saved and fetched only when Apply is pressed."; }
-                                        }
-                                    }
-                                }
-
-                                if root.cloud-source-draft.mode == 0 :
+                                // The source rows are settings of the layer,
+                                // so the master switch owns them too: off,
+                                // there is nothing to check, fetch or stop.
+                                if root.clouds.enabled :
                                 VerticalLayout {
                                     spacing: 4px;
 
-                                    cloud-floor-slider := SettingRow {
-                                        label: "IR floor";
-                                        hint: "Infrared brightness at or below this counts as clear sky.";
-                                        indent: 8px;
-                                        minimum: 0;
-                                        maximum: 254;
-                                        value <=> root.cloud-source-draft.floor;
-                                        default-value: root.cloud-source-defaults.floor;
-                                        value-text: round(root.cloud-source-draft.floor);
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    cloud-ceiling-slider := SettingRow {
-                                        label: "IR ceiling";
-                                        hint: "Infrared brightness at or above this counts as full cloud.";
-                                        indent: 8px;
-                                        minimum: 1;
-                                        maximum: 255;
-                                        value <=> root.cloud-source-draft.ceiling;
-                                        default-value: root.cloud-source-defaults.ceiling;
-                                        value-text: round(root.cloud-source-draft.ceiling);
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    cloud-gamma-slider := SettingRow {
-                                        label: "Gamma";
-                                        hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
-                                        indent: 8px;
-                                        minimum: 10;
-                                        maximum: 400;
-                                        value <=> root.cloud-source-draft.gamma;
-                                        default-value: root.cloud-source-defaults.gamma;
-                                        value-text: round(root.cloud-source-draft.gamma) / 100;
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    cloud-blur-slider := SettingRow {
-                                        label: "Blur";
-                                        hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
-                                        indent: 8px;
-                                        minimum: 0;
-                                        maximum: 100;
-                                        value <=> root.cloud-source-draft.blur;
-                                        default-value: root.cloud-source-defaults.blur;
-                                        value-text: round(root.cloud-source-draft.blur) / 10;
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                }
+                                    // Typed rather than dragged: the range is a
+                                    // day wide, so a slider would be a
+                                    // one-minute pixel hunt.
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        padding-left: 0px;
 
-                                if root.cloud-source-draft.mode == 2 :
-                                VerticalLayout {
-                                    spacing: 4px;
+                                        Text {
+                                            text: "Check every";
+                                            width: 88px;
+                                            vertical-alignment: center;
+                                        }
 
-                                    nsmc-floor-slider := SettingRow {
-                                        label: "IR floor";
-                                        hint: "Coverage at or below this counts as clear sky. The mosaic's alpha already is a cloud fraction, so 0 keeps it as served.";
-                                        indent: 8px;
-                                        minimum: 0;
-                                        maximum: 254;
-                                        value <=> root.cloud-source-draft.nsmc-floor;
-                                        default-value: root.cloud-source-defaults.nsmc-floor;
-                                        value-text: round(root.cloud-source-draft.nsmc-floor);
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    nsmc-ceiling-slider := SettingRow {
-                                        label: "IR ceiling";
-                                        hint: "Coverage at or above this counts as full cloud.";
-                                        indent: 8px;
-                                        minimum: 1;
-                                        maximum: 255;
-                                        value <=> root.cloud-source-draft.nsmc-ceiling;
-                                        default-value: root.cloud-source-defaults.nsmc-ceiling;
-                                        value-text: round(root.cloud-source-draft.nsmc-ceiling);
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    nsmc-gamma-slider := SettingRow {
-                                        label: "Gamma";
-                                        hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
-                                        indent: 8px;
-                                        minimum: 10;
-                                        maximum: 400;
-                                        value <=> root.cloud-source-draft.nsmc-gamma;
-                                        default-value: root.cloud-source-defaults.nsmc-gamma;
-                                        value-text: round(root.cloud-source-draft.nsmc-gamma) / 100;
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                    nsmc-blur-slider := SettingRow {
-                                        label: "Blur";
-                                        hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
-                                        indent: 8px;
-                                        minimum: 0;
-                                        maximum: 100;
-                                        value <=> root.cloud-source-draft.nsmc-blur;
-                                        default-value: root.cloud-source-defaults.nsmc-blur;
-                                        value-text: round(root.cloud-source-draft.nsmc-blur) / 10;
-                                        enabled: !root.cloud-source-override;
-                                    }
-                                }
+                                        cloud-poll-spinbox := SpinBox {
+                                            minimum: 5;
+                                            maximum: 1440;
+                                            value <=> root.cloud-poll-mins;
+                                            // The stock 128px minimum plus the
+                                            // label and the unit would widen
+                                            // the panel past the sidebar floor.
+                                            min-width: 100px;
+                                            horizontal-stretch: 1;
+                                            accessible-label: "Minutes between cloud source checks";
+                                            edited => {
+                                                root.cloud-poll-changed();
+                                                root.sliders-changed();
+                                            }
+                                            Tooltip {
+                                                Hint { text: "Minutes between checks of the cloud source, 5 to 1440. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery."; }
+                                            }
+                                        }
 
-                                HorizontalLayout {
-                                    spacing: 4px;
-                                    apply-button := Button {
-                                        text: "Apply source";
-                                        enabled: root.cloud-source-draft != root.cloud-source
-                                            && !root.cloud-source-override;
-                                        clicked => { root.apply-cloud-source(root.cloud-source-draft); }
-                                        Tooltip {
-                                            Hint { text: "Validates, saves and switches to the source as edited. Nothing fetches before this."; }
+                                        Text {
+                                            text: "min";
+                                            vertical-alignment: center;
                                         }
                                     }
-                                    // The manual side of the same round: ask
-                                    // for one now, or stop the one running.
-                                    // The stop exists only while a fetch is
-                                    // in flight, which the engine reports.
-                                    refresh-cloud-button := Button {
-                                        text: "Refresh now";
-                                        enabled: root.clouds.enabled;
-                                        clicked => { root.refresh-clouds(); }
-                                        Tooltip {
-                                            Hint { text: "Fetches the current imagery now, ahead of the hourly check. Upstream republishes every 15 minutes, so a fetch that soon after the last one is served from the cache."; }
+
+                                    cloud-source-combo := SettingCombo {
+                                        label: "Source";
+                                        hint: "Where the cloud imagery comes from: the EUMETSAT or NSMC infrared mosaic, processed here, or a remote image.";
+                                        model: [
+                                            "EUMETSAT",
+                                            "NSMC",
+                                            "Remote image",
+                                        ];
+                                        current-index <=> root.cloud-source-draft.mode;
+                                        enabled: !root.cloud-source-override;
+                                    }
+
+                                    if root.cloud-source-draft.mode == 2 :
+                                    VerticalLayout {
+                                        cloud-url := LineEdit {
+                                            min-width: 0;
+                                            accessible-label: "Remote cloud image URL";
+                                            text <=> root.cloud-source-draft.remote-url;
+                            // The text is a draft: nothing fetches until Apply.
+                                            enabled: !root.cloud-source-override;
+                                            Tooltip {
+                                                Hint { text: "HTTP or HTTPS. {size} becomes the map's width by height, a fixed URL is used as it is. Applied, saved and fetched only when Apply is pressed."; }
+                                            }
                                         }
                                     }
-                                    if root.cloud-source-busy :
-                                    stop-cloud-button := Button {
-                                        text: "Stop";
-                                        clicked => { root.abort-clouds(); }
-                                        Tooltip {
-                                            Hint { text: "Stops the fetch in flight without a retry. The next check is the regular one."; }
+
+                                    if root.cloud-source-draft.mode == 0 :
+                                    VerticalLayout {
+                                        spacing: 4px;
+
+                                        cloud-floor-slider := SettingRow {
+                                            label: "IR floor";
+                                            hint: "Infrared brightness at or below this counts as clear sky.";
+                                            indent: 8px;
+                                            minimum: 0;
+                                            maximum: 254;
+                                            value <=> root.cloud-source-draft.floor;
+                                            default-value: root.cloud-source-defaults.floor;
+                                            value-text: round(root.cloud-source-draft.floor);
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        cloud-ceiling-slider := SettingRow {
+                                            label: "IR ceiling";
+                                            hint: "Infrared brightness at or above this counts as full cloud.";
+                                            indent: 8px;
+                                            minimum: 1;
+                                            maximum: 255;
+                                            value <=> root.cloud-source-draft.ceiling;
+                                            default-value: root.cloud-source-defaults.ceiling;
+                                            value-text: round(root.cloud-source-draft.ceiling);
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        cloud-gamma-slider := SettingRow {
+                                            label: "Gamma";
+                                            hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
+                                            indent: 8px;
+                                            minimum: 10;
+                                            maximum: 400;
+                                            value <=> root.cloud-source-draft.gamma;
+                                            default-value: root.cloud-source-defaults.gamma;
+                                            value-text: round(root.cloud-source-draft.gamma) / 100;
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        cloud-blur-slider := SettingRow {
+                                            label: "Blur";
+                                            hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
+                                            indent: 8px;
+                                            minimum: 0;
+                                            maximum: 100;
+                                            value <=> root.cloud-source-draft.blur;
+                                            default-value: root.cloud-source-defaults.blur;
+                                            value-text: round(root.cloud-source-draft.blur) / 10;
+                                            enabled: !root.cloud-source-override;
                                         }
                                     }
-                                }
 
-                                if root.cloud-source-status != "" :
-                                Text {
-                                    text: root.cloud-source-status;
-                                    wrap: word-wrap;
-                                    font-size: 11px;
-                                    color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
-                                }
+                                    if root.cloud-source-draft.mode == 1 :
+                                    VerticalLayout {
+                                        spacing: 4px;
 
-                                if root.cloud-source-override :
-                                Text {
-                                    text: "SUNLIT_EARTH_CLOUD_URL overrides the source; edits here are disabled and the environment value is not saved.";
-                                    wrap: word-wrap;
-                                    font-size: 11px;
-                                    color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                        nsmc-floor-slider := SettingRow {
+                                            label: "IR floor";
+                                            hint: "Coverage at or below this counts as clear sky. The mosaic's alpha already is a cloud fraction, so 0 keeps it as served.";
+                                            indent: 8px;
+                                            minimum: 0;
+                                            maximum: 254;
+                                            value <=> root.cloud-source-draft.nsmc-floor;
+                                            default-value: root.cloud-source-defaults.nsmc-floor;
+                                            value-text: round(root.cloud-source-draft.nsmc-floor);
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        nsmc-ceiling-slider := SettingRow {
+                                            label: "IR ceiling";
+                                            hint: "Coverage at or above this counts as full cloud.";
+                                            indent: 8px;
+                                            minimum: 1;
+                                            maximum: 255;
+                                            value <=> root.cloud-source-draft.nsmc-ceiling;
+                                            default-value: root.cloud-source-defaults.nsmc-ceiling;
+                                            value-text: round(root.cloud-source-draft.nsmc-ceiling);
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        nsmc-gamma-slider := SettingRow {
+                                            label: "Gamma";
+                                            hint: "The coverage curve's exponent, from 0.1 to 4. Below 1 brightens midtones.";
+                                            indent: 8px;
+                                            minimum: 10;
+                                            maximum: 400;
+                                            value <=> root.cloud-source-draft.nsmc-gamma;
+                                            default-value: root.cloud-source-defaults.nsmc-gamma;
+                                            value-text: round(root.cloud-source-draft.nsmc-gamma) / 100;
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                        nsmc-blur-slider := SettingRow {
+                                            label: "Blur";
+                                            hint: "Gaussian blur of the coverage map, in pixels, before it is encoded.";
+                                            indent: 8px;
+                                            minimum: 0;
+                                            maximum: 100;
+                                            value <=> root.cloud-source-draft.nsmc-blur;
+                                            default-value: root.cloud-source-defaults.nsmc-blur;
+                                            value-text: round(root.cloud-source-draft.nsmc-blur) / 10;
+                                            enabled: !root.cloud-source-override;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        apply-button := Button {
+                                            text: "Apply source";
+                                            enabled: root.cloud-source-draft != root.cloud-source
+                                                && !root.cloud-source-override;
+                                            clicked => { root.apply-cloud-source(root.cloud-source-draft); }
+                                            Tooltip {
+                                                Hint { text: "Validates, saves and switches to the source as edited. Nothing fetches before this."; }
+                                            }
+                                        }
+                                        // The manual side of the same round: ask
+                                        // for one now, or stop the one running.
+                                        // The stop exists only while a fetch is
+                                        // in flight, which the engine reports.
+                                        refresh-cloud-button := Button {
+                                            text: "Refresh now";
+                                            clicked => { root.refresh-clouds(); }
+                                            Tooltip {
+                                                Hint { text: "Fetches the current imagery now, ahead of the hourly check. Upstream republishes every 15 minutes, so a fetch that soon after the last one is served from the cache."; }
+                                            }
+                                        }
+                                        if root.cloud-source-busy :
+                                        stop-cloud-button := Button {
+                                            text: "Stop";
+                                            clicked => { root.abort-clouds(); }
+                                            Tooltip {
+                                                Hint { text: "Stops the fetch in flight without a retry. The next check is the regular one."; }
+                                            }
+                                        }
+                                    }
+
+                                    if root.cloud-source-status != "" :
+                                    Text {
+                                        text: root.cloud-source-status;
+                                        wrap: word-wrap;
+                                        font-size: 11px;
+                                        color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                    }
+
+                                    if root.cloud-source-override :
+                                    Text {
+                                        text: "SUNLIT_EARTH_CLOUD_URL overrides the source; edits here are disabled and the environment value is not saved.";
+                                        wrap: word-wrap;
+                                        font-size: 11px;
+                                        color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                    }
                                 }
 
                                 if root.clouds.enabled :

@@ -4,10 +4,10 @@ Notable changes to Sunlit Earth, for people who use it. The GitHub release pages
 
 ## [Unreleased]
 
-- New cloud source: NSMC (this machine). The app fetches the National Satellite Meteorological Center's global geostationary infrared mosaic (`GEOS_IRX`, hourly, the interface documented at [www.nsmc.org.cn/nsmc/cn/image/wms.html](http://www.nsmc.org.cn/nsmc/cn/image/wms.html)) and processes it into the cloud layer on this machine, with its own coverage curve. The imagery requires attribution to NSMC (CMA); see the About window.
+- New cloud source: NSMC. The app fetches the National Satellite Meteorological Center's global geostationary infrared mosaic (`GEOS_IRX`, hourly, the interface documented at [www.nsmc.org.cn/nsmc/cn/image/wms.html](http://www.nsmc.org.cn/nsmc/cn/image/wms.html)) and processes it into the cloud layer on this machine, with its own coverage curve. The imagery requires attribution to NSMC (CMA); see the About window.
 - Bugfix: a saved window geometry larger than its monitor no longer reopens the window as a tall narrow strip hanging off the screen. The size is capped to the monitor's work area at startup; the saved position is kept.
 - The tray menu's two refresh entries are now named for what they update: "Update Wallpaper Now" and "Update Clouds Now".
-- The cloud check interval is a setting: the Clouds group's "Check every" slider, five minutes to a day around the hourly default, reaching the running engine without a restart.
+- The cloud check interval is a setting: the Clouds group's "Check every" field, whole minutes from five to a day around the hourly default, typed or stepped rather than dragged, reaching the running engine without a restart. The source controls show only while Show clouds is on, and the Source list reads EUMETSAT, NSMC, Remote image.
 
 ## [0.5.0] - 2026-10-25
 

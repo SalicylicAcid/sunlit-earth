@@ -9858,7 +9858,7 @@ fn test_cloud_source_rows_follow_the_draft_mode() {
     );
 
     let mut draft = window.get_cloud_source_draft();
-    draft.mode = 1;
+    draft.mode = 2;
     window.set_cloud_source_draft(draft);
     assert!(
         url_row(&window),
@@ -9870,7 +9870,7 @@ fn test_cloud_source_rows_follow_the_draft_mode() {
     ));
 
     let mut draft = window.get_cloud_source_draft();
-    draft.mode = 2;
+    draft.mode = 1;
     window.set_cloud_source_draft(draft);
     assert!(
         param_row_present(&window, "MainWindow::nsmc-floor-slider"),
@@ -9894,7 +9894,7 @@ fn test_cloud_source_rows_follow_the_draft_mode() {
 fn test_the_draft_never_reaches_the_applied_or_the_save() {
     let SourceWindow { window, link, sent } = create_source_window();
     let mut draft = window.get_cloud_source_draft();
-    draft.mode = 1;
+    draft.mode = 2;
     draft.floor = 61.0;
     window.set_cloud_source_draft(draft);
     // The applied value is untouched by a draft edit.
@@ -9919,7 +9919,7 @@ fn test_an_invalid_draft_is_refused_entirely() {
     } = create_source_window();
     // floor above the ceiling, with the mode switched on the way there.
     let mut draft = window.get_cloud_source_draft();
-    draft.mode = 1;
+    draft.mode = 2;
     draft.floor = 200.0;
     draft.ceiling = 100.0;
     window.set_cloud_source_draft(draft.clone());
@@ -9951,7 +9951,7 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
     let mut draft = window.get_cloud_source_draft();
     // The default source is the native one; switching to the remote image
     // exercises the same apply path.
-    draft.mode = 1;
+    draft.mode = 2;
     draft.floor = 61.0;
     // 0.5 is exact in f32, which the sliders' values travel through.
     draft.gamma = 50.0;
@@ -9993,7 +9993,7 @@ fn test_apply_switches_the_engine_and_reads_the_applied_value() {
 fn test_a_nsmc_draft_switches_and_saves_the_nsmc_mode() {
     let SourceWindow { window, link, sent } = create_source_window();
     let mut draft = window.get_cloud_source_draft();
-    draft.mode = 2;
+    draft.mode = 1;
     // 0.5 is exact in f32, which the sliders' values travel through.
     draft.nsmc_gamma = 150.0;
     draft.nsmc_floor = 10.0;
@@ -10251,22 +10251,22 @@ fn every_slider_producible_draft_applies_inside_the_domain() {
     }
 }
 
-/// The check-interval slider reaches the engine as its command, and the
+/// The check-interval spinbox reaches the engine as its command, and the
 /// debounced save reads it into the config; the defaults push puts the
 /// one-hour default back.
 #[test]
-fn test_the_cloud_poll_slider_saves_and_reaches_the_engine() {
+fn test_the_cloud_poll_spinbox_saves_and_reaches_the_engine() {
     let SourceWindow { window, link, sent } = create_source_window();
     // The changed callback is a change registration, not an action one.
     ui_callbacks::register_change_callbacks(&window, &link);
-    approx::assert_relative_eq!(window.get_cloud_poll_mins(), 60.0);
-    assert!(param_row_present(&window, "MainWindow::cloud-poll-slider"));
+    assert_eq!(window.get_cloud_poll_mins(), 60);
+    assert!(param_row_present(&window, "MainWindow::cloud-poll-spinbox"));
 
-    window.set_cloud_poll_mins(10.0);
+    window.set_cloud_poll_mins(10);
     window.invoke_cloud_poll_changed();
-    let sent: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    let commands: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
     assert!(
-        sent.iter().any(|command| matches!(
+        commands.iter().any(|command| matches!(
             command,
             sunlit_core::engine::EngineCommand::SetCloudPollInterval(10)
         )),
@@ -10275,9 +10275,67 @@ fn test_the_cloud_poll_slider_saves_and_reaches_the_engine() {
     let config = ui_callbacks::read_config_from_window(&window, &link);
     assert_eq!(config.cloud_poll_mins, 10);
 
+    // A value outside the field's range clamps to it on the way out, both
+    // to the engine and into the save.
+    window.set_cloud_poll_mins(1);
+    window.invoke_cloud_poll_changed();
+    let commands: Vec<sunlit_core::engine::EngineCommand> = sent.try_iter().collect();
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            sunlit_core::engine::EngineCommand::SetCloudPollInterval(5)
+        )),
+        "a minute count under the floor clamps to it"
+    );
+    assert_eq!(
+        ui_callbacks::read_config_from_window(&window, &link).cloud_poll_mins,
+        5
+    );
+
     // The defaults push restores the one-hour default along with the rest.
     ui_callbacks::apply_config_to_window(&window, &sunlit_core::config::AppConfig::default());
-    approx::assert_relative_eq!(window.get_cloud_poll_mins(), 60.0);
+    assert_eq!(window.get_cloud_poll_mins(), 60);
+}
+
+/// Show clouds is the layer's master switch, so it owns the source rows too:
+/// off, there is nothing to check, fetch or stop, and the whole section goes
+/// with the layer.
+#[test]
+fn test_show_clouds_hides_the_whole_source_section() {
+    let SourceWindow { window, .. } = create_source_window();
+    window.set_clouds({
+        let mut clouds = window.get_clouds();
+        clouds.enabled = true;
+        clouds
+    });
+    assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
+    assert!(param_row_present(&window, "MainWindow::cloud-poll-spinbox"));
+    assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
+
+    window.set_clouds({
+        let mut clouds = window.get_clouds();
+        clouds.enabled = false;
+        clouds
+    });
+    assert!(
+        !param_row_present(&window, "MainWindow::cloud-source-combo"),
+        "the source row is the layer's, so it goes with it"
+    );
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-poll-spinbox"
+    ));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
+
+    window.set_clouds({
+        let mut clouds = window.get_clouds();
+        clouds.enabled = true;
+        clouds
+    });
+    assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
 }
 
 /// An edit arms the debounced settings write: one write a second after the

@@ -627,12 +627,7 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     let engine = link.clone();
     window.on_cloud_poll_changed(move || {
         if let Some(win) = window_weak.upgrade() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "a clamped interval in minutes is far inside the u32 range"
-            )]
-            let mins = win.get_cloud_poll_mins().round().clamp(5.0, 1440.0) as u32;
+            let mins = u32::try_from(win.get_cloud_poll_mins().clamp(5, 1440)).unwrap_or(60);
             engine.send(EngineCommand::SetCloudPollInterval(mins));
         }
     });
@@ -908,15 +903,17 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
     )]
     window.set_auto_refresh_interval(config.auto_refresh_interval_minutes as f32);
     #[expect(
-        clippy::cast_precision_loss,
-        reason = "an interval in minutes is far inside the f32 mantissa"
+        clippy::cast_possible_wrap,
+        reason = "a minute count in 5..=1440 is far inside the i32 the property takes"
     )]
-    window.set_cloud_poll_mins(config.cloud_poll_mins as f32);
+    let poll_mins = config.cloud_poll_mins as i32;
+    window.set_cloud_poll_mins(poll_mins);
     #[expect(
-        clippy::cast_precision_loss,
-        reason = "an interval in minutes is far inside the f32 mantissa"
+        clippy::cast_possible_wrap,
+        reason = "a minute count in 5..=1440 is far inside the i32 the property takes"
     )]
-    window.set_cloud_poll_defaults(config::AppConfig::default().cloud_poll_mins as f32);
+    let poll_default = config::AppConfig::default().cloud_poll_mins as i32;
+    window.set_cloud_poll_defaults(poll_default);
 
     update_datetime_labels(window);
 }
@@ -955,10 +952,11 @@ fn cloud_source_settings(config: &config::CloudSourceConfig) -> CloudSourceSetti
         nsmc_gamma: (config.nsmc.gamma * 100.0) as f32,
         nsmc_blur: (config.nsmc.blur * 10.0) as f32,
     };
+    // The combo's order: EUMETSAT, NSMC, Remote image.
     match config.mode {
         config::CloudSourceMode::Eumetsat => build(0),
-        config::CloudSourceMode::Remote => build(1),
-        config::CloudSourceMode::Nsmc => build(2),
+        config::CloudSourceMode::Nsmc => build(1),
+        config::CloudSourceMode::Remote => build(2),
     }
 }
 
@@ -988,9 +986,10 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
         blur: f64::from(settings.nsmc_blur.round()) / 10.0,
     };
     config::CloudSourceConfig {
+        // The combo's order: EUMETSAT (0), NSMC (1), Remote image (2).
         mode: match settings.mode {
             0 => config::CloudSourceMode::Eumetsat,
-            2 => config::CloudSourceMode::Nsmc,
+            1 => config::CloudSourceMode::Nsmc,
             _ => config::CloudSourceMode::Remote,
         },
         remote_url: settings.remote_url.to_string(),
@@ -1567,12 +1566,7 @@ pub fn read_config_from_window_onto(
     }
     read_params_from_window(window, aa_counts).write_to_config(&mut config);
     config.cloud_source = cloud_source_config_from(&window.get_cloud_source());
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a clamped interval in minutes is far inside the u32 range"
-    )]
-    let poll_mins = window.get_cloud_poll_mins().round().clamp(5.0, 1440.0) as u32;
+    let poll_mins = u32::try_from(window.get_cloud_poll_mins().clamp(5, 1440)).unwrap_or(60);
     config.cloud_poll_mins = poll_mins;
     config
 }
