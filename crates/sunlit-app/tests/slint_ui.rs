@@ -2050,7 +2050,7 @@ fn test_switching_the_source_switches_its_parameters_in_real_time() {
     let curve_of = |mode: sunlit_core::config::CloudSourceMode| {
         sunlit_core::config::AppConfig::defaults_for(mode).cloud_floor_land
     };
-    let apply_button = || the_button(&window, "Apply source");
+    let apply_button = || the_button(&window, "Apply parameters");
     let set_cloud_commands = || {
         sent.try_iter()
             .filter_map(|command| match command {

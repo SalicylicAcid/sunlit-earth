@@ -1669,7 +1669,7 @@ export component MainWindow inherits Window {
                             // The text is a draft: nothing fetches until Apply.
                                             enabled: !root.cloud-source-override;
                                             Tooltip {
-                                                Hint { text: "HTTP or HTTPS. {size} becomes the map's width by height, a fixed URL is used as it is. Applied, saved and fetched only when Apply is pressed."; }
+                                                Hint { text: "HTTP or HTTPS. {size} becomes the map's width by height, a fixed URL is used as it is. URL edits take effect only after Apply parameters; selecting Remote image immediately uses the saved URL."; }
                                             }
                                         }
                                     }
@@ -1789,12 +1789,12 @@ export component MainWindow inherits Window {
                                     HorizontalLayout {
                                         spacing: 4px;
                                         apply-button := Button {
-                                            text: "Apply source";
+                                            text: "Apply parameters";
                                             enabled: root.cloud-source-draft != root.cloud-source
                                                 && !root.cloud-source-override;
                                             clicked => { root.apply-cloud-source(root.cloud-source-draft); }
                                             Tooltip {
-                                                Hint { text: "Validates, saves and switches to the source as edited. Nothing fetches before this."; }
+                                                Hint { text: "Validates, applies and saves parameter or URL edits for the current source. Picking a source switches immediately; no confirmation is needed."; }
                                             }
                                         }
                                         // The manual side of the same round: ask
