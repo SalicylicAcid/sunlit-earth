@@ -5,18 +5,14 @@
 //! (`plans/2026-11-13-cloud-map-generator.md`), which was verified against the
 //! app's renderer. One round fetches the two hemispheres of
 //! `mumi:worldcloudmap_ir108` from `EUMETView`'s WMS 1.3.0 endpoint (EPSG:4326,
-//! no auth), stitches them west-first into a 2:1 equirectangular map, trims
-//! the geostationary blind zone at the poles column by column, maps IR
-//! brightness to cloud coverage, and encodes the quality-88 grayscale JPEG the
-//! fetcher stores and decodes.
+//! no auth), stitches them west-first into a 2:1 equirectangular map, masks
+//! the polar blind zone without stretching or moving valid samples, maps IR
+//! brightness to cloud coverage, and fades inside the valid boundary after
+//! gamma and blur. It encodes the quality-88 grayscale JPEG the fetcher decodes.
 //!
 //! The imagery requires the "Contains modified EUMETSAT data" attribution
-//! (EUMETSAT data licensing). Two approximations are inherent to the method
-//! and carry over from the generator: the per-column pole trim stretches each
-//! column's retained rows across the full height, which shifts latitudes near
-//! the poles (a visualization approximation, not a reprojection), and the two
-//! hemispheres are "latest" requests taken seconds apart, not a strictly
-//! simultaneous instant.
+//! (EUMETSAT data licensing). The two hemispheres are "latest" requests taken
+//! seconds apart, not a strictly simultaneous instant.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -46,16 +42,11 @@ pub(crate) const LAYER: &str = "mumi:worldcloudmap_ir108";
 pub(crate) const HEMISPHERES: [(&str, &str); 2] =
     [("west", "-90,-180,90,0"), ("east", "-90,0,90,180")];
 
-/// Grayscale values at or above this are leftover blind-zone white, not cloud.
-pub(crate) const NO_DATA_THRESHOLD: f32 = 254.0 / 255.0;
-/// Blind-zone detection for the pole trim. Below the no-data threshold so the
-/// disc edge antialiased to near-white (236..253) is trimmed away too, which
-/// the coverage curve would otherwise clip to full cloud.
-pub(crate) const TRIM_THRESHOLD: f32 = 236.0 / 255.0;
-/// Median window half width for the column edges of the pole trim.
-pub(crate) const TRIM_SMOOTH_HALF: usize = 24;
-/// Fixed trim band, per pole, when a column's own edges look wrong.
-pub(crate) const TRIM_FALLBACK: f64 = 0.09;
+/// Pole-connected blind-zone white, including the antialiased near-white rim.
+/// This cutoff never rejects bright clouds inside a column's valid support.
+const TRIM_THRESHOLD: f32 = 236.0 / 255.0;
+/// Latitude width of the inward coverage fade, independent of map resolution.
+const POLAR_FADE_DEGREES: f64 = 5.0;
 /// Quality of the derived grayscale JPEG, as the generator's default.
 pub(crate) const JPEG_QUALITY: u8 = 88;
 /// One WMS tile's side in pixels. A hemisphere is fetched as a grid of this
@@ -195,113 +186,72 @@ pub(crate) fn stitch(west: &GrayMap, east: &GrayMap) -> GrayMap {
     GrayMap::new(width, height, pixels).expect("stitched rectangle")
 }
 
-/// Slide a window over `values` and take the window's middle element.
-///
-/// The window is clamped at the ends; with an even count the upper middle is
-/// taken, as the generator's `np.sort` window does.
-fn median_smooth(values: &[usize], half: usize) -> Vec<usize> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let lo = i.saturating_sub(half);
-            let hi = (i + half + 1).min(values.len());
-            let mut window = values[lo..hi].to_vec();
-            window.sort_unstable();
-            window[window.len() / 2]
-        })
-        .collect()
-}
-
-/// Drop the polar blind zone column by column, then stretch what is left.
-///
-/// The service paints the unseen polar cap solid white and the disc edge
-/// around it is antialiased to near-white, which the coverage curve reads as
-/// thick cloud. That boundary is a curve in equirectangular space, so a
-/// single horizontal cut cannot remove it: each column finds its own first
-/// and last usable row within the top and bottom thirds, a span that starts
-/// too low or ends too high makes both edges fall back to a fixed band, the
-/// edges are median-smoothed to kill single-column spikes, and what remains
-/// is stretched across the full height.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "row indices and fractions of a fixed-size image"
-)]
-pub(crate) fn trim_poles(image: &GrayMap) -> GrayMap {
+// Only pole-connected near-white runs are missing; bright interior clouds remain valid.
+fn trim_poles(image: &GrayMap) -> (GrayMap, Vec<std::ops::Range<usize>>) {
     let width = image.width as usize;
     let height = image.height as usize;
-    let third = height / 3;
-    let quarter = height / 4;
-    let fallback_top = (TRIM_FALLBACK * height as f64) as usize;
-    let fallback_bottom = height.saturating_sub(fallback_top);
-
-    let mut tops = Vec::with_capacity(width);
-    let mut bottoms = Vec::with_capacity(width);
+    let mut masked = image.clone();
+    let mut bounds = Vec::with_capacity(width);
     for x in 0..width {
-        // First row from the top (within the top third) that is not
-        // blind-zone white. An all-white window ends the search at its edge,
-        // as the generator's argmax of an all-false window does.
-        let top = (0..third)
+        let top = (0..height)
             .find(|&y| image.pixels[y * width + x] < TRIM_THRESHOLD)
-            .unwrap_or(third);
-        // Last row from the bottom (within the bottom third) that is not
-        // blind-zone white; an all-white window stops at 2h/3.
-        let bottom = (third * 2..height)
-            .rev()
-            .find(|&y| image.pixels[y * width + x] < TRIM_THRESHOLD)
-            .unwrap_or(third * 2);
-        tops.push(top);
-        bottoms.push(bottom);
-    }
-    // A usable span that starts too low or ends too high is suspicious; the
-    // generator falls back to a fixed band, for both edges together.
-    for i in 0..width {
-        if tops[i] >= quarter || bottoms[i] <= 3 * quarter {
-            tops[i] = fallback_top;
-            bottoms[i] = fallback_bottom;
+            .unwrap_or(height);
+        let bottom = (top..height)
+            .rfind(|&y| image.pixels[y * width + x] < TRIM_THRESHOLD)
+            .map_or(top, |y| y + 1);
+        for y in (0..top).chain(bottom..height) {
+            masked.pixels[y * width + x] = 0.0;
         }
+        bounds.push(top..bottom);
     }
-    let tops = median_smooth(&tops, TRIM_SMOOTH_HALF);
-    let bottoms = median_smooth(&bottoms, TRIM_SMOOTH_HALF);
-
-    let mut out = vec![0.0f32; width * height];
-    for x in 0..width {
-        // Slice indices stay in range, the way Python's slice clamps them;
-        // only a fixture smaller than the fallback band can reach this.
-        let top = tops[x].min(height.saturating_sub(1));
-        let bottom = bottoms[x].min(height.saturating_sub(1)).max(top);
-        let n = bottom - top + 1;
-        for y in 0..height {
-            // np.interp of the column over np.linspace(0, 1, n), sampled at
-            // np.linspace(0, 1, height): position y/(h-1)*(n-1), mixed
-            // linearly between its neighboring column rows.
-            let pos = if height > 1 {
-                y as f64 / (height as f64 - 1.0) * (n as f64 - 1.0)
-            } else {
-                0.0
-            };
-            let i = (pos as usize).min(n - 1);
-            let frac = (pos - i as f64) as f32;
-            let a = image.pixels[(top + i) * width + x];
-            let b = if i + 1 < n {
-                image.pixels[(top + i + 1) * width + x]
-            } else {
-                a
-            };
-            out[y * width + x] = a + (b - a) * frac;
-        }
-    }
-    GrayMap::new(image.width, image.height, out).expect("trimmed rectangle")
+    (masked, bounds)
 }
 
-/// Turn IR brightness into cloud coverage.
-///
-/// Values at or above [`NO_DATA_THRESHOLD`] are leftover blind-zone white,
-/// not cloud, and map to clear sky. `gamma` follows the generator's
-/// `v ** gamma` convention (gamma below 1 brightens midtones):
-/// `clamp((255v - floor) / (ceiling - floor), 0, 1) ** gamma`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "image row distances are small; coverage is stored in f32"
+)]
+fn feather_poles(image: &mut GrayMap, bounds: &[std::ops::Range<usize>]) {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let fade_rows = f64::from(image.height) * POLAR_FADE_DEGREES / 180.0;
+    for y in 0..height {
+        let center = y as f64 + 0.5;
+        for (x, support) in bounds.iter().enumerate() {
+            let pixel = &mut image.pixels[y * width + x];
+            if !support.contains(&y) {
+                *pixel = 0.0;
+                continue;
+            }
+            let mut distance = fade_rows;
+            if support.start > 0 {
+                distance = distance.min(center - support.start as f64);
+            }
+            if support.end < height {
+                distance = distance.min(support.end as f64 - center);
+            }
+            let t = (distance / fade_rows).clamp(0.0, 1.0);
+            *pixel *= (t * t * (3.0 - 2.0 * t)) as f32;
+        }
+    }
+}
+
+fn process_map(image: &GrayMap, settings: &EumetsatSettings) -> GrayMap {
+    let (masked, bounds) = trim_poles(image);
+    let map = to_coverage(&masked, settings);
+    drop(masked);
+    // Mask before blur and fade after it, so blind-zone white cannot bleed into the clouds.
+    let mut map = if settings.blur > 0.0 {
+        gaussian_blur(&map, settings.blur)
+    } else {
+        map
+    };
+    feather_poles(&mut map, &bounds);
+    map
+}
+
+/// Map masked IR brightness to coverage with gamma below one brightening midtones.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the coverage curve runs in f32 like the rest of the pipeline"
@@ -317,12 +267,8 @@ pub(crate) fn to_coverage(image: &GrayMap, settings: &EumetsatSettings) -> GrayM
         .pixels
         .iter()
         .map(|&v| {
-            if v >= NO_DATA_THRESHOLD {
-                0.0
-            } else {
-                let t = ((f64::from(v) - floor) / span).clamp(0.0, 1.0) as f32;
-                t.powf(gamma)
-            }
+            let t = ((f64::from(v) - floor) / span).clamp(0.0, 1.0) as f32;
+            t.powf(gamma)
         })
         .collect();
     GrayMap::new(image.width, image.height, pixels).expect("same rectangle")
@@ -539,7 +485,7 @@ pub struct EumetsatCloudSource {
 /// The processing algorithm's version, stored in every derived map's
 /// metadata. Bump when the math changes, so stale derivations are
 /// recomputed rather than served.
-const ALGORITHM_VERSION: u32 = 1;
+const ALGORITHM_VERSION: u32 = 2;
 
 /// The raw pair's manifest, the commit point of a stored round: written last,
 /// after both PNGs are on disk and verified.
@@ -717,13 +663,12 @@ impl EumetsatCloudSource {
         }
     }
 
-    /// What one round's cache entry is named after: the layer and the
-    /// hemisphere size. The processing parameters are deliberately absent —
-    /// a parameter change must reuse the same derived file rather than
-    /// accumulate one per tuning — so the key names the imagery, not the
-    /// look.
+    /// The startup cache names the layer, hemisphere size and algorithm, so
+    /// an old stretched map cannot load before reprocessing. Tuning remains
+    /// absent: parameter edits reuse the same derived file rather than
+    /// accumulating files. Raw-pair names are independent of this identity.
     fn identity(px: u32) -> String {
-        format!("{LAYER}|{px}")
+        format!("{LAYER}|{px}|v{ALGORITHM_VERSION}")
     }
 
     /// Set the round's visible phase; an empty string clears it. The download
@@ -1289,14 +1234,8 @@ impl EumetsatCloudSource {
         started: Instant,
     ) -> Result<Vec<u8>, String> {
         let stitched = stitch(west, east);
-        let map = trim_poles(&stitched);
+        let map = process_map(&stitched, &self.settings);
         drop(stitched);
-        let map = to_coverage(&map, &self.settings);
-        let map = if self.settings.blur > 0.0 {
-            gaussian_blur(&map, self.settings.blur)
-        } else {
-            map
-        };
         let bytes = encode_jpeg(&map);
         info!(
             bytes = bytes.len(),
@@ -1492,10 +1431,7 @@ mod tests {
         assert_eq!(LAYER, "mumi:worldcloudmap_ir108");
         assert_eq!(HEMISPHERES[0], ("west", "-90,-180,90,0"));
         assert_eq!(HEMISPHERES[1], ("east", "-90,0,90,180"));
-        assert!((NO_DATA_THRESHOLD - 254.0 / 255.0).abs() < f32::EPSILON);
         assert!((TRIM_THRESHOLD - 236.0 / 255.0).abs() < f32::EPSILON);
-        assert_eq!(TRIM_SMOOTH_HALF, 24);
-        assert!((TRIM_FALLBACK - 0.09).abs() < f64::EPSILON);
         assert_eq!(JPEG_QUALITY, 88);
         assert_eq!(REQUEST_TIMEOUT, Duration::from_mins(5));
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(15));
@@ -1546,83 +1482,282 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_single_column_spike_is_removed_by_the_median_window() {
-        let values = [5usize, 5, 9, 5, 5];
-        assert_eq!(median_smooth(&values, 2), [5, 5, 5, 5, 5]);
-    }
-
-    /// White polar caps whose edge follows a gentle curve over the columns,
-    /// the same fixture the generator's tests use.
-    fn blind_zone_image(width: u32, height: u32) -> GrayMap {
-        let w = width as usize;
-        let h = height as usize;
-        let mut pixels = vec![0.3f32; w * h];
-        for x in 0..w {
-            let edge = 12 + (4 * x) / w;
-            for y in 0..edge {
-                pixels[y * w + x] = 1.0;
-            }
-            for y in h - edge..h {
-                pixels[y * w + x] = 1.0;
+    /// Irregular caps spanning 74..81 N and 65..81 S, with antialiased white.
+    fn irregular_caps() -> GrayMap {
+        let (w, h) = (128usize, 180usize);
+        let mut image = gray(128, 180, 0.0);
+        for y in 0..h {
+            for x in 0..w {
+                let cap = y < 9 + (x * 7) % 8 || y >= h - (9 + (x * 11) % 17);
+                image.pixels[y * w + x] = if cap {
+                    f32::from([236u8, 247, 254, 255][(x + y) % 4]) / 255.0
+                } else {
+                    // Every valid sample is distinct, so resampling cannot hide.
+                    #[expect(clippy::cast_precision_loss, reason = "small fixture indices")]
+                    let value = 0.1 + (y * w + x) as f32 / (w * h) as f32 * 0.6;
+                    value
+                };
             }
         }
-        GrayMap::new(width, height, pixels).unwrap()
+        image
     }
 
     #[test]
-    fn trim_poles_removes_the_curved_caps_and_keeps_the_interior() {
-        let image = blind_zone_image(128, 96);
-        let result = trim_poles(&image);
-        assert_eq!(result.width(), 128);
-        assert_eq!(result.height(), 96);
-        // The solid white caps disappear from the stretched output. The
-        // median-smoothed edges can still catch a column or two of the curved
-        // rim, so the guarantee is about the cap as a region.
-        let w = 128usize;
-        let input_white = (0..9 * w).filter(|&i| image.pixels()[i] >= 0.99).count();
-        assert_eq!(input_white, 9 * w);
-        let output_white = (0..9 * w).filter(|&i| result.pixels()[i] >= 0.99).count();
-        // 0.05 as a ratio of counts: one twentieth.
-        assert!(
-            output_white * 20 < 9 * w,
-            "{output_white} white pixels left in the top nine rows"
-        );
-        #[expect(clippy::cast_precision_loss, reason = "a mean over a small fixture")]
-        let mean: f32 = result.pixels().iter().sum::<f32>() / result.pixels().len() as f32;
-        assert!((mean - 0.3).abs() < 0.05, "interior mean {mean} moved");
-    }
-
-    #[test]
-    fn near_white_caps_are_trimmed_under_the_236_threshold() {
-        let mut image = blind_zone_image(128, 96);
-        // 247/255 is below the no-data cutoff but above the trim threshold:
-        // the disc edge antialiased to near-white must still be trimmed.
-        let w = 128usize;
-        for i in 0..12 * w {
-            image.pixels[i] = 247.0 / 255.0;
-            image.pixels[84 * w + i] = 247.0 / 255.0;
+    #[expect(
+        clippy::float_cmp,
+        reason = "unchanged samples and the mask must be exact"
+    )]
+    fn trim_poles_preserves_every_valid_coordinate_without_poleward_copies() {
+        let image = irregular_caps();
+        let (result, _) = trim_poles(&image);
+        assert_eq!((result.width(), result.height()), (128, 180));
+        for y in 0..180 {
+            for x in 0..128 {
+                let i = y * 128 + x;
+                let cap = y < 9 + (x * 7) % 8 || y >= 180 - (9 + (x * 11) % 17);
+                let expected = if cap { 0.0 } else { image.pixels[i] };
+                assert_eq!(result.pixels[i], expected, "coordinate ({x}, {y}) moved");
+            }
         }
-        let result = trim_poles(&image);
-        let output_white = (0..9 * 128).filter(|&i| result.pixels()[i] >= 0.99).count();
-        // 0.05 as a ratio of counts: one twentieth.
-        assert!(
-            output_white * 20 < 9 * 128,
-            "{output_white} white pixels left in the top nine rows"
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "masking must preserve exact zeros and untouched samples"
+    )]
+    fn all_white_columns_and_deep_caps_never_fall_back_to_valid_data() {
+        let mut image = gray(8, 180, 0.4);
+        for y in 0..180 {
+            image.pixels[y * 8] = 247.0 / 255.0;
+            image.pixels[y * 8 + 7] = 1.0;
+            if !(80..100).contains(&y) {
+                image.pixels[y * 8 + 3] = 1.0;
+            }
+        }
+        let (result, _) = trim_poles(&image);
+        let processed = process_map(
+            &image,
+            &EumetsatSettings {
+                blur: 1.0,
+                ..EumetsatSettings::default()
+            },
         );
+        for y in 0..180 {
+            assert_eq!(
+                processed.pixels[y * 8],
+                0.0,
+                "blur cannot revive an empty column"
+            );
+            assert_eq!(processed.pixels[y * 8 + 7], 0.0);
+            assert_eq!(result.pixels[y * 8], 0.0);
+            assert_eq!(result.pixels[y * 8 + 7], 0.0);
+            assert_eq!(result.pixels[y * 8 + 1], 0.4, "neighbor remains valid");
+            assert_eq!(
+                result.pixels[y * 8 + 3],
+                if (80..100).contains(&y) { 0.4 } else { 0.0 }
+            );
+        }
+        for fill in [236.0 / 255.0, 1.0] {
+            assert!(
+                trim_poles(&gray(8, 180, fill))
+                    .0
+                    .pixels
+                    .iter()
+                    .all(|&v| v == 0.0)
+            );
+        }
     }
 
     #[test]
-    fn an_all_white_map_falls_back_to_the_fixed_band_and_stays_finite() {
-        let image = gray(128, 96, 1.0);
-        let result = trim_poles(&image);
-        assert_eq!(result.width(), 128);
-        assert_eq!(result.height(), 96);
-        assert!(result.pixels().iter().all(|v| v.is_finite()));
+    fn one_row_and_full_data_maps_keep_their_boundaries() {
+        let row = GrayMap::new(4, 1, vec![0.1, 1.0, 0.7, 247.0 / 255.0]).unwrap();
+        assert_eq!(trim_poles(&row).0.pixels, [0.1, 0.0, 0.7, 0.0]);
+        let mut full = gray(16, 16, 0.5);
+        for y in 0..16 {
+            for x in 0..16 {
+                full.pixels[y * 16 + x] = f32::from(u8::try_from(x + y * 13).unwrap()) / 255.0;
+            }
+        }
+        assert_eq!(trim_poles(&full).0.pixels, full.pixels);
+        let settings = EumetsatSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+        };
+        assert_eq!(process_map(&full, &settings).pixels, full.pixels);
+        assert_eq!(process_map(&row, &settings).pixels, [0.1, 0.0, 0.7, 0.0]);
+        // A single supported latitude row is retained, not duplicated into
+        // the blind zone; the two fades meet at its nearest boundary.
+        let mut single = gray(4, 180, 1.0);
+        single.pixels[90 * 4..91 * 4].fill(0.5);
+        let processed = process_map(&single, &settings);
+        for y in 0..180 {
+            let expected = if y == 90 { 0.5 * 0.028 } else { 0.0 };
+            assert!((processed.pixels[y * 4] - expected).abs() < 1e-7);
+        }
+    }
+
+    /// Exercise the real storage pipeline without a disk cache or network.
+    fn processed_fixture(image: &GrayMap, settings: EumetsatSettings) -> image::GrayImage {
+        let px = image.height();
+        assert_eq!(image.width(), 2 * px);
+        let mut west = Vec::new();
+        let mut east = Vec::new();
+        for row in image.pixels.chunks_exact(image.width() as usize) {
+            west.extend_from_slice(&row[..px as usize]);
+            east.extend_from_slice(&row[px as usize..]);
+        }
+        let source = EumetsatCloudSource::new(settings, None);
+        let bytes = source
+            .process_and_store(
+                px,
+                &GrayMap::new(px, px, west).unwrap(),
+                &GrayMap::new(px, px, east).unwrap(),
+                "fixture-west",
+                "fixture-east",
+                Instant::now(),
+            )
+            .unwrap();
+        image::load_from_memory(&bytes).unwrap().into_luma8()
+    }
+
+    fn flat_caps(height: u32, top: u32, bottom: u32, value: f32) -> GrayMap {
+        let mut image = gray(2 * height, height, value);
+        let w = image.width() as usize;
+        image.pixels[..top as usize * w].fill(247.0 / 255.0);
+        image.pixels[bottom as usize * w..].fill(1.0);
+        image
     }
 
     #[test]
-    fn coverage_maps_no_data_white_to_clear_sky() {
+    fn the_feather_is_five_degrees_smoothstep_after_gamma_at_sample_centers() {
+        let settings = EumetsatSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 0.5,
+            blur: 0.0,
+        };
+        let coarse = processed_fixture(&flat_caps(180, 18, 162, 0.5), settings.clone());
+        let fine = processed_fixture(&flat_caps(540, 54, 486, 0.5), settings);
+        let mut previous = 0u8;
+        for offset in 0..8u32 {
+            let north = coarse.get_pixel(90, 18 + offset).0[0];
+            let south = coarse.get_pixel(90, 161 - offset).0[0];
+            let higher_resolution = fine.get_pixel(270, 54 + 3 * offset + 1).0[0];
+            let t = ((f64::from(offset) + 0.5) / 5.0).min(1.0);
+            let expected = 255.0 * 0.5f64.sqrt() * t * t * (3.0 - 2.0 * t);
+            assert!(
+                (f64::from(north) - expected).abs() <= 3.0,
+                "row {offset}: {north} vs {expected}"
+            );
+            assert!(north >= previous, "fade must be monotonic into support");
+            assert!(
+                north.abs_diff(south) <= 3,
+                "both boundaries use sample centers"
+            );
+            assert!(
+                north.abs_diff(higher_resolution) <= 3,
+                "latitude width must not depend on resolution"
+            );
+            previous = north;
+        }
+    }
+
+    #[test]
+    fn gamma_and_blur_do_not_resurrect_caps_or_blur_their_white_into_support() {
+        let settings = EumetsatSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 0.5,
+            blur: 1.0,
+        };
+        let image = flat_caps(180, 18, 162, 0.25);
+        let float_map = process_map(&image, &settings);
+        let result = processed_fixture(&image, settings);
+        // Independent reference: zero no-data BEFORE blur, feather AFTER it.
+        let mut reference = gray(360, 180, 0.5);
+        reference.pixels[..18 * 360].fill(0.0);
+        reference.pixels[162 * 360..].fill(0.0);
+        let reference = gaussian_blur(&reference, 1.0);
+        for y in 0..180u32 {
+            let distance = f64::from(y).min(179.0 - f64::from(y)) + 0.5 - 18.0;
+            let t = (distance / 5.0).clamp(0.0, 1.0);
+            let expected = f64::from(reference.pixels[y as usize * 360 + 90])
+                * t
+                * t
+                * (3.0 - 2.0 * t)
+                * 255.0;
+            let actual = result.get_pixel(90, y).0[0];
+            // JPEG is lossy, but the pre-encode no-data mask must be exact.
+            assert!(
+                (f64::from(actual) - expected).abs() <= 3.0,
+                "row {y}: {actual} vs {expected}"
+            );
+            assert!(
+                (f64::from(float_map.pixels[y as usize * 360 + 90]) - expected / 255.0).abs()
+                    < 1e-7
+            );
+            if !(18..162).contains(&y) {
+                assert!(
+                    float_map.pixels[y as usize * 360..(y as usize + 1) * 360]
+                        .iter()
+                        .all(|&v| v == 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bright_interior_clouds_are_retained_even_when_saturated() {
+        let settings = EumetsatSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+        };
+        let mut image = flat_caps(64, 8, 56, 0.4);
+        for y in 24..40 {
+            for x in 0..128 {
+                image.pixels[y * 128 + x] = f32::from([236u8, 247, 254, 255][x / 32]) / 255.0;
+            }
+        }
+        let result = processed_fixture(&image, settings);
+        for (x, expected) in [(16, 236u8), (48, 247), (80, 254), (112, 255)] {
+            let actual = result.get_pixel(x, 32).0[0];
+            assert!(
+                actual.abs_diff(expected) <= 2,
+                "interior cloud at {x}: {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn processing_does_not_fade_edges_without_a_cap() {
+        let settings = EumetsatSettings {
+            floor: 0,
+            ceiling: 255,
+            gamma: 1.0,
+            blur: 0.0,
+        };
+        for (top, bottom) in [(0, 64), (0, 56), (8, 64)] {
+            let result = processed_fixture(&flat_caps(64, top, bottom, 0.4), settings.clone());
+            if top == 0 {
+                assert!(result.get_pixel(32, 0).0[0].abs_diff(102) <= 2);
+            }
+            if bottom == 64 {
+                assert!(result.get_pixel(32, 63).0[0].abs_diff(102) <= 2);
+            }
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "saturated coverage must map to exactly one"
+    )]
+    fn coverage_keeps_saturated_values_after_the_support_mask() {
         let image = GrayMap::new(1, 2, vec![1.0, 253.0 / 255.0]).unwrap();
         let settings = EumetsatSettings {
             floor: 0,
@@ -1631,7 +1766,11 @@ mod tests {
             blur: 0.0,
         };
         let result = to_coverage(&image, &settings);
-        assert!(result.pixels()[0] < 0.01, "no-data maps to clear sky");
+        assert_eq!(
+            result.pixels()[0],
+            1.0,
+            "the mask, not brightness, rejects no-data"
+        );
         assert!(result.pixels()[1] > 0.9, "253/255 is cloud, not no-data");
     }
 
@@ -1679,10 +1818,8 @@ mod tests {
 
     #[test]
     fn the_pipeline_keeps_north_up_and_west_first() {
-        // A west half at 0.2 and an east half at 0.8, blind zone included:
-        // after trim and coverage, the west stays the dimmer left half and
-        // the north row matches the south row, which the per-column stretch
-        // preserves because it works along latitude only.
+        // The blind zone stays empty and each hemisphere's valid samples
+        // keep their original longitude and latitude.
         let w = 64usize;
         let h = 32usize;
         let west = gray(32, 32, 0.2);
@@ -1698,11 +1835,13 @@ mod tests {
             gamma: 1.0,
             blur: 0.0,
         };
-        let covered = to_coverage(&trim_poles(&image), &settings);
-        let nw = covered.pixels()[0];
-        let ne = covered.pixels()[w / 2];
-        let sw = covered.pixels()[(h - 1) * w];
-        let se = covered.pixels()[(h - 1) * w + w / 2];
+        let covered = to_coverage(&trim_poles(&image).0, &settings);
+        assert!(covered.pixels()[..w].iter().all(|&v| v == 0.0));
+        assert!(covered.pixels()[(h - 1) * w..].iter().all(|&v| v == 0.0));
+        let nw = covered.pixels()[w];
+        let ne = covered.pixels()[w + w / 2];
+        let sw = covered.pixels()[(h - 2) * w];
+        let se = covered.pixels()[(h - 2) * w + w / 2];
         assert!(nw < 0.3, "north-west stays west-dim: {nw}");
         assert!(ne > 0.7, "north-east stays east-bright: {ne}");
         assert!(sw < 0.3, "south-west stays west-dim: {sw}");
@@ -1950,6 +2089,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn algorithm_v2_invalidates_the_v1_startup_cache_identity() {
+        let source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        let legacy = CloudTarget::eumetsat(&format!("{LAYER}|1024"));
+        let current = source.prepare(2048);
+        assert_ne!(
+            current.cache_key, legacy.cache_key,
+            "stretched v1 startup map must not be served"
+        );
+        assert_eq!(ALGORITHM_VERSION, 2);
+        assert_eq!(
+            EumetsatCloudSource::identity(1024),
+            format!("{LAYER}|1024|v{ALGORITHM_VERSION}")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The raw pair and the derived map caches
     // -----------------------------------------------------------------------
@@ -2086,6 +2241,43 @@ mod tests {
         assert!(
             !retuned.derived_matches(16, &hashes.0, &hashes.1),
             "the tuning moved, the derivation is stale"
+        );
+    }
+
+    #[test]
+    fn v1_derived_metadata_is_rebuilt_without_redownloading_or_rewriting_raw() {
+        let (scratch, mut source) = scratch_cache("eumetsat_v1_reprocess");
+        store_round(&source, 60, 90);
+        let raw_path = scratch.join("eumetsat_raw_16_meta.toml");
+        let mut raw_meta: RawManifest =
+            toml::from_str(&std::fs::read_to_string(&raw_path).unwrap()).unwrap();
+        raw_meta.algorithm = 1;
+        raw_meta.fetched_epoch_secs = 1; // Even old raw remains reusable on first fetch.
+        let raw_text = toml::to_string(&raw_meta).unwrap();
+        std::fs::write(&raw_path, &raw_text).unwrap();
+        let meta_path = scratch.join("eumetsat_map_32x16_meta.toml");
+        let mut old: DerivedMeta =
+            toml::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        old.algorithm = 1;
+        std::fs::write(&meta_path, toml::to_string(&old).unwrap()).unwrap();
+        let pair = source.load_raw_pair(16).expect("v1 raw is reusable");
+        let (agent, calls) = stub_agent(|_| panic!("algorithm migration must not download"));
+        source.agent = agent;
+        let result = source.fetch_if_changed(None).unwrap();
+        assert!(result.is_some(), "the v1 derived map must be rebuilt");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let meta: DerivedMeta =
+            toml::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(meta.algorithm, 2);
+        assert!(source.derived_matches(16, &pair.hashes.0, &pair.hashes.1));
+        assert_eq!(std::fs::read_to_string(raw_path).unwrap(), raw_text);
+        assert_eq!(
+            std::fs::read(scratch.join("eumetsat_raw_west_16.png")).unwrap(),
+            pair.west
+        );
+        assert_eq!(
+            std::fs::read(scratch.join("eumetsat_raw_east_16.png")).unwrap(),
+            pair.east
         );
     }
 

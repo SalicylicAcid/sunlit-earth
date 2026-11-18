@@ -171,9 +171,7 @@ fn prepare_remote(remote: &RemoteCloudUrl, resolution: u32) -> (String, CloudTar
 }
 
 impl CloudTarget {
-    /// Identity of a native EUMETSAT round: the layer, the processing settings
-    /// and the hemisphere size arrive as one string and are hashed, so the key
-    /// names no other source's entry and carries no settings in the clear.
+    /// Hash the EUMETSAT layer, hemisphere size and algorithm version, excluding tuning parameters.
     pub(crate) fn eumetsat(identity: &str) -> Self {
         use std::fmt::Write;
         let mut key = "clouds_cache_eumetsat_".to_owned();
@@ -186,9 +184,7 @@ impl CloudTarget {
         }
     }
 
-    /// Identity of a native NSMC round, hashed under its own prefix the same
-    /// way [`CloudTarget::eumetsat`](Self::eumetsat) is: the layer and the
-    /// map size name the entry, the derivation parameters stay out of it.
+    /// Hash the NSMC layer, map size and algorithm version, excluding tuning parameters.
     pub(crate) fn nsmc(identity: &str) -> Self {
         use std::fmt::Write;
         let mut key = "clouds_cache_nsmc_".to_owned();

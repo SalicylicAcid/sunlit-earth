@@ -7,8 +7,8 @@
 //! fleet's 10.8 um infrared channels, one round an hour. A round is one
 //! `GetMap` request for the full globe at 4096x2048, and the response is an
 //! RGBA PNG whose **alpha channel carries the cloud intensity**: 0 is clear
-//! sky (and, above roughly 60 degrees of latitude, no data at all — the
-//! geostationary ring cannot see the poles), 255 the deepest convective
+//! sky or missing polar observations; the geostationary ring cannot see the
+//! poles. A value of 255 marks the deepest convective
 //! cloud. The RGB channels only echo that as a binary companion — white
 //! wherever any coverage is present, black elsewhere — so the derivation
 //! reads the alpha alone. Measured service quirks the constants below rest
@@ -23,9 +23,8 @@
 //! the stored raw mosaic against. That replaces the EUMETSAT source's
 //! freshness window — the list is the authority, so nothing is age-gated —
 //! and it means every poll costs one small JSON request even when the
-//! imagery is current. The pole handling stretches the outermost
-//! data-bearing rows across the blind bands, the same latitude-shift
-//! approximation the EUMETSAT pole trim makes.
+//! imagery is current. Missing polar caps stay empty, with a five-degree
+//! inward fade that never moves observed rows.
 //!
 //! The imagery requires attribution to the National Satellite Meteorological
 //! Center (CMA); see `assets/ATTRIBUTION.md`.
@@ -80,11 +79,6 @@ const WMS_VERSION: &str = "1.1.0";
 /// every variant derives from.
 const RAW_WIDTH: u32 = 4096;
 const RAW_HEIGHT: u32 = 2048;
-/// A row counts as data-bearing when at least this fraction of its pixels
-/// carry coverage: the polar no-data bands are whole rows of alpha zero,
-/// while a clear-sky row inside the data area still holds scattered thin
-/// cloud.
-const BAND_ROW_FRACTION: f64 = 0.5;
 /// One request's timeout, as the EUMETSAT source's: the service renders the
 /// full globe on the fly, which measured about half a minute for the 4K PNG.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
@@ -107,7 +101,7 @@ const REST_SLICE: Duration = Duration::from_millis(100);
 /// The processing algorithm's version, stored in every derived map's
 /// metadata. Bump when the math changes, so stale derivations are
 /// recomputed rather than served.
-const ALGORITHM_VERSION: u32 = 1;
+const ALGORITHM_VERSION: u32 = 3;
 
 /// The `GetMap` request for one round, at the fixed raw size. The service's
 /// own parameter spelling is lowercase, and the bbox is longitude,latitude
@@ -289,12 +283,9 @@ impl NsmcCloudSource {
         }
     }
 
-    /// What one round's cache entry is named after: the layer and the map
-    /// size. The derivation parameters are deliberately absent — a parameter
-    /// change must reuse the same derived file rather than accumulate one
-    /// per tuning — so the key names the imagery, not the look.
+    // The startup cache must not post imagery derived with a superseded coordinate mapping.
     fn identity(width: u32, height: u32) -> String {
-        format!("{LAYER}|{width}x{height}")
+        format!("{LAYER}|{width}x{height}|v{ALGORITHM_VERSION}")
     }
 
     /// Set the round's visible phase; an empty string clears it. The download
@@ -697,11 +688,7 @@ impl NsmcCloudSource {
             && meta.sha256 == sha256
     }
 
-    /// Process one round into the derived map, and store it with its
-    /// metadata: the polar bands filled, the map resized to the prepared
-    /// variant, the levels curve applied, the optional blur, and the
-    /// grayscale JPEG encoded. The stages run on the worker thread; the user
-    /// stop is checked between them.
+    /// Derive the resized coverage, blur it, fade missing polar edges, and cache the JPEG.
     fn derive_store_and_encode(
         &self,
         alpha: &[u8],
@@ -713,8 +700,7 @@ impl NsmcCloudSource {
         if self.cancelled() {
             return Err(Self::stop_error());
         }
-        let filled = fill_poles(alpha, RAW_WIDTH, RAW_HEIGHT);
-        let resized = resize_alpha(filled, RAW_WIDTH, RAW_HEIGHT, width, height);
+        let resized = resize_alpha(alpha.to_vec(), RAW_WIDTH, RAW_HEIGHT, width, height);
         if self.cancelled() {
             return Err(Self::stop_error());
         }
@@ -733,6 +719,7 @@ impl NsmcCloudSource {
         if self.cancelled() {
             return Err(Self::stop_error());
         }
+        let map = fade_poles(&map, alpha, RAW_WIDTH, RAW_HEIGHT);
         let bytes = encode_jpeg(&map);
         info!(
             bytes = bytes.len(),
@@ -851,71 +838,38 @@ fn validate_alpha(alpha: &[u8]) -> Result<(), FetchError> {
     }
 }
 
-/// Fill the polar no-data bands by stretching the outermost data-bearing
-/// rows across them.
-///
-/// The geostationary ring cannot see above roughly 60 degrees of latitude,
-/// so the mosaic arrives with whole bands of alpha zero at the top and the
-/// bottom — which the coverage curve reads as a cloudless cap. The band
-/// edges are found once, globally: the blind zone runs at nearly constant
-/// latitude, and a per-column search would chase clear-sky rows inside the
-/// data area. What the outermost data rows hold is then interpolated across
-/// the full height, the same latitude-shift approximation the EUMETSAT pole
-/// trim makes.
+// Alpha also encodes clear sky, so only the global outer empty rows define polar support.
 #[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "row indices and fractions of a fixed-size image"
+    clippy::cast_possible_truncation,
+    reason = "normalized row coordinates of a bounded image"
 )]
-fn fill_poles(alpha: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let threshold = (BAND_ROW_FRACTION * f64::from(width)) as usize;
-    let row_has_data =
-        |y: usize| alpha[y * w..(y + 1) * w].iter().filter(|&&a| a > 0).count() >= threshold;
-    let Some(top) = (0..h).find(|&y| row_has_data(y)) else {
-        // Nothing anywhere is data-bearing; the caller rejects such a round
-        // before this runs, and leaving the map alone costs nothing.
-        return alpha.to_vec();
-    };
-    let Some(bottom) = (top..h).rev().find(|&y| row_has_data(y)) else {
-        return alpha.to_vec();
-    };
-    if top == 0 && bottom == h - 1 {
-        return alpha.to_vec();
-    }
-    // np.interp of each column over the data band's rows, sampled across the
-    // full height: position y/(h-1)*(band-1), mixed linearly between its
-    // neighboring band rows.
-    let band = bottom - top + 1;
-    let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        let pos = if h > 1 {
-            y as f64 / (h as f64 - 1.0) * (band as f64 - 1.0)
-        } else {
-            0.0
-        };
-        let row_index = (pos as usize).min(band - 1);
-        let frac = (pos - row_index as f64) as f32;
-        let top_row = (top + row_index) * w;
-        let bottom_row = if row_index + 1 < band {
-            top_row + w
-        } else {
-            top_row
-        };
-        for x in 0..w {
-            let a = f32::from(alpha[top_row + x]);
-            let b = f32::from(alpha[bottom_row + x]);
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "an interpolated coverage byte, clamped before the cast"
-            )]
-            let value = (a + (b - a) * frac).round().clamp(0.0, 255.0) as u8;
-            out[y * w + x] = value;
+fn fade_poles(image: &GrayMap, alpha: &[u8], raw_width: u32, raw_height: u32) -> GrayMap {
+    let mut rows = alpha.chunks_exact(raw_width as usize);
+    let top = rows.clone().position(|row| row.iter().any(|&v| v > 0));
+    let bottom = rows.rposition(|row| row.iter().any(|&v| v > 0));
+    let mut pixels = image.pixels().to_vec();
+    if let (Some(top), Some(bottom)) = (top, bottom) {
+        let north = top as f64 / f64::from(raw_height);
+        let south = (bottom + 1) as f64 / f64::from(raw_height);
+        for (y, row) in pixels.chunks_exact_mut(image.width() as usize).enumerate() {
+            let latitude_row = (y as f64 + 0.5) / f64::from(image.height());
+            let from_north = if top == 0 { 1.0 } else { latitude_row - north };
+            let from_south = if bottom + 1 == raw_height as usize {
+                1.0
+            } else {
+                south - latitude_row
+            };
+            let t = (from_north.min(from_south) / (5.0 / 180.0)).clamp(0.0, 1.0);
+            let weight = (t * t * (3.0 - 2.0 * t)) as f32;
+            for value in row {
+                *value *= weight;
+            }
         }
+    } else {
+        pixels.fill(0.0);
     }
-    out
+    GrayMap::new(image.width(), image.height(), pixels).expect("the same rectangle")
 }
 
 /// Resize the coverage input from the fixed raw size to the prepared
@@ -1252,42 +1206,176 @@ mod tests {
         validate_alpha(&real).unwrap();
     }
 
+    fn polar_fixture(alpha: &[u8], width: u32, height: u32) -> GrayMap {
+        let image = GrayMap::new(
+            width,
+            height,
+            alpha.iter().map(|&v| f32::from(v) / 255.0).collect(),
+        )
+        .unwrap();
+        fade_poles(&image, alpha, width, height)
+    }
+
     #[test]
-    fn the_polar_bands_are_stretched_across_the_poles() {
-        // 8 rows: two no-data bands of two rows around a data band of four,
-        // every pixel of the band carrying one coverage value.
-        let mut alpha = vec![0u8; 8 * 8];
-        for y in 2..6 {
+    fn polar_fade_preserves_interior_coordinates_and_clear_rows() {
+        let mut alpha = vec![0u8; 8 * 180];
+        for y in 15..165 {
             for x in 0..8 {
-                alpha[y * 8 + x] = u8::try_from(100 + x * 10).unwrap();
+                alpha[y * 8 + x] = u8::try_from(y + x).unwrap();
             }
         }
-        let filled = fill_poles(&alpha, 8, 8);
-        // Every row now holds the band's own column values: the stretch is
-        // vertical, so a column's value is its band value everywhere.
-        for y in 0..8 {
-            for x in 0..8 {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the band value this row must land on"
-                )]
-                let expected = (100 + x * 10) as u8;
-                assert_eq!(filled[y * 8 + x], expected, "row {y}, column {x}");
+        alpha[40 * 8..41 * 8].fill(0);
+        let faded = polar_fixture(&alpha, 8, 180);
+        let expected: Vec<_> = alpha.iter().map(|&v| f32::from(v) / 255.0).collect();
+        assert_eq!(&faded.pixels()[20 * 8..160 * 8], &expected[20 * 8..160 * 8]);
+        assert!(faded.pixels()[..15 * 8].iter().all(|&v| v == 0.0));
+        assert!(faded.pixels()[165 * 8..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "unchanged samples and empty sky must be exact"
+    )]
+    fn polar_fade_keeps_sparse_clouds_without_copying_them_poleward() {
+        let mut alpha = vec![0u8; 8 * 180];
+        alpha[15 * 8 + 3] = 100;
+        alpha[25 * 8..155 * 8].fill(100);
+        alpha[164 * 8 + 6] = 100;
+        let faded = polar_fixture(&alpha, 8, 180);
+        for (&before, &after) in alpha.iter().zip(faded.pixels()) {
+            if before == 0 {
+                assert_eq!(after, 0.0);
+            }
+        }
+        assert!(faded.pixels()[15 * 8 + 3] > 0.0);
+        assert!(faded.pixels()[164 * 8 + 6] > 0.0);
+        assert_eq!(faded.pixels()[30 * 8 + 3], 100.0 / 255.0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "full support must keep the exact original value"
+    )]
+    fn polar_fade_is_smooth_and_symmetric_over_five_degrees() {
+        let mut alpha = vec![0u8; 180];
+        alpha[15..165].fill(255);
+        let faded = polar_fixture(&alpha, 1, 180);
+        for y in 15..20 {
+            let t = (f32::from(u16::try_from(y).unwrap()) + 0.5 - 15.0) / 5.0;
+            let expected = t * t * (3.0 - 2.0 * t);
+            assert!((faded.pixels()[y] - expected).abs() < 1e-5);
+            assert!((faded.pixels()[179 - y] - expected).abs() < 1e-5);
+        }
+        assert_eq!(faded.pixels()[20], 1.0);
+        assert_eq!(faded.pixels()[159], 1.0);
+    }
+
+    #[test]
+    fn polar_fade_uses_latitude_rather_than_output_pixel_count() {
+        let mut alpha = vec![0u8; 180];
+        alpha[15..165].fill(255);
+        let low = polar_fixture(&alpha, 1, 180);
+        let high_input = GrayMap::new(1, 540, vec![1.0; 540]).unwrap();
+        let high = fade_poles(&high_input, &alpha, 1, 180);
+        for y in 0..180 {
+            assert!((low.pixels()[y] - high.pixels()[3 * y + 1]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "observed support must remain exactly unchanged"
+    )]
+    fn polar_fade_leaves_an_observed_pole_alone() {
+        let mut alpha = vec![255u8; 180];
+        alpha[165..].fill(0);
+        let north = polar_fixture(&alpha, 1, 180);
+        assert!(north.pixels()[..160].iter().all(|&v| v == 1.0));
+        alpha.reverse();
+        let south = polar_fixture(&alpha, 1, 180);
+        assert!(south.pixels()[20..].iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "missing polar samples must remain exactly zero"
+    )]
+    fn polar_fade_never_extends_a_single_observed_row() {
+        let mut alpha = vec![0u8; 8 * 180];
+        alpha[30 * 8 + 2] = 75;
+        let faded = polar_fixture(&alpha, 8, 180);
+        assert!(faded.pixels()[30 * 8 + 2] > 0.0);
+        assert!(faded.pixels()[30 * 8 + 2] < 75.0 / 255.0);
+        for (i, &v) in faded.pixels().iter().enumerate() {
+            if i != 30 * 8 + 2 {
+                assert_eq!(v, 0.0);
             }
         }
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "full support must remain exactly unchanged"
+    )]
     fn a_map_with_data_at_both_edges_is_left_alone() {
-        let alpha = rgba_png(8, 8, 100);
-        let filled = fill_poles(&alpha, 8, 8);
-        assert_eq!(filled, alpha);
+        let alpha = decode_alpha_sized(&rgba_png(8, 8, 100), 8, 8).unwrap();
+        let faded = polar_fixture(&alpha, 8, 8);
+        assert!(faded.pixels().iter().all(|&v| v == 100.0 / 255.0));
     }
 
     #[test]
     fn an_all_clear_map_is_left_alone_for_the_caller_to_reject() {
         let alpha = vec![0u8; 8 * 8];
-        assert_eq!(fill_poles(&alpha, 8, 8), alpha);
+        assert!(
+            polar_fixture(&alpha, 8, 8)
+                .pixels()
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    #[test]
+    fn derivation_fades_after_gamma_and_blur_without_resurrecting_the_caps() {
+        let mut alpha = vec![0u8; (RAW_WIDTH * RAW_HEIGHT) as usize];
+        alpha[170 * RAW_WIDTH as usize..1878 * RAW_WIDTH as usize].fill(64);
+        let settings = NsmcSettings {
+            gamma: 0.3,
+            blur: 1.0,
+            ..pass_through()
+        };
+        let source = NsmcCloudSource::new(settings.clone(), None);
+        let bytes = source
+            .derive_store_and_encode(&alpha, 360, 180, "fixture", Instant::now())
+            .unwrap();
+        let output = image::load_from_memory(&bytes).unwrap().into_luma8();
+        let resized = resize_alpha(alpha, RAW_WIDTH, RAW_HEIGHT, 360, 180);
+        let input = GrayMap::new(
+            360,
+            180,
+            resized.into_iter().map(|v| f32::from(v) / 255.0).collect(),
+        )
+        .unwrap();
+        let baseline = gaussian_blur(&to_coverage(&input, &settings), settings.blur);
+        for y in [0u32, 5, 10, 169, 175, 179] {
+            assert_eq!(output.get_pixel(180, y)[0], 0, "row {y}");
+        }
+        for y in [16u16, 17, 18, 90, 161, 162, 163] {
+            let latitude_row = (f32::from(y) + 0.5) / 180.0;
+            let distance = (latitude_row - 170.0 / 2048.0).min(1878.0 / 2048.0 - latitude_row);
+            let t = (distance / (5.0 / 180.0)).clamp(0.0, 1.0);
+            let weight = t * t * (3.0 - 2.0 * t);
+            let expected = baseline.pixels()[usize::from(y) * 360 + 180] * weight * 255.0;
+            let actual = f32::from(output.get_pixel(180, u32::from(y))[0]);
+            assert!(
+                (actual - expected).abs() < 3.0,
+                "row {y}: {actual} != {expected}"
+            );
+        }
     }
 
     #[test]
@@ -1426,6 +1514,18 @@ mod tests {
     }
 
     #[test]
+    fn prepare_does_not_reuse_stretched_or_repeated_polar_startup_caches() {
+        let source = NsmcCloudSource::new(NsmcSettings::default(), None);
+        for resolution in [2048, 4096, 8192] {
+            let (width, height) = cloud_variant(resolution);
+            for suffix in ["", "|v2"] {
+                let old = CloudTarget::nsmc(&format!("{LAYER}|{width}x{height}{suffix}"));
+                assert_ne!(source.prepare(resolution).cache_key, old.cache_key);
+            }
+        }
+    }
+
+    #[test]
     fn the_status_composes_the_phase_and_the_progress_line() {
         let source = NsmcCloudSource::new(NsmcSettings::default(), None);
         assert_eq!(source.status(), None);
@@ -1553,6 +1653,56 @@ mod tests {
         assert!(scratch.join("nsmc_map_2048x1024.jpg").exists());
         assert!(!scratch.join("nsmc_map_2048x1024.jpg.tmp").exists());
         let _ = calls.load(Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_repeated_polar_derivation_is_rebuilt_from_the_unchanged_raw_mosaic() {
+        let scratch = crate::test_support::ScratchDir::new("nsmc_latitude_cache");
+        let (agent, calls) = stub_agent(|_, uri| {
+            assert!(
+                uri.contains("datatime/mongodb"),
+                "unexpected download: {uri}"
+            );
+            Ok(list_response(&round_list_body()))
+        });
+        let settings = pass_through();
+        let source = test_source(settings.clone(), Some(scratch.path().to_path_buf()), agent);
+        source.prepare(2048);
+        let raw = rgba_png(RAW_WIDTH, RAW_HEIGHT, 120);
+        source.store_raw(&raw, "202611142300").unwrap();
+        let raw_meta = std::fs::read(scratch.join("nsmc_raw_meta.toml")).unwrap();
+        let sha = sha256_hex(&raw);
+        let old_meta = DerivedMeta {
+            version: 1,
+            algorithm: 2,
+            floor: settings.floor,
+            ceiling: settings.ceiling,
+            gamma: settings.gamma,
+            blur: settings.blur,
+            cap: settings.cap,
+            sha256: sha.clone(),
+        };
+        std::fs::write(scratch.join("nsmc_map_2048x1024.jpg"), b"old derived map").unwrap();
+        std::fs::write(
+            scratch.join("nsmc_map_2048x1024_meta.toml"),
+            toml::to_string(&old_meta).unwrap(),
+        )
+        .unwrap();
+        assert!(!source.derived_matches(2048, 1024, &sha));
+        let image = source
+            .fetch_if_changed(None)
+            .unwrap()
+            .expect("the old derivation must be replaced");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the round list");
+        let decoded = image::load_from_memory(&image.bytes).unwrap().into_luma8();
+        assert_eq!(decoded.dimensions(), (2048, 1024));
+        assert!(decoded.get_pixel(1024, 512)[0].abs_diff(120) < 2);
+        assert!(source.derived_matches(2048, 1024, &sha));
+        assert_eq!(std::fs::read(scratch.join("nsmc_raw.png")).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(scratch.join("nsmc_raw_meta.toml")).unwrap(),
+            raw_meta
+        );
     }
 
     #[test]
