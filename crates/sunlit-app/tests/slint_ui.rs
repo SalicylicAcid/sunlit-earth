@@ -10595,8 +10595,38 @@ fn every_slider_producible_draft_applies_inside_the_domain() {
 /// debounced save reads it into the config; the defaults push puts the
 /// one-hour default back.
 #[test]
+fn test_native_clouds_show_their_publication_schedule_instead_of_a_poll_interval() {
+    let SourceWindow { window, .. } = create_source_window();
+    for mode in [0, 1, 2] {
+        let mut draft = window.get_cloud_source_draft();
+        draft.mode = mode;
+        window.set_cloud_source_draft(draft);
+        assert_eq!(
+            param_row_present(&window, "MainWindow::cloud-poll-spinbox"),
+            mode == 2
+        );
+        assert_eq!(
+            param_row_present(&window, "MainWindow::cloud-publication-note"),
+            mode != 2
+        );
+    }
+    window.set_cloud_source_override(true);
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 0;
+    window.set_cloud_source_draft(draft);
+    assert!(param_row_present(&window, "MainWindow::cloud-poll-spinbox"));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-publication-note"
+    ));
+}
+
+#[test]
 fn test_the_cloud_poll_spinbox_saves_and_reaches_the_engine() {
     let SourceWindow { window, link, sent } = create_source_window();
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 2;
+    window.set_cloud_source_draft(draft);
     // The changed callback is a change registration, not an action one.
     ui_callbacks::register_change_callbacks(&window, &link);
     assert_eq!(window.get_cloud_poll_mins(), 60);
@@ -10649,7 +10679,14 @@ fn test_show_clouds_hides_the_whole_source_section() {
         clouds
     });
     assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
-    assert!(param_row_present(&window, "MainWindow::cloud-poll-spinbox"));
+    assert!(param_row_present(
+        &window,
+        "MainWindow::cloud-publication-note"
+    ));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-poll-spinbox"
+    ));
     assert!(param_row_present(&window, "MainWindow::cloud-floor-slider"));
 
     window.set_clouds({

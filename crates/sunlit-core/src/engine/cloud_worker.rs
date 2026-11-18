@@ -16,7 +16,7 @@ use std::time::Duration;
 use crossbeam_channel::{Sender, TryRecvError, bounded};
 use tracing::{debug, info, warn};
 
-use super::schedule::Schedule;
+use super::schedule::{RoundSchedule, Schedule};
 use crate::assets::cloud_fetcher::{CloudUpdater, PollOutcome, RetryBackoff};
 use crate::assets::cloud_source::CloudSource;
 use crate::assets::mailbox::TextureMailbox;
@@ -50,6 +50,7 @@ pub(super) struct CloudWorker {
     /// wallpaper's cloud wait and the headless waits follow.
     wait_ms: Arc<AtomicU64>,
     pub(super) schedule: Schedule,
+    rounds: RoundSchedule,
     /// A poll came due but the worker was busy, so it still owes one. Kept
     /// separate from the schedule so a busy worker does not drag the deadline
     /// backwards and forwards on every tick.
@@ -111,8 +112,30 @@ impl CloudWorker {
 
     /// Hand the worker a new source, replacing any switch not yet applied:
     /// rapid applies leave only the last one behind.
-    pub(super) fn set_source(&self, source: Arc<dyn CloudSource>) {
+    pub(super) fn set_source(&mut self, source: Arc<dyn CloudSource>) {
         *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(source);
+        self.rounds = RoundSchedule::default();
+    }
+
+    pub(super) fn scheduled_due(
+        &mut self,
+        elapsed: Duration,
+        utc: time::OffsetDateTime,
+        enabled: bool,
+    ) -> bool {
+        let fetching = self.fetching();
+        let publication = self
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|source| source.publication());
+        if let Some(publication) = publication {
+            let due = self.rounds.due(utc, fetching, publication);
+            enabled && due
+        } else {
+            enabled && self.schedule.due(elapsed)
+        }
     }
 
     /// The cloud generation in force: raised whenever the effective target
@@ -173,7 +196,7 @@ impl CloudWorker {
 
     /// Ask the worker for one poll. Returns `false` when the worker is still
     /// busy with the previous one, so the caller can retry soon.
-    pub(super) fn request(&self) -> bool {
+    pub(super) fn request(&mut self) -> bool {
         if self.busy.swap(true, Ordering::SeqCst) {
             return false;
         }
@@ -181,6 +204,7 @@ impl CloudWorker {
             self.busy.store(false, Ordering::SeqCst);
             return false;
         }
+        self.rounds.started();
         true
     }
 }
@@ -341,6 +365,7 @@ pub(super) fn spawn_cloud_worker(
         // The startup check is owed whatever auto-refresh says: it feeds the
         // first wallpaper, which is a wallpaper update even with the timer off.
         owed: true,
+        rounds: RoundSchedule::default(),
         answer,
         enabled,
         abandoned,
@@ -654,7 +679,7 @@ mod tests {
 
     #[test]
     fn a_switch_applies_between_attempts_and_bumps_the_generation() {
-        let (worker, mailbox, generation) = worker();
+        let (mut worker, mailbox, generation) = worker();
         worker.request();
         wait_for_pair(&mailbox, "the first source's map");
         assert_eq!(generation.load(Ordering::SeqCst), 0);
@@ -674,7 +699,7 @@ mod tests {
 
     #[test]
     fn rapid_switches_keep_only_the_last_pending_source() {
-        let (worker, mailbox, _generation) = worker();
+        let (mut worker, mailbox, _generation) = worker();
         let first = ScriptedSource::new();
         worker.set_source(ScriptedSource::new());
         worker.set_source(ScriptedSource::new());
@@ -778,7 +803,7 @@ mod tests {
 
     /// Ask for a poll, retrying while the worker is still finishing the
     /// previous one.
-    fn request_when_free(worker: &CloudWorker) {
+    fn request_when_free(worker: &mut CloudWorker) {
         let deadline = std::time::Instant::now() + TIMEOUT;
         while !worker.request() {
             assert!(
@@ -831,7 +856,7 @@ mod tests {
     /// the next run clean — a stale stop must not eat it.
     #[test]
     fn an_abort_stops_a_run_without_a_retry() {
-        let (worker, mailbox, source) = stoppable_worker();
+        let (mut worker, mailbox, source) = stoppable_worker();
         worker.request();
         wait_for_pair(&mailbox, "the first map");
         assert_eq!(source.fetches(), 1);
@@ -839,7 +864,7 @@ mod tests {
         // The next run parks mid-fetch, which is the slow download; the stop
         // answers it there.
         source.park.store(true, Ordering::SeqCst);
-        request_when_free(&worker);
+        request_when_free(&mut worker);
         let deadline = std::time::Instant::now() + TIMEOUT;
         while source.fetches() < 2 {
             assert!(
@@ -860,7 +885,7 @@ mod tests {
         // And the worker is clean afterwards: the next run starts fresh and
         // fetches normally, which is what a stale stop would break.
         source.park.store(false, Ordering::SeqCst);
-        request_when_free(&worker);
+        request_when_free(&mut worker);
         wait_for_pair(&mailbox, "the map after the stop");
         assert_eq!(source.fetches(), 3);
     }

@@ -29,6 +29,7 @@ dds = { workspace = true, features = ["rayon"] }
 rayon.workspace = true
 sha2.workspace = true
 crc32fast.workspace = true
+roxmltree.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

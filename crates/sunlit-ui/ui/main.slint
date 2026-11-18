@@ -1599,10 +1599,7 @@ export component MainWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 4px;
 
-                                    // Typed rather than dragged: the range is a
-                                    // day wide, so a slider would be a
-                                    // one-minute pixel hunt.
-                                    HorizontalLayout {
+                                    if root.cloud-source-draft.mode == 2 || root.cloud-source-override : HorizontalLayout {
                                         spacing: 4px;
                                         padding-left: 0px;
 
@@ -1630,7 +1627,7 @@ export component MainWindow inherits Window {
                                                 root.sliders-changed();
                                             }
                                             Tooltip {
-                                                Hint { text: "Minutes between checks of the cloud source, 5 to 1440. Checks run on schedule only while Auto-refresh wallpaper is on; Refresh now always checks. The source's own gate still decides whether a check downloads anything, so a small value here costs small requests, not imagery."; }
+                                                Hint { text: "Minutes between remote image checks, 5 to 1440, counted from this edit. Scheduled checks require Auto-refresh wallpaper; Refresh now checks immediately. Native sources follow their upstream UTC rounds instead."; }
                                             }
                                         }
 
@@ -1638,6 +1635,15 @@ export component MainWindow inherits Window {
                                             text: "min";
                                             vertical-alignment: center;
                                         }
+                                    }
+
+                                    if root.cloud-source-draft.mode != 2 && !root.cloud-source-override : cloud-publication-note := Text {
+                                        text: root.cloud-source-draft.mode == 0
+                                            ? "UTC rounds every 3 hours (00, 03, 06...). Checks every 5 min until a new round is published; downloads only a new round."
+                                            : "Hourly UTC rounds. Checks every 5 min until a new round is published; downloads only a new round.";
+                                        wrap: word-wrap;
+                                        font-size: 11px;
+                                        color: Palette.foreground.with-alpha(0.7);
                                     }
 
                                     if !root.auto-refresh-enabled : cloud-checks-paused-note := Text {

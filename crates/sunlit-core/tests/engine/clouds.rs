@@ -491,6 +491,99 @@ fn a_switched_off_cloud_layer_fetches_nothing_until_it_is_switched_on() {
 /// still fetches, but polls that fall due are not made. Turning the timer on
 /// makes the overdue check at once rather than an interval later, and turning
 /// it off pauses the schedule again.
+struct PublishedClouds {
+    inner: CountingClouds,
+    available: std::sync::Mutex<time::OffsetDateTime>,
+    settled: std::sync::Mutex<Option<time::OffsetDateTime>>,
+}
+
+impl CloudSource for PublishedClouds {
+    fn publication(&self) -> Option<sunlit_core::assets::cloud_source::CloudPublication> {
+        Some(sunlit_core::assets::cloud_source::CloudPublication {
+            interval: Duration::from_hours(1),
+            latest: *self.settled.lock().unwrap(),
+        })
+    }
+
+    fn fetch_if_changed(&self, etag: Option<&str>) -> Result<Option<CloudImage>, String> {
+        let result = self.inner.fetch_if_changed(etag)?;
+        *self.settled.lock().unwrap() = Some(*self.available.lock().unwrap());
+        Ok(result)
+    }
+
+    fn describe(&self) -> String {
+        "hourly publication fixture".to_owned()
+    }
+}
+
+#[test]
+fn native_cloud_checks_follow_utc_rounds_and_wait_for_publication() {
+    let _gpu = gpu();
+    let source = Arc::new(PublishedClouds {
+        inner: CountingClouds::new(false),
+        available: std::sync::Mutex::new(time::macros::datetime!(2026-11-18 05:00 UTC)),
+        settled: std::sync::Mutex::new(None),
+    });
+    let clock = Arc::new(MockClock::new(
+        time::macros::datetime!(2026-11-18 05:59:30 UTC),
+    ));
+    let harness = Harness::start(|config| {
+        config.params = switched(true);
+        config.cloud = Some(Arc::clone(&source) as Arc<dyn CloudSource>);
+        config.clock = Arc::clone(&clock) as Arc<dyn sunlit_core::engine::clock::Clock>;
+        config.cloud_poll_interval = Duration::from_hours(24);
+        config.auto_refresh = Some(Duration::from_hours(24));
+    });
+    source.inner.wait_for_fetches(1, "startup");
+    assert_eq!(source.inner.fetches_after_quiet(), 1);
+    harness.engine.set_cloud_poll_interval(1440);
+    harness.advance(&clock, Duration::from_secs(30));
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        2,
+        "06:00 checks despite the custom interval"
+    );
+
+    let advance_awake = |seconds: u64| {
+        for _ in 0..seconds / 30 {
+            harness.advance(&clock, Duration::from_secs(30));
+            harness.engine.memory_report().unwrap();
+            harness.engine.memory_report().unwrap();
+        }
+    };
+    advance_awake(240);
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        2,
+        "no retry before five minutes"
+    );
+    *source.available.lock().unwrap() = time::macros::datetime!(2026-11-18 06:00 UTC);
+    advance_awake(60);
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        3,
+        "06:05 discovers the delayed round"
+    );
+    advance_awake(300);
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        3,
+        "caught up: wait for 07:00"
+    );
+    harness.engine.refresh_clouds();
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        4,
+        "manual check bypasses the wait"
+    );
+    harness.advance(&clock, Duration::from_mins(10));
+    assert_eq!(
+        source.inner.fetches_after_quiet(),
+        5,
+        "resume checks even before the next round"
+    );
+}
+
 #[test]
 fn scheduled_cloud_checks_follow_auto_refresh() {
     let _gpu = gpu();

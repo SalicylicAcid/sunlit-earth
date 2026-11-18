@@ -107,13 +107,36 @@ const MAX_BODY_BYTES: u64 = 50 * 1024 * 1024;
 /// Decoded hemisphere cap. The largest real hemisphere is 4096 x 4096 (the
 /// 8192 texture resolution halves into it); nothing larger is decoded.
 const MAX_HEMISPHERE_SIDE: u32 = 4096;
-/// Upstream's own refresh cadence for the IR108 layer: both hemispheres are
-/// "latest" imagery republished this often. A round fetched within the
-/// window cannot differ from the stored one, so a poll inside it serves the
-/// pair from disk rather than downloading it again — the manual refresh
-/// pressed twice, or an hourly poll landing just behind a restart, costs
-/// nothing.
-const UPSTREAM_REFRESH: Duration = Duration::from_mins(15);
+const UPSTREAM_REFRESH: Duration = Duration::from_hours(3);
+
+fn parse_latest_round(body: &str) -> Result<String, String> {
+    use time::format_description::well_known::Rfc3339;
+    let document =
+        roxmltree::Document::parse(body).map_err(|e| format!("invalid WMS capabilities: {e}"))?;
+    let layer = document
+        .descendants()
+        .find(|node| {
+            node.has_tag_name("Layer")
+                && node
+                    .children()
+                    .any(|child| child.has_tag_name("Name") && child.text() == Some(LAYER))
+        })
+        .ok_or_else(|| "the WMS capabilities do not name the cloud layer".to_owned())?;
+    let dimension = layer
+        .children()
+        .find(|node| node.has_tag_name("Dimension") && node.attribute("name") == Some("time"))
+        .ok_or_else(|| "the cloud layer has no time dimension".to_owned())?;
+    dimension
+        .text()
+        .unwrap_or_default()
+        .split([',', '/'])
+        .filter_map(|value| time::OffsetDateTime::parse(value.trim(), &Rfc3339).ok())
+        .max()
+        .ok_or_else(|| "the cloud time dimension holds no usable rounds".to_owned())?
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|e| e.to_string())
+}
 
 /// A grayscale map as row-major f32 in [0, 1], north up, -180..180 west to
 /// east: the same orientation the remote map and the generator use, which is
@@ -436,11 +459,12 @@ pub(crate) enum FetchError {
 /// The native cloud source: one worker thread fetches both hemispheres of a
 /// round sequentially and only a complete pair produces a new image.
 ///
-/// There are no conditional requests against this source: upstream serves
-/// "latest" imagery, so every poll fetches a fresh round and `known_etag` is
-/// ignored on purpose. The two hemispheres are "latest" requests taken
-/// seconds apart; the round's start and end times are logged, not claimed to
-/// be one satellite instant.
+/// There are no conditional requests against this source: `known_etag` is
+/// ignored on purpose, and it is the capabilities' latest round, not an
+/// `ETag`, that decides what a poll fetches — the current round answers from
+/// the cache, a newer round downloads. The two hemispheres are "latest"
+/// requests taken seconds apart; the round's start and end times are logged,
+/// not claimed to be one satellite instant.
 ///
 /// The disk cache holds two layers. The raw pair (the two hemisphere PNGs and
 /// a manifest naming their hashes, published with the manifest last) is what
@@ -459,10 +483,8 @@ pub struct EumetsatCloudSource {
     /// cache directory. `None` caches nothing and every round hits the
     /// network.
     cache_dir: Option<std::path::PathBuf>,
-    /// Whether the next fetch is this instance's first. A parameter or
-    /// algorithm change arrives as a new instance, and its first fetch
-    /// reprocesses the stored raw pair instead of downloading again.
-    first_fetch: AtomicBool,
+    request_time: Mutex<Option<String>>,
+    round: Mutex<Option<time::OffsetDateTime>>,
     /// Backoff between transient attempts; the shipped values are
     /// [`RETRY_DELAYS`] and tests shorten them.
     retry_delays: [Duration; (MAX_ATTEMPTS - 1) as usize],
@@ -495,13 +517,7 @@ struct RawManifest {
     algorithm: u32,
     west_sha256: String,
     east_sha256: String,
-    /// When the round started, Unix seconds. The freshness gate reads it: a
-    /// round younger than [`UPSTREAM_REFRESH`] cannot differ from what
-    /// upstream has, so a poll inside the window skips the network. `default`
-    /// lets a manifest from before the gate read as unknown, which is never
-    /// fresh.
-    #[serde(default)]
-    fetched_epoch_secs: u64,
+    round: String,
 }
 
 /// The stored raw pair, its bytes and the hashes its manifest named.
@@ -509,8 +525,7 @@ struct RawPair {
     west: Vec<u8>,
     east: Vec<u8>,
     hashes: (String, String),
-    /// The manifest's fetch time, Unix seconds; zero means unknown.
-    fetched_epoch_secs: u64,
+    round: String,
 }
 
 /// The derived map's metadata, the commit point of a derivation: only a
@@ -552,36 +567,30 @@ impl EumetsatCloudSource {
         let started = Instant::now();
         let deadline = started + ROUND_BUDGET;
 
-        // The stored pair is served from disk on this instance's first fetch
-        // — a parameter or algorithm change arrives as a new instance, and
-        // its first fetch reprocesses rather than downloads again — and on
-        // any poll inside the window a round can still be young in: upstream
-        // cannot have published anything the pair does not hold.
+        self.set_phase("checking the round list");
+        let latest = self.request_latest_round()?;
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        *self
+            .request_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(latest.clone());
         let cached_raw = self.load_raw_pair(px);
-        let first = self.first_fetch.swap(false, Ordering::SeqCst);
-        let serves_from_disk = cached_raw
-            .as_ref()
-            .is_some_and(|pair| first || Self::round_is_fresh(pair));
         if let Some(pair) = &cached_raw
-            && serves_from_disk
+            && pair.round == latest
         {
             if self.derived_matches(px, &pair.hashes.0, &pair.hashes.1) {
-                info!(
-                    px,
-                    fresh = !first,
-                    "the stored raw pair and its derivation are still current"
-                );
+                info!(px, round = %latest, "the stored raw pair and its derivation are still current");
+                self.settle(&latest);
                 return Ok(None);
             }
             self.set_phase("processing locally");
-            info!(
-                px,
-                first, "reprocessing the stored raw pair without the network"
-            );
             let west = decode_png(&pair.west, px)?;
             let east = decode_png(&pair.east, px)?;
             let bytes =
                 self.process_and_store(px, &west, &east, &pair.hashes.0, &pair.hashes.1, started)?;
+            self.settle(&latest);
             return Ok(Some(CloudImage {
                 bytes: Download::new(bytes),
                 etag: None,
@@ -617,18 +626,18 @@ impl EumetsatCloudSource {
         self.set_phase("processing the round");
         let west_sha = sha256_hex(&west_body);
         let east_sha = sha256_hex(&east_body);
-        // Upstream unchanged and the derivation current: nothing to report,
-        // and nothing to process.
+        self.store_raw_pair(px, &west_body, &east_body, &latest)?;
         if let Some(pair) = &cached_raw
             && west_body == pair.west
             && east_body == pair.east
             && self.derived_matches(px, &pair.hashes.0, &pair.hashes.1)
         {
             debug!(px, "the upstream round matches the stored one");
+            self.settle(&latest);
             return Ok(None);
         }
-        self.store_raw_pair(px, &west_body, &east_body)?;
         let bytes = self.process_and_store(px, &west, &east, &west_sha, &east_sha, started)?;
+        self.settle(&latest);
         Ok(Some(CloudImage {
             bytes: Download::new(bytes),
             etag: None,
@@ -654,7 +663,8 @@ impl EumetsatCloudSource {
             settings,
             size: Mutex::new(hemisphere_px(DEFAULT_TEXTURE_RESOLUTION)),
             cache_dir,
-            first_fetch: AtomicBool::new(true),
+            request_time: Mutex::new(None),
+            round: Mutex::new(None),
             retry_delays: RETRY_DELAYS,
             phase: Mutex::new(String::new()),
             progress: Mutex::new([None, None]),
@@ -713,21 +723,32 @@ impl EumetsatCloudSource {
         "the download was stopped".to_owned()
     }
 
-    /// Whether the stored round is too young for upstream to have published
-    /// anything new. Both hemispheres are "latest" imagery the service
-    /// republishes every [`UPSTREAM_REFRESH`], so a pair fetched inside the
-    /// window is the present state whatever the poll would ask for. A
-    /// manifest without a usable time — one from before the gate, a clock
-    /// set backwards — is never fresh.
-    fn round_is_fresh(pair: &RawPair) -> bool {
-        if pair.fetched_epoch_secs == 0 {
-            return false;
+    fn request_latest_round(&self) -> Result<String, String> {
+        use std::io::Read as _;
+        let url = format!("{WMS_URL}?service=WMS&version=1.3.0&request=GetCapabilities");
+        let mut response = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| format!("WMS round list: {e}"))?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(format!("WMS round list: HTTP {status}"));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        now >= pair.fetched_epoch_secs && now - pair.fetched_epoch_secs < UPSTREAM_REFRESH.as_secs()
+        let mut body = String::new();
+        response
+            .body_mut()
+            .with_config()
+            .limit(4 * 1024 * 1024)
+            .reader()
+            .read_to_string(&mut body)
+            .map_err(|e| format!("WMS round list: {e}"))?;
+        parse_latest_round(&body)
+    }
+
+    fn settle(&self, round: &str) {
+        *self.round.lock().unwrap_or_else(PoisonError::into_inner) =
+            time::OffsetDateTime::parse(round, &time::format_description::well_known::Rfc3339).ok();
     }
 
     /// Fetch one hemisphere as a grid of [`TILE_PX`] tiles.
@@ -890,7 +911,16 @@ impl EumetsatCloudSource {
         deadline: Instant,
     ) -> Result<GrayMap, FetchError> {
         let tile_bbox = sub_bbox(bbox, row, col, tiles);
-        let url = build_wms_url(&tile_bbox, tile_px);
+        let mut url = build_wms_url(&tile_bbox, tile_px);
+        if let Some(round) = self
+            .request_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            use std::fmt::Write as _;
+            write!(url, "&time={round}").expect("writing a string");
+        }
         for attempt in 1..=MAX_ATTEMPTS {
             if self.cancelled() {
                 return Err(FetchError::Permanent(Self::stop_error()));
@@ -1063,6 +1093,29 @@ impl EumetsatCloudSource {
 }
 
 impl CloudSource for EumetsatCloudSource {
+    fn publication(&self) -> Option<super::cloud_source::CloudPublication> {
+        Some(super::cloud_source::CloudPublication {
+            interval: UPSTREAM_REFRESH,
+            latest: *self.round.lock().unwrap_or_else(PoisonError::into_inner),
+        })
+    }
+
+    fn settled_note(&self) -> Option<String> {
+        self.round
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|round| {
+                format!(
+                    "round {} UTC",
+                    round
+                        .format(time::macros::format_description!(
+                            "[year]-[month]-[day] [hour]:[minute]"
+                        ))
+                        .expect("round format")
+                )
+            })
+    }
+
     fn wait(&self) -> Duration {
         CloudWait::LongFetch.duration()
     }
@@ -1115,7 +1168,7 @@ impl EumetsatCloudSource {
     /// verified by decoding what landed, then renamed, and the manifest
     /// written last as the commit point. A failure anywhere leaves the
     /// previous pair and its manifest untouched.
-    fn store_raw_pair(&self, px: u32, west: &[u8], east: &[u8]) -> Result<(), String> {
+    fn store_raw_pair(&self, px: u32, west: &[u8], east: &[u8], round: &str) -> Result<(), String> {
         let Some(dir) = &self.cache_dir else {
             return Ok(());
         };
@@ -1145,10 +1198,7 @@ impl EumetsatCloudSource {
             algorithm: ALGORITHM_VERSION,
             west_sha256: sha256_hex(west),
             east_sha256: sha256_hex(east),
-            fetched_epoch_secs: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            round: round.to_owned(),
         };
         let manifest =
             toml::to_string(&manifest).map_err(|e| format!("the raw manifest failed: {e}"))?;
@@ -1181,7 +1231,7 @@ impl EumetsatCloudSource {
             west,
             east,
             hashes: (west_sha, east_sha),
-            fetched_epoch_secs: manifest.fetched_epoch_secs,
+            round: manifest.round,
         })
     }
 
@@ -1386,6 +1436,14 @@ mod tests {
 
     use super::*;
 
+    const FIXTURE_ROUND: &str = "2026-11-18T06:00:00Z";
+
+    fn capabilities_response(round: &str) -> Response<Body> {
+        Response::builder().status(200).body(Body::builder().data(format!(
+            r#"<WMS_Capabilities xmlns="http://www.opengis.net/wms"><Capability><Layer><Layer><Name>{LAYER}</Name><Dimension name="time" default="{round}">2026-11-17T00:00:00Z/{round}/PT3H</Dimension></Layer></Layer></Capability></WMS_Capabilities>"#
+        ).into_bytes())).unwrap()
+    }
+
     fn gray(width: u32, height: u32, fill: f32) -> GrayMap {
         GrayMap::new(width, height, vec![fill; width as usize * height as usize]).unwrap()
     }
@@ -1408,7 +1466,10 @@ mod tests {
         let seen = Arc::clone(&calls);
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .middleware(move |_: Request<SendBody>, _: MiddlewareNext| {
+            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                if req.uri().to_string().contains("GetCapabilities") {
+                    return Ok(capabilities_response(FIXTURE_ROUND));
+                }
                 let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
                 make(n)
             })
@@ -1423,6 +1484,88 @@ mod tests {
             .header("Content-Type", "image/png")
             .body(Body::builder().data(png_bytes(px, px, value)))
             .unwrap()
+    }
+
+    #[test]
+    fn capabilities_select_the_latest_time_of_only_the_cloud_layer() {
+        let xml = r#"<w:WMS_Capabilities xmlns:w="http://www.opengis.net/wms"><w:Layer>
+            <w:Layer><w:Name>other</w:Name><w:Dimension name="time">2026-11-19T00:00:00Z</w:Dimension></w:Layer>
+            <w:Layer><w:Name>mumi:worldcloudmap_ir108</w:Name><w:Dimension name="time" default="2026-11-18T03:00:00Z">2026-11-18T09:00:00.000Z,2026-11-18T06:00:00Z</w:Dimension></w:Layer>
+        </w:Layer></w:WMS_Capabilities>"#;
+        assert_eq!(parse_latest_round(xml).unwrap(), "2026-11-18T09:00:00Z");
+        for invalid in [
+            "not xml",
+            "<Layer/>",
+            "<Layer><Name>mumi:worldcloudmap_ir108</Name><Dimension name=\"time\">invalid/PT3H</Dimension></Layer>",
+        ] {
+            assert!(parse_latest_round(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_metadata_preserves_the_settled_round_and_fetches_no_tiles() {
+        let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
+        source.settle(FIXTURE_ROUND);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        source.agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                assert!(req.uri().to_string().contains("GetCapabilities"));
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::builder()
+                    .status(503)
+                    .body(Body::builder().data(Vec::new()))
+                    .unwrap())
+            })
+            .build()
+            .new_agent();
+        assert!(source.fetch_if_changed(None).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            source.publication().unwrap().latest,
+            Some(time::macros::datetime!(2026-11-18 06:00 UTC))
+        );
+        assert_eq!(
+            source.settled_note().as_deref(),
+            Some("round 2026-11-18 06:00 UTC")
+        );
+        assert_eq!(source.status(), None);
+    }
+
+    #[test]
+    fn identical_tiles_still_commit_the_new_round() {
+        let (_scratch, mut source) = scratch_cache("eumetsat_identical_round");
+        *source.size.lock().unwrap() = 16;
+        let round = Arc::new(AtomicUsize::new(0));
+        let current = Arc::clone(&round);
+        let tiles = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&tiles);
+        source.agent = ureq::Agent::config_builder()
+            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                if req.uri().to_string().contains("GetCapabilities") {
+                    return Ok(capabilities_response(
+                        if current.load(Ordering::SeqCst) == 0 {
+                            FIXTURE_ROUND
+                        } else {
+                            "2026-11-18T09:00:00Z"
+                        },
+                    ));
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(png_response(16, 80))
+            })
+            .build()
+            .new_agent();
+        assert!(source.fetch_if_changed(None).unwrap().is_some());
+        round.store(1, Ordering::SeqCst);
+        assert!(source.fetch_if_changed(None).unwrap().is_none());
+        assert_eq!(
+            source.load_raw_pair(16).unwrap().round,
+            "2026-11-18T09:00:00Z"
+        );
+        assert!(source.fetch_if_changed(None).unwrap().is_none());
+        assert_eq!(tiles.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -2013,6 +2156,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_round_does_not_hide_a_newly_published_round() {
+        let (_scratch, mut source) = scratch_cache("eumetsat_new_publication");
+        store_round(&source, 60, 90);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        source.agent = ureq::Agent::config_builder()
+            .middleware(move |req: Request<SendBody>, _: MiddlewareNext| {
+                let url = req.uri().to_string();
+                seen.lock().unwrap().push(url.clone());
+                if url.contains("GetCapabilities") {
+                    Ok(Response::builder().status(200).body(Body::builder().data(
+                        br#"<WMS_Capabilities><Capability><Layer><Layer><Name>mumi:worldcloudmap_ir108</Name><Dimension name="time" default="2026-11-18T12:00:00Z">2026-11-17T00:00:00Z/2026-11-18T12:00:00Z/PT3H</Dimension></Layer></Layer></Capability></WMS_Capabilities>"#.to_vec()
+                    )).unwrap())
+                } else {
+                    Ok(png_response(16, 128))
+                }
+            })
+            .build().new_agent();
+        assert!(
+            source.fetch_if_changed(None).unwrap().is_some(),
+            "startup checks upstream even with a recent cache"
+        );
+        let urls = requests.lock().unwrap();
+        assert_eq!(urls.len(), 3);
+        assert!(urls[0].contains("GetCapabilities"));
+        for url in &urls[1..] {
+            assert!(url.contains("time=2026-11-18T12:00:00Z"), "{url}");
+        }
+        drop(urls);
+        assert!(source.fetch_if_changed(None).unwrap().is_none());
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "only metadata is fetched for an unchanged round"
+        );
+    }
+
+    #[test]
     fn fetch_if_changed_rounds_two_hemispheres_into_one_jpeg_and_ignores_etags() {
         let mut source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         source.retry_delays = [Duration::ZERO, Duration::ZERO];
@@ -2112,10 +2293,11 @@ mod tests {
     /// A source with a scratch cache directory, and the directory.
     fn scratch_cache(name: &str) -> (crate::test_support::ScratchDir, EumetsatCloudSource) {
         let scratch = crate::test_support::ScratchDir::new(name);
-        let source = EumetsatCloudSource::new(
+        let mut source = EumetsatCloudSource::new(
             EumetsatSettings::default(),
             Some(scratch.path().to_path_buf()),
         );
+        source.agent = stub_agent(|_| panic!("unexpected imagery download")).0;
         (scratch, source)
     }
 
@@ -2124,37 +2306,15 @@ mod tests {
         png_bytes(16, 16, value)
     }
 
-    /// Rewrite the stored manifest's fetch time to `secs_ago` before now, so
-    /// a test can age a round past the upstream window without waiting for
-    /// it.
-    fn backdate_pair(scratch: &crate::test_support::ScratchDir, px: u32, secs_ago: u64) {
-        let path = scratch.join(&format!("eumetsat_raw_{px}_meta.toml"));
-        let text = std::fs::read_to_string(&path).expect("the manifest reads");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is set")
-            .as_secs();
-        let updated = text
-            .lines()
-            .map(|line| {
-                if line.starts_with("fetched_epoch_secs") {
-                    format!("fetched_epoch_secs = {}", now.saturating_sub(secs_ago))
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, format!("{updated}\n")).expect("the manifest is rewritten");
-    }
-
     /// Store a raw pair and its derivation at 16 px, and point `source` at
     /// that size: the state a poll between rounds reads.
     fn store_round(source: &EumetsatCloudSource, west_value: u8, east_value: u8) {
         let west = raw_body(west_value);
         let east = raw_body(east_value);
         let hashes = (sha256_hex(&west), sha256_hex(&east));
-        source.store_raw_pair(16, &west, &east).expect("stored");
+        source
+            .store_raw_pair(16, &west, &east, FIXTURE_ROUND)
+            .expect("stored");
         let west_map = decode_png(&west, 16).expect("the west decodes");
         let east_map = decode_png(&east, 16).expect("the east decodes");
         source
@@ -2176,7 +2336,7 @@ mod tests {
         let west = raw_body(60);
         let east = raw_body(90);
         source
-            .store_raw_pair(16, &west, &east)
+            .store_raw_pair(16, &west, &east, FIXTURE_ROUND)
             .expect("the pair is stored");
         assert!(scratch.join("eumetsat_raw_west_16.png").is_file());
         assert!(scratch.join("eumetsat_raw_east_16.png").is_file());
@@ -2209,7 +2369,9 @@ mod tests {
         let west = raw_body(60);
         let east = raw_body(90);
         let hashes = (sha256_hex(&west), sha256_hex(&east));
-        source.store_raw_pair(16, &west, &east).expect("stored");
+        source
+            .store_raw_pair(16, &west, &east, FIXTURE_ROUND)
+            .expect("stored");
         assert!(
             !source.derived_matches(16, &hashes.0, &hashes.1),
             "there is no derivation yet"
@@ -2252,7 +2414,6 @@ mod tests {
         let mut raw_meta: RawManifest =
             toml::from_str(&std::fs::read_to_string(&raw_path).unwrap()).unwrap();
         raw_meta.algorithm = 1;
-        raw_meta.fetched_epoch_secs = 1; // Even old raw remains reusable on first fetch.
         let raw_text = toml::to_string(&raw_meta).unwrap();
         std::fs::write(&raw_path, &raw_text).unwrap();
         let meta_path = scratch.join("eumetsat_map_32x16_meta.toml");
@@ -2296,7 +2457,8 @@ mod tests {
             },
             Some(scratch.path().to_path_buf()),
         );
-        old.store_raw_pair(16, &west, &east).expect("stored");
+        old.store_raw_pair(16, &west, &east, FIXTURE_ROUND)
+            .expect("stored");
         let old_west = decode_png(&west, 16).expect("decodes");
         let old_east = decode_png(&east, 16).expect("decodes");
         old.process_and_store(
@@ -2335,38 +2497,42 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The upstream freshness gate and the user stop
+    // The upstream round gate and the user stop
     // -----------------------------------------------------------------------
 
-    /// A round inside the upstream window is the present state whatever the
-    /// poll would ask for: the poll after the first — the shape of the hourly
-    /// check, or of a refresh pressed twice — answers from disk.
+    /// The capabilities list still naming the stored round, every poll — a
+    /// refresh pressed twice, the schedule's five-minute recheck — answers
+    /// from disk without downloading imagery.
     #[test]
-    fn a_round_within_the_upstream_window_is_served_from_disk() {
-        let (scratch, mut source) = scratch_cache("eumetsat_fresh_gate");
+    fn repeated_polls_of_the_current_round_are_served_from_disk() {
+        let (scratch, mut source) = scratch_cache("eumetsat_current_round");
         store_round(&source, 60, 90);
         source.fetch_if_changed(None).expect("the first fetch");
-        let (agent, calls) = stub_agent(|_| panic!("a young round must not touch the network"));
+        let (agent, calls) = stub_agent(|_| panic!("the current round must not touch the imagery"));
         source.agent = agent;
         assert!(
             source
                 .fetch_if_changed(None)
                 .expect("the gate holds")
                 .is_none(),
-            "a fresh pair with a current derivation is reused"
+            "a pair of the current round with a current derivation is reused"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(scratch);
     }
 
-    /// A round past the window is old news: the poll downloads again and
-    /// commits what it got.
+    /// A stored round behind the capabilities' latest is old news: the poll
+    /// downloads again and commits what it got.
     #[test]
-    fn a_round_past_the_upstream_window_is_fetched_again() {
-        let (scratch, mut source) = scratch_cache("eumetsat_stale_gate");
+    fn a_stored_round_behind_the_latest_is_fetched_again() {
+        let (scratch, mut source) = scratch_cache("eumetsat_outdated_round");
         store_round(&source, 60, 90);
         source.fetch_if_changed(None).expect("the first fetch");
-        backdate_pair(&scratch, 16, UPSTREAM_REFRESH.as_secs() + 60);
+        let path = scratch.join("eumetsat_raw_16_meta.toml");
+        let mut manifest: RawManifest =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        manifest.round = "2026-11-18T03:00:00Z".to_owned();
+        std::fs::write(path, toml::to_string(&manifest).unwrap()).unwrap();
         source.retry_delays = [Duration::ZERO, Duration::ZERO];
         let (agent, calls) = stub_agent(|_| Ok(png_response(16, 128)));
         source.agent = agent;
@@ -2382,16 +2548,16 @@ mod tests {
         assert_eq!(image::load_from_memory(&image.bytes).unwrap().width(), 32);
     }
 
-    /// A young round whose derivation no longer matches — its metadata gone,
-    /// say — is reprocessed from disk rather than downloaded again.
+    /// The current round whose derivation no longer matches — its metadata
+    /// gone, say — is reprocessed from disk rather than downloaded again.
     #[test]
-    fn a_fresh_pair_without_a_current_derivation_is_reprocessed_from_disk() {
-        let (scratch, mut source) = scratch_cache("eumetsat_fresh_reprocess");
+    fn the_current_round_with_a_stale_derivation_is_reprocessed_from_disk() {
+        let (scratch, mut source) = scratch_cache("eumetsat_stale_derivation");
         store_round(&source, 60, 90);
         source.fetch_if_changed(None).expect("the first fetch");
         std::fs::remove_file(scratch.join("eumetsat_map_32x16_meta.toml"))
             .expect("the derivation's metadata is taken away");
-        let (agent, calls) = stub_agent(|_| panic!("a young round must not touch the network"));
+        let (agent, calls) = stub_agent(|_| panic!("the current round must not touch the imagery"));
         source.agent = agent;
         assert!(
             source
@@ -2743,13 +2909,17 @@ mod tests {
         approx::assert_relative_eq!(map.pixels()[512 * 1024 + 512], 140.0 / 255.0);
     }
 
+    /// A new instance over a complete cache — the startup poll's shape —
+    /// reads the capabilities list and answers without downloading imagery.
     #[test]
-    fn a_first_fetch_with_a_current_derivation_costs_nothing() {
-        let (_scratch, mut source) = scratch_cache("eumetsat_current");
+    fn a_new_instance_with_the_current_round_costs_nothing() {
+        let (_scratch, mut source) = scratch_cache("eumetsat_new_instance");
         let west = raw_body(60);
         let east = raw_body(90);
         let hashes = (sha256_hex(&west), sha256_hex(&east));
-        source.store_raw_pair(16, &west, &east).expect("stored");
+        source
+            .store_raw_pair(16, &west, &east, FIXTURE_ROUND)
+            .expect("stored");
         let west_map = decode_png(&west, 16).expect("decodes");
         let east_map = decode_png(&east, 16).expect("decodes");
         source
@@ -2762,7 +2932,7 @@ mod tests {
                 Instant::now(),
             )
             .expect("stored");
-        let (agent, calls) = stub_agent(|_| panic!("nothing changed, so nothing is fetched"));
+        let (agent, calls) = stub_agent(|_| panic!("the current round must not touch the imagery"));
         source.agent = agent;
         *source.size.lock().expect("the size lock") = 16;
         assert!(

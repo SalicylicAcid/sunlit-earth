@@ -198,11 +198,21 @@ impl CloudTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CloudPublication {
+    pub interval: Duration,
+    pub latest: Option<time::OffsetDateTime>,
+}
+
 /// A source of equirectangular cloud imagery.
 ///
 /// Implementations must be cheap to call when nothing has changed: the engine
 /// polls on a schedule and expects `None` most of the time.
 pub trait CloudSource: Send + Sync {
+    fn publication(&self) -> Option<CloudPublication> {
+        None
+    }
+
     /// Select the image and cache identity before polling. The default keeps
     /// URL-driven fixtures following the original service (and env override);
     /// fixed fixtures can continue to ignore `retarget`.

@@ -580,6 +580,7 @@ impl NsmcCloudSource {
         }
         self.set_phase("processing the round");
         let sha = sha256_hex(&body);
+        self.store_raw(&body, &latest)?;
         // Upstream unchanged and the derivation current: nothing to report,
         // and nothing to process. The round list can move to a new entry
         // while the imagery it names is byte-identical to the stored one.
@@ -591,7 +592,6 @@ impl NsmcCloudSource {
             self.settle(&latest);
             return Ok(None);
         }
-        self.store_raw(&body, &latest)?;
         let bytes = self.derive_store_and_encode(&alpha, width, height, &sha, started)?;
         self.settle(&latest);
         Ok(Some(CloudImage {
@@ -934,6 +934,26 @@ fn to_coverage(image: &GrayMap, settings: &NsmcSettings) -> GrayMap {
 }
 
 impl CloudSource for NsmcCloudSource {
+    fn publication(&self) -> Option<super::cloud_source::CloudPublication> {
+        let latest = self
+            .round
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .and_then(|round| {
+                time::PrimitiveDateTime::parse(
+                    round,
+                    time::macros::format_description!("[year][month][day][hour][minute]"),
+                )
+                .ok()
+            })
+            .map(time::PrimitiveDateTime::assume_utc);
+        Some(super::cloud_source::CloudPublication {
+            interval: Duration::from_hours(1),
+            latest,
+        })
+    }
+
     fn wait(&self) -> Duration {
         // One mosaic request costs the service's render time — measured about
         // half a minute for the 4K PNG — plus the transfer and the
@@ -1476,6 +1496,42 @@ mod tests {
         assert_relative_eq!(covered.pixels()[1], 0.25);
         assert_relative_eq!(covered.pixels()[2], 1.0);
         assert_relative_eq!(covered.pixels()[3], 1.0);
+    }
+
+    #[test]
+    fn identical_imagery_still_commits_the_new_round() {
+        let scratch = crate::test_support::ScratchDir::new("nsmc_identical_round");
+        let mosaics = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&mosaics);
+        let bytes = rgba_png(RAW_WIDTH, RAW_HEIGHT, 80);
+        let cached = bytes.clone();
+        let (agent, _) = stub_agent(move |_, uri| {
+            if uri.contains("datatime") {
+                Ok(list_response(
+                    r#"{"ds":[{"dataDate":"20261118","dataTime":"060000"}]}"#,
+                ))
+            } else {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(mosaic_response(bytes.clone()))
+            }
+        });
+        let source = test_source(pass_through(), Some(scratch.path().to_path_buf()), agent);
+        *source.size.lock().unwrap() = (32, 16);
+        source.store_raw(&cached, "202611180500").unwrap();
+        let alpha = decode_alpha(&cached).unwrap();
+        source
+            .derive_store_and_encode(&alpha, 32, 16, &sha256_hex(&cached), Instant::now())
+            .unwrap();
+        assert!(source.fetch_if_changed(None).unwrap().is_none());
+        assert_eq!(source.load_raw().unwrap().round, "202611180600");
+        assert!(source.fetch_if_changed(None).unwrap().is_none());
+        assert_eq!(mosaics.load(Ordering::SeqCst), 1);
+        let publication = source.publication().unwrap();
+        assert_eq!(publication.interval, Duration::from_hours(1));
+        assert_eq!(
+            publication.latest,
+            Some(time::macros::datetime!(2026-11-18 06:00 UTC))
+        );
     }
 
     #[test]

@@ -84,6 +84,7 @@ serial_test = "3"
 i-slint-backend-testing = "=1.19.0"
 i-slint-core = { version = "=1.19.0", default-features = false }
 regex-lite = "0.1"
+roxmltree = "0.21"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
