@@ -657,6 +657,17 @@ pub fn register_action_callbacks(
     }
 
     {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
+        window.on_cloud_source_selected(move || {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            cloud_source_selected(&win, &engine);
+        });
+    }
+
+    {
         let engine = link.clone();
         window.on_refresh_clouds(move || {
             engine.send(EngineCommand::RefreshClouds);
@@ -1023,23 +1034,58 @@ fn apply_cloud_source(win: &MainWindow, engine: &EngineLink, draft: &CloudSource
         );
         return;
     }
+    switch_cloud_source(win, engine, source, "Applied; the map is on its way.");
+}
+
+/// Switch the engine and the panel to `source`, in one breath: the curve the
+/// window was drawing with is filed under the source it leaves, the new
+/// source's curve and parameters land on the panel rows and in the uniforms
+/// together, the draft is re-seeded from the switched state — which is what
+/// drops the edits the leaving mode never had applied — and the whole state
+/// is written. Apply reaches this with a validated draft; the Source picker
+/// reaches it with the saved parameters of the mode just picked, which is
+/// what makes picking a source the switch itself rather than a draft of one.
+fn switch_cloud_source(
+    win: &MainWindow,
+    engine: &EngineLink,
+    source: config::CloudSourceConfig,
+    status: &str,
+) {
     // The curve on screen was tuned on the source being left, so it is filed
     // under that source before the switch adopts the new one's.
     let leaving = source_mode(win.get_cloud_source().mode);
     engine.set_cloud_source(source.clone());
     CLOUDS.drawn.store(false, Ordering::Relaxed);
-    // The push resets the section, including its status line; the applied
+    // The push resets the section, including its status line; the outgoing
     // note goes out after it, so the two do not race for the same property.
     apply_cloud_source_to_window(win, &source);
     let mut saved = read_config_from_window(win, engine);
+    saved.cloud_source = source;
     saved.cloud_curves = session_curves(&saved);
     saved.store_curve_for(leaving);
     saved.load_active_curve();
     set_session_curves(saved.cloud_curves);
     push_cloud_curve_to_window(win, &saved);
     engine.push_params(win);
-    win.set_cloud_source_status("Applied; the map is on its way.".into());
+    win.set_cloud_source_status(status.into());
     write_settings(win, engine, || saved);
+}
+
+/// The Source picker's commit: the mode just picked takes its saved
+/// parameters to the engine and the panel at once, and the mode being left
+/// loses whatever edits it never applied. Value edits inside a mode are still
+/// a draft until Apply; the mode itself is not.
+fn cloud_source_selected(win: &MainWindow, engine: &EngineLink) {
+    let picked = source_mode(win.get_cloud_source_draft().mode);
+    let applied = win.get_cloud_source();
+    if source_mode(applied.mode) == picked {
+        // Re-selecting the source in force: nothing to switch, and the
+        // draft's edits in this mode stay.
+        return;
+    }
+    let mut source = cloud_source_config_from(&applied);
+    source.mode = picked;
+    switch_cloud_source(win, engine, source, "Switched; the map is on its way.");
 }
 
 /// What a source switch does to the cloud curve: the panel's six rows take the

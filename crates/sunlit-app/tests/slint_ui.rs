@@ -1991,6 +1991,163 @@ fn test_every_slider_row_shares_one_column() {
     assert_sliders_share_one_column(&window);
 }
 
+// ---------------------------------------------------------------------------
+// Switching the cloud source in real time
+// ---------------------------------------------------------------------------
+
+/// The Source combo, driven the way a user drives it: the popup opens and an
+/// item is clicked, which is the write path the two-way binding on
+/// `cloud-source-draft.mode` serves — a whole-struct write from Rust would
+/// not exercise it.
+fn pick_source(window: &MainWindow, index: usize) {
+    let combo: Vec<_> =
+        ElementHandle::find_by_element_id(window, "MainWindow::cloud-source-combo").collect();
+    let combo = combo.into_iter().next().expect("the Source combo exists");
+    let combo_box = combo
+        .query_descendants()
+        .match_accessible_role(AccessibleRole::Combobox)
+        .find_first()
+        .expect("a SettingCombo holds a ComboBox");
+    combo_box.invoke_accessible_expand_action();
+    let items: Vec<_> = ElementQuery::from_root(window)
+        .match_type_name("ListItem")
+        .find_all();
+    assert!(
+        items.len() > index,
+        "the Source popup holds {} items, not {}",
+        items.len(),
+        index + 1
+    );
+    items[index].mock_single_click(slint::platform::PointerEventButton::Left);
+}
+
+/// The slider value one of the source's parameter rows shows, read through
+/// the accessibility tree the way a screen reader reads it.
+fn shown_source_value(window: &MainWindow, id: &str) -> f32 {
+    accessible_number(&slider_of(
+        &ElementHandle::find_by_element_id(window, id)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .next()
+            .expect("the row exists"),
+    ))
+}
+
+/// The mode's own parameters travel with the switch the moment it happens:
+/// picking a source in the combo swaps the parameter rows to that source's
+/// saved values, and applying the draft adopts that source's render curve on
+/// the panel rows and hands the engine the new source in the same breath.
+/// The curve rows sit still while only the picker moves, because the edits
+/// are a draft until Apply.
+#[test]
+fn test_switching_the_source_switches_its_parameters_in_real_time() {
+    let SourceWindow { window, sent, .. } = create_source_window();
+    let defaults = AppConfig::default();
+    let (eumetsat, nsmc) = (
+        defaults.cloud_source.eumetsat.clone(),
+        defaults.cloud_source.nsmc.clone(),
+    );
+    let curve_of = |mode: sunlit_core::config::CloudSourceMode| {
+        sunlit_core::config::AppConfig::defaults_for(mode).cloud_floor_land
+    };
+    let apply_button = || the_button(&window, "Apply source");
+    let set_cloud_commands = || {
+        sent.try_iter()
+            .filter_map(|command| match command {
+                sunlit_core::engine::EngineCommand::SetCloudSource(config) => Some(config),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Picking NSMC in the combo is the switch itself: its rows appear with
+    // the saved NSMC parameters, the panel's curve rows adopt NSMC's curve,
+    // the engine is handed the NSMC source, and Apply goes dark — there is
+    // nothing left to apply.
+    pick_source(&window, 1);
+    assert_eq!(window.get_cloud_source_draft().mode, 1);
+    assert!(param_row_present(&window, "MainWindow::nsmc-floor-slider"));
+    assert!(!param_row_present(
+        &window,
+        "MainWindow::cloud-floor-slider"
+    ));
+    approx::assert_relative_eq!(
+        shown_source_value(&window, "MainWindow::nsmc-floor-slider"),
+        f32::from(nsmc.floor)
+    );
+    approx::assert_relative_eq!(
+        window.get_clouds().land.floor,
+        curve_of(sunlit_core::config::CloudSourceMode::Nsmc)
+    );
+    let switched = set_cloud_commands()
+        .into_iter()
+        .next()
+        .expect("the pick hands the engine a source");
+    assert_eq!(switched.mode, sunlit_core::config::CloudSourceMode::Nsmc);
+    assert_eq!(switched.nsmc.floor, nsmc.floor);
+    assert!(
+        !apply_button().accessible_enabled().unwrap_or(true),
+        "a fresh pick leaves nothing for Apply to do"
+    );
+
+    // An edit inside the mode is still a draft: it arms Apply.
+    let floor_row = ElementHandle::find_by_element_id(&window, "MainWindow::nsmc-floor-slider")
+        .collect::<Vec<_>>()
+        .into_iter()
+        .next()
+        .expect("the NSMC floor row exists");
+    let floor_slider = slider_of(&floor_row);
+    floor_slider.set_accessible_value("50");
+    approx::assert_relative_eq!(window.get_cloud_source_draft().nsmc_floor, 50.0);
+    assert!(
+        apply_button().accessible_enabled().unwrap_or(false),
+        "an edit arms Apply"
+    );
+
+    // Picking EUMETSAT drops the edit the mode never applied: the draft
+    // returns to the saved NSMC floor, the EUMETSAT rows show the saved
+    // EUMETSAT parameters, the curve rows adopt EUMETSAT's curve, and the
+    // engine takes the EUMETSAT source — all in the pick's own beat.
+    pick_source(&window, 0);
+    assert_eq!(window.get_cloud_source_draft().mode, 0);
+    approx::assert_relative_eq!(
+        window.get_cloud_source_draft().nsmc_floor,
+        f32::from(nsmc.floor)
+    );
+    approx::assert_relative_eq!(
+        shown_source_value(&window, "MainWindow::cloud-floor-slider"),
+        f32::from(eumetsat.floor)
+    );
+    approx::assert_relative_eq!(
+        window.get_clouds().land.floor,
+        curve_of(sunlit_core::config::CloudSourceMode::Eumetsat)
+    );
+    let switched = set_cloud_commands()
+        .into_iter()
+        .next()
+        .expect("the pick hands the engine a source");
+    assert_eq!(
+        switched.mode,
+        sunlit_core::config::CloudSourceMode::Eumetsat
+    );
+    assert!(
+        !apply_button().accessible_enabled().unwrap_or(true),
+        "a pick that dropped the edit leaves nothing for Apply"
+    );
+
+    // And back to NSMC: the saved floor is what shows — the dropped edit is
+    // not resurrected — with NSMC's curve on the panel rows.
+    pick_source(&window, 1);
+    approx::assert_relative_eq!(
+        shown_source_value(&window, "MainWindow::nsmc-floor-slider"),
+        f32::from(nsmc.floor)
+    );
+    approx::assert_relative_eq!(
+        window.get_clouds().land.floor,
+        curve_of(sunlit_core::config::CloudSourceMode::Nsmc)
+    );
+}
+
 #[test]
 fn test_about_is_reachable_without_opening_advanced() {
     let window = create_window();

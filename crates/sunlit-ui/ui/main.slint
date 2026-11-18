@@ -311,6 +311,9 @@ export component MainWindow inherits Window {
     in property <float> night-gamma-value;
     callback sliders-changed();
     callback apply-cloud-source(CloudSourceSettings);
+    // The Source picker commits the switch itself: picking a mode is the
+    // switch, not a draft of one.
+    callback cloud-source-selected();
     callback refresh-clouds();
     callback abort-clouds();
     callback cloud-poll-changed();
@@ -1646,7 +1649,7 @@ export component MainWindow inherits Window {
 
                                     cloud-source-combo := SettingCombo {
                                         label: "Source";
-                                        hint: "Where the cloud imagery comes from: the EUMETSAT or NSMC infrared mosaic, processed here, or a remote image.";
+                                        hint: "Where the cloud imagery comes from: the EUMETSAT or NSMC infrared mosaic, processed here, or a remote image. Picking one switches to it at once, with that source's own saved parameters; edits the mode being left never applied are dropped.";
                                         model: [
                                             "EUMETSAT",
                                             "NSMC",
@@ -1654,6 +1657,7 @@ export component MainWindow inherits Window {
                                         ];
                                         current-index <=> root.cloud-source-draft.mode;
                                         enabled: !root.cloud-source-override;
+                                        selected => { root.cloud-source-selected(); }
                                     }
 
                                     if root.cloud-source-draft.mode == 2 :
