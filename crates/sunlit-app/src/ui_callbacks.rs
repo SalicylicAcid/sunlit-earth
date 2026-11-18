@@ -1577,13 +1577,22 @@ pub(crate) fn refresh_datetime_sliders(window: &MainWindow) {
 /// Reading from disk also means a `--quality` override is not persisted, which
 /// is the intended behavior for a per-run flag. `--texture-resolution` does
 /// have a widget, so keeping it out of the file takes the flag `link` carries.
+///
+/// The cloud curves are the one UI-unmanaged field a save does not take from
+/// the disk: the session carries them, and the file it is read from can lag
+/// the session by the debounce behind an in-flight write. A switch files the
+/// curves it is leaving under the session precisely so a save that lands
+/// after it records them, which is also what keeps a test process, which
+/// never writes, from asserting against the developer's own file.
 pub fn read_config_from_window(window: &MainWindow, link: &EngineLink) -> AppConfig {
-    read_config_from_window_onto(
+    let mut config = read_config_from_window_onto(
         window,
         link.aa_counts(),
         &config::load_config(),
         link.resolution_is_one_run_only(),
-    )
+    );
+    config.cloud_curves = session_curves(&config);
+    config
 }
 
 /// The testable half of [`read_config_from_window`]: overwrite the UI-managed

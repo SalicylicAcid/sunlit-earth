@@ -1763,9 +1763,11 @@ fn test_a_replaced_layout_highlights_the_stored_anchor() {
 // ---------------------------------------------------------------------------
 
 /// The widest the settings panel is allowed to insist on being, set by a
-/// `SettingCombo` row: an 88px label, 4px of spacing, the 140px combo, and the
-/// panel's 8px + 22px of padding.
-const PANEL_FLOOR: f32 = 262.0;
+/// `SettingCombo` row: a 112px label, 4px of spacing, the 132px combo, and the
+/// panel's 8px + 22px of padding. The label column is pinned so every row's
+/// slider starts at the same x; widening it widens the floor by the same
+/// amount.
+const PANEL_FLOOR: f32 = 278.0;
 
 /// A layout counts an `if`-gated subtree towards its minimum width only once
 /// that repeater has been walked. A running app's layout pass does it; a test
@@ -1862,6 +1864,131 @@ fn test_the_narrowest_window_holds_the_panel_and_the_globe() {
         "only {}px left for the image at the window's minimum width",
         window.get_viewport_width()
     );
+}
+
+// ---------------------------------------------------------------------------
+// One slider column
+// ---------------------------------------------------------------------------
+
+/// The row's label Text, the first of the two the row carries.
+fn label_of(row: &ElementHandle) -> ElementHandle {
+    row.query_descendants()
+        .match_type_name("Text")
+        .find_all()
+        .first()
+        .expect("a row carries a label")
+        .clone()
+}
+
+/// The row's value Text, the second of the two the row carries.
+fn value_of(row: &ElementHandle) -> ElementHandle {
+    row.query_descendants()
+        .match_type_name("Text")
+        .find_all()
+        .last()
+        .expect("a row carries a value")
+        .clone()
+}
+
+/// The Date/Time override's rows, whose values carry a zone or a date
+/// ("16:23 UTC+2", "Sun 18 Oct") and so sit in an 80px value column where
+/// every other row's value fits in 35px. Their sliders start in the shared
+/// column like everybody's, and end 45px short of it.
+const WIDE_VALUE_ROWS: [&str; 2] = [
+    "MainWindow::custom-hour-slider",
+    "MainWindow::custom-day-slider",
+];
+
+/// Every slider row's control starts at the same x and every ordinary row's
+/// slider spans the same span to the same value column.
+///
+/// The label column is pinned by `label-width` in widgets.slint; a row whose
+/// label outgrows it wraps to a second line instead of pushing its slider
+/// right, which is what had set the Clouds group's sliders to four different
+/// left edges. This fails when a row grows a column of its own again.
+fn assert_sliders_share_one_column(window: &MainWindow) {
+    let rows: Vec<ElementHandle> = all_rows(window)
+        .into_iter()
+        .filter(|row| {
+            row.query_descendants()
+                .match_accessible_role(AccessibleRole::Slider)
+                .find_first()
+                .is_some()
+        })
+        .collect();
+    assert!(
+        rows.len() > 10,
+        "the panel should hold more than {} slider rows",
+        rows.len()
+    );
+
+    let mut slider_x: Option<f32> = None;
+    let mut label_end: Option<f32> = None;
+    let mut slider_width: Option<f32> = None;
+    let mut value_x: Option<f32> = None;
+    for row in &rows {
+        let id = row.id().unwrap_or_default();
+        let wide = WIDE_VALUE_ROWS.contains(&id.as_str());
+
+        let label = label_of(row);
+        let slider = slider_of(row);
+        let value = value_of(row);
+        // Geometry the testing backend reports in whole logical pixels, so a
+        // half-pixel of slack still keeps a 7px shift a failure. The label's
+        // left edge legitimately varies: a sub-row indents by 8px, and gives
+        // the same width up, so what must hold is where its column ends.
+        let same = |seen: &mut Option<f32>, found: f32, what: &str| match *seen {
+            Some(expected) => assert!(
+                (found - expected).abs() <= 0.5,
+                "the {what} of {id} sits at {found}, off the shared column at {expected}"
+            ),
+            None => *seen = Some(found),
+        };
+        same(
+            &mut label_end,
+            label.absolute_position().x + label.size().width,
+            "label column end",
+        );
+        same(&mut slider_x, slider.absolute_position().x, "slider x");
+        if !wide {
+            same(&mut slider_width, slider.size().width, "slider width");
+            same(&mut value_x, value.absolute_position().x, "value x");
+        }
+    }
+
+    // The panel's raw rows — the cloud check's spinbox and the date override's
+    // year spinbox — hold the same column, which they do by carrying the same
+    // label width the SettingRows do.
+    for id in ["MainWindow::cloud-poll-spinbox", "MainWindow::year-spinbox"] {
+        let found: Vec<_> = ElementHandle::find_by_element_id(window, id).collect();
+        let Some(spinbox) = found.into_iter().next() else {
+            continue;
+        };
+        let expected = slider_x.expect("a slider was seen");
+        assert!(
+            (spinbox.absolute_position().x - expected).abs() <= 0.5,
+            "the {id} sits at {}, off the shared column at {expected}",
+            spinbox.absolute_position().x
+        );
+    }
+}
+
+#[test]
+fn test_every_slider_row_shares_one_column() {
+    let SourceWindow { window, .. } = create_source_window();
+    // The Date/Time override brings its Time and Day rows up, the one place
+    // whose value column is its own.
+    window.set_datetime(DateTimeSettings {
+        use_custom: true,
+        ..window.get_datetime()
+    });
+
+    assert_sliders_share_one_column(&window);
+
+    let mut draft = window.get_cloud_source_draft();
+    draft.mode = 1;
+    window.set_cloud_source_draft(draft);
+    assert_sliders_share_one_column(&window);
 }
 
 #[test]

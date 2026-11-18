@@ -213,10 +213,11 @@ export component MainWindow inherits Window {
     icon: @image-url("../../../assets/icon/sunlit-earth.svg");
     preferred-width: 1000px;
     preferred-height: 600px;
-    // The panel's floor of 262px, the splitter, and `min-image-width` below it,
-    // rounded up. A binding from `panel.min-width` would keep itself honest but
-    // runs through the window's own layout; the test guards the arithmetic
-    // instead.
+    // The panel's floor of 278px (the widest row is a SettingCombo: its 112px
+    // label, 4px of spacing and the 132px combo), the splitter, and
+    // `min-image-width` below it, rounded up. A binding from `panel.min-width`
+    // would keep itself honest but runs through the window's own layout; the
+    // test guards the arithmetic instead.
     min-width: 520px;
 
     in property <string> version;
@@ -1181,7 +1182,6 @@ export component MainWindow inherits Window {
                         display-mode-combo := SettingCombo {
                             label: "Mode";
                             hint: "How the screens relate. One screen: only the screen below gets a wallpaper and the rest keep theirs. Mirror: every screen gets the same view, rendered at its own size and shape. Extend: one continuous view is spread across all of them.";
-                            label-width: 52px;
                             model: root.display-mode-options;
                             current-index <=> root.display-mode-index;
                             selected => { root.display-plan-changed(); }
@@ -1190,7 +1190,6 @@ export component MainWindow inherits Window {
                         display-screen-combo := SettingCombo {
                             label: "Screen";
                             hint: "Which screen gets the picture in one-screen mode, and which screen the view is centered on in the other two.";
-                            label-width: 52px;
                             model: root.display-screen-options;
                             current-index <=> root.display-anchor-index;
                             selected => { root.display-plan-changed(); }
@@ -1542,7 +1541,10 @@ export component MainWindow inherits Window {
 
                                         Text {
                                             text: "Year";
-                                            width: 88px - 8px;
+                                            // The label column the SettingRows
+                                            // hold, less the indent this row
+                                            // applies as padding.
+                                            width: 112px - 8px;
                                             vertical-alignment: center;
                                         }
 
@@ -1603,7 +1605,10 @@ export component MainWindow inherits Window {
 
                                         Text {
                                             text: "Check every";
-                                            width: 88px;
+                                            // The label column the SettingRows
+                                            // hold, so the spinbox starts where
+                                            // their sliders start.
+                                            width: 112px;
                                             vertical-alignment: center;
                                         }
 

@@ -134,6 +134,12 @@ export component ResetSlot inherits Rectangle {
 // hover text over both would open both. A `Tooltip` lowers to a full-size
 // child area, which inside a layout would claim a cell of its own, so the
 // label, the slider and the value sit in a Rectangle that carries it.
+//
+// The label and the value sit in pinned columns, so every row's control starts
+// and ends at the same x however long its label or value is. The label's
+// column is as wide as the panel's longest label needs on Windows; a wider
+// platform font wraps a long label to a second line rather than pushing the
+// control out of the column.
 export component SettingRow inherits Rectangle {
     in property <string> label;
     in property <string> hint;
@@ -141,8 +147,14 @@ export component SettingRow inherits Rectangle {
     // A sub-row shifts its label right and gives up the same width, so the
     // sliders of a group stay in one column whatever the nesting is.
     in property <length> indent: 0px;
-    in property <length> label-width: 88px;
-    in property <length> value-width: 45px;
+    // Wide enough for "Toward the equator", the panel's longest label, at the
+    // 12px default font. Every row shares it, so every slider shares its two
+    // edges. Widening this widens the panel's floor by the same amount; see
+    // `PANEL_FLOOR` in the slint_ui tests.
+    in property <length> label-width: 112px;
+    // Wide enough for "1.15×" and "130%", the widest values the panel draws,
+    // with slack for a wider platform font.
+    in property <length> value-width: 35px;
     in property <float> minimum;
     in property <float> maximum;
     in-out property <float> value;
@@ -176,7 +188,8 @@ export component SettingRow inherits Rectangle {
                 Text {
                     text: root.label;
                     vertical-alignment: center;
-                    min-width: root.label-width - root.indent;
+                    width: root.label-width - root.indent;
+                    wrap: word-wrap;
                 }
                 Slider {
                     minimum: root.minimum;
@@ -188,7 +201,7 @@ export component SettingRow inherits Rectangle {
                 Text {
                     text: root.value-text;
                     vertical-alignment: center;
-                    min-width: root.value-width;
+                    width: root.value-width;
                 }
             }
 
@@ -415,7 +428,7 @@ export component SettingColor inherits Rectangle {
     in property <string> label;
     in property <string> hint;
     in property <length> indent: 0px;
-    in property <length> label-width: 88px;
+    in property <length> label-width: 112px;
     in-out property <color> value;
     // What the row's reset puts back.
     in property <color> default-value;
@@ -446,7 +459,8 @@ export component SettingColor inherits Rectangle {
                 Text {
                     text: root.label;
                     vertical-alignment: center;
-                    min-width: root.label-width - root.indent;
+                    width: root.label-width - root.indent;
+                    wrap: word-wrap;
                 }
                 VerticalLayout {
                     alignment: center;
@@ -558,7 +572,7 @@ export component SettingCombo inherits Rectangle {
     in property <string> label;
     in property <string> hint;
     in property <length> indent: 0px;
-    in property <length> label-width: 88px;
+    in property <length> label-width: 112px;
     in property <[string]> model;
     in-out property <int> current-index;
     in property <bool> enabled: true;
@@ -576,15 +590,21 @@ export component SettingCombo inherits Rectangle {
         Text {
             text: root.label;
             vertical-alignment: center;
-            min-width: root.label-width - root.indent;
+            width: root.label-width - root.indent;
+            wrap: word-wrap;
         }
         ComboBox {
             // The fluent ComboBox asks for 160px flat, which would set the
-            // sidebar's floor. 140 fits the longest value the fixed models
-            // carry, at 93px of text inside 42px of padding, spacing and
-            // chevron, with slack for another platform's font. A screen label
-            // is longer than that and elides, as it did at 160.
-            min-width: 140px;
+            // sidebar's floor past the 280px the panel's budget allows. 132
+            // keeps the floor at 278px: a 112px label, 4px of spacing, and the
+            // panel's 8px + 22px of padding. That is under the longest value
+            // the fixed models carry, "Day/Night Blend" at 93px of text inside
+            // 42px of padding, spacing and chevron, so at panel widths past
+            // the floor — the 360px the window opens at, and every drag past
+            // it — the combo is wide enough and the value shows whole. At the
+            // floor itself the value elides, which the combo's own
+            // `overflow: elide` exists for.
+            min-width: 132px;
             model: root.model;
             current-index <=> root.current-index;
             max-height: 24px;
