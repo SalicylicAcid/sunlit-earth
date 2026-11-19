@@ -1637,15 +1637,6 @@ export component MainWindow inherits Window {
                                         }
                                     }
 
-                                    if root.cloud-source-draft.mode != 2 && !root.cloud-source-override : cloud-publication-note := Text {
-                                        text: root.cloud-source-draft.mode == 0
-                                            ? "UTC rounds every 3 hours (00, 03, 06...). Checks every 5 min until a new round is published; downloads only a new round."
-                                            : "Hourly UTC rounds. Checks every 5 min until a new round is published; downloads only a new round.";
-                                        wrap: word-wrap;
-                                        font-size: 11px;
-                                        color: Palette.foreground.with-alpha(0.7);
-                                    }
-
                                     if !root.auto-refresh-enabled : cloud-checks-paused-note := Text {
                                         text: "Scheduled checks are paused while Auto-refresh wallpaper is off; Refresh now still checks.";
                                         wrap: word-wrap;
@@ -1664,6 +1655,19 @@ export component MainWindow inherits Window {
                                         current-index <=> root.cloud-source-draft.mode;
                                         enabled: !root.cloud-source-override;
                                         selected => { root.cloud-source-selected(); }
+                                    }
+
+                                    // The schedule note sits under the row it
+                                    // explains: each native source states its
+                                    // own cadence, the one 5-minute case, and
+                                    // that imagery moves only with a new round.
+                                    if root.cloud-source-draft.mode != 2 && !root.cloud-source-override : cloud-publication-note := Text {
+                                        text: root.cloud-source-draft.mode == 0
+                                            ? "Checks upstream once per 3-hour UTC round (00:00, 03:00, 06:00, ...). If that round has not published yet, it re-checks every 5 minutes until it appears. Imagery is downloaded only for a new round."
+                                            : "Checks upstream once per hourly UTC round. If that round has not published yet, it re-checks every 5 minutes until it appears. Imagery is downloaded only for a new round.";
+                                        wrap: word-wrap;
+                                        font-size: 11px;
+                                        color: Palette.foreground.with-alpha(0.7);
                                     }
 
                                     if root.cloud-source-draft.mode == 2 :
