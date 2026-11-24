@@ -163,6 +163,10 @@ mod tests {
     #[test]
     fn saved_remote_source_and_runtime_override_reach_startup() {
         use sunlit_core::config::{CloudSourceConfig, CloudSourceMode};
+        // Resolving a source names the user's cache folder, which a test
+        // cannot reach: the case holds a scratch one for its thread.
+        let dir = ScratchDir::new("cloud_source_startup");
+        let _scratch = sunlit_core::user_state::scratch_for_this_thread(dir.path());
         // The mode is named: the config default is the native EUMETSAT one,
         // and this case is about a saved remote URL.
         let saved = CloudSourceConfig {

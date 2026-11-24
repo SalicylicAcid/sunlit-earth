@@ -79,7 +79,7 @@ impl CloudSource for RoundsSource {
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         let live = *self.live.lock().expect("the live round");
-        let stamp = live.format(&stamp_format()).expect("the stamp formats");
+        let stamp = live.format(stamp_format()).expect("the stamp formats");
         if known_etag == Some(stamp.as_str()) {
             return Ok(None);
         }
@@ -133,9 +133,8 @@ impl CloudSource for RoundsSource {
     }
 }
 
-fn stamp_format() -> Vec<time::format_description::BorrowedFormatItem<'static>> {
-    time::format_description::parse("[year][month][day][hour][minute]")
-        .expect("the stamp format parses")
+fn stamp_format() -> &'static [time::format_description::BorrowedFormatItem<'static>] {
+    time::macros::format_description!("[year][month][day][hour][minute]")
 }
 
 fn download_of(bytes: Vec<u8>) -> sunlit_core::assets::cloud_source::Download {

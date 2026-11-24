@@ -1082,7 +1082,7 @@ mod tests {
             &generation,
             &CloudArchive::new(None),
             None,
-            Duration::from_secs(86_400),
+            Duration::from_hours(24),
             Duration::ZERO,
             2048,
             true,

@@ -952,7 +952,7 @@ cloud_haze_band = 25.0"
         }
         let (table, changes) = nsmc_curve("");
         assert_eq!(table, earth("[cloud_source.nsmc]\n"));
-        assert!(changes.is_empty());
+        assert_eq!(changes, Vec::<Change>::new());
         // No section at all, and a section that is not a table.
         for source in ["[sunlit.earth]", "cloud_source = 3"] {
             let mut table = earth(source);
@@ -1049,7 +1049,7 @@ cloud_gamma_ocean = 0.75",
     #[test]
     fn a_file_without_a_flat_curve_gains_no_table() {
         let mut table = earth("longitude = 42.0");
-        assert!(apply(v6_to_v7, &mut table).is_empty());
+        assert_eq!(apply(v6_to_v7, &mut table), Vec::<Change>::new());
         assert!(!table.contains_key("cloud_curves"));
     }
 

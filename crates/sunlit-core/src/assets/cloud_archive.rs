@@ -27,10 +27,8 @@ const MANIFEST_VERSION: i64 = 2;
 
 /// The stamp format every archived round is filed and named under:
 /// `20260816T090000`, in UTC.
-fn stamp_format() -> Vec<time::format_description::BorrowedFormatItem<'static>> {
-    time::format_description::parse("[year][month][day]T[hour][minute][second]")
-        .expect("the stamp format parses")
-}
+const STAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
+    time::macros::format_description!("[year][month][day]T[hour][minute][second]");
 
 /// A round's stamp, in UTC — the zone the upstream names its rounds in,
 /// whatever offset the caller's scene instant carries:
@@ -38,7 +36,7 @@ fn stamp_format() -> Vec<time::format_description::BorrowedFormatItem<'static>> 
 pub(crate) fn stamp_of_round(round: time::OffsetDateTime) -> String {
     round
         .to_offset(time::OffsetDateTime::UNIX_EPOCH.offset())
-        .format(&stamp_format())
+        .format(STAMP_FORMAT)
         .unwrap_or_default()
 }
 
@@ -47,7 +45,7 @@ pub(crate) fn parse_stamp(stamp: &str) -> Option<time::OffsetDateTime> {
     if stamp.len() != 15 || !stamp.bytes().take(8).all(|b| b.is_ascii_digit()) {
         return None;
     }
-    time::PrimitiveDateTime::parse(stamp, &stamp_format())
+    time::PrimitiveDateTime::parse(stamp, STAMP_FORMAT)
         .ok()
         .map(time::PrimitiveDateTime::assume_utc)
 }
@@ -338,9 +336,7 @@ impl CloudArchive {
         let Some(dir) = self.entry_dir(key) else {
             return Vec::new();
         };
-        read_manifest(&dir)
-            .map(|manifest| manifest.rounds)
-            .unwrap_or_default()
+        read_manifest(&dir).map_or_default(|manifest| manifest.rounds)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -392,15 +388,13 @@ fn write_manifest(dir: &Path, manifest: &Manifest) {
 /// pinned rounds are never taken here, whatever they weigh.
 fn prune_to_budget(dir: &Path, manifest: &mut Manifest, budget_bytes: u64) {
     let entry_bytes = || -> u64 {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|entry| entry.metadata().ok())
-                    .map(|meta| meta.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.metadata().ok())
+                .map(|meta| meta.len())
+                .sum()
+        })
     };
     let mut taken: Vec<String> = Vec::new();
     while entry_bytes() > budget_bytes {

@@ -1768,10 +1768,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "unchanged samples and the mask must be exact"
-    )]
     fn trim_poles_preserves_every_valid_coordinate_without_poleward_copies() {
         let image = irregular_caps();
         let (result, _) = trim_poles(&image);
@@ -1787,10 +1783,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "masking must preserve exact zeros and untouched samples"
-    )]
     fn all_white_columns_and_deep_caps_never_fall_back_to_valid_data() {
         let mut image = gray(8, 180, 0.4);
         for y in 0..180 {
@@ -2018,10 +2010,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "saturated coverage must map to exactly one"
-    )]
     fn coverage_keeps_saturated_values_after_the_support_mask() {
         let image = GrayMap::new(1, 2, vec![1.0, 253.0 / 255.0]).unwrap();
         let settings = EumetsatSettings {

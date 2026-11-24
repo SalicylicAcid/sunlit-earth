@@ -327,6 +327,10 @@ struct Engine {
     /// The per-round archive, shared with the worker: the engine reads its
     /// index for coverage and holds its settings; the worker records into it.
     cloud_archive: CloudArchive,
+    /// The folder the caches live in, as the caller resolved it. The engine
+    /// never resolves it: a worker thread holds no claim on the user's
+    /// folders, and a test's scratch folder is thread-local to the test.
+    cache_dir: Option<std::path::PathBuf>,
     /// What the layer does outside the archive's span.
     cloud_backfill: CloudBackfillPolicy,
     /// The historical fetch in flight: dispatched, no result yet.
@@ -580,6 +584,7 @@ impl Engine {
             cloud_status: None,
             cloud_busy: false,
             cloud_archive,
+            cache_dir,
             cloud_backfill,
             cloud_fetch_in_flight: None,
             cloud_prefetch: HashMap::new(),
@@ -1064,7 +1069,7 @@ impl Engine {
         let source = crate::assets::cloud_source::resolve(
             config,
             crate::env_override(crate::config::clouds::ENV_CLOUD_URL).as_deref(),
-            crate::assets::cloud_fetcher::cache_dir().as_deref(),
+            self.cache_dir.as_deref(),
         );
         info!(source = %source.describe(), "the cloud source is switching");
         cloud.set_source(source);
@@ -2351,7 +2356,7 @@ mod tests {
             interval,
         );
         assert_eq!(quiet.cap, 1);
-        assert!(quiet.neighbours.is_empty());
+        assert_eq!(quiet.neighbours, Vec::<time::OffsetDateTime>::new());
 
         let moved = cloud_browse_plan(
             CloudBrowseKind::Time,
@@ -2382,7 +2387,7 @@ mod tests {
         );
         assert!(expired.expired);
         assert_eq!(expired.cap, 1);
-        assert!(expired.neighbours.is_empty());
+        assert_eq!(expired.neighbours, Vec::<time::OffsetDateTime>::new());
     }
 
     /// A fast time drag widens the span to two rounds either side.

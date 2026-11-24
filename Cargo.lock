@@ -5350,6 +5350,7 @@ dependencies = [
  "pollster",
  "proptest",
  "rayon",
+ "roxmltree",
  "rustix 1.1.6",
  "semver",
  "serde",

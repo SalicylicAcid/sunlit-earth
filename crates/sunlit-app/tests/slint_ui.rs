@@ -10688,7 +10688,7 @@ fn test_show_clouds_hides_the_whole_source_section() {
         clouds
     });
     assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
-    assert!(!schedule_note(&window).is_empty());
+    assert_ne!(schedule_note(&window), "");
     assert!(!param_row_present(
         &window,
         "MainWindow::cloud-poll-spinbox"
@@ -10751,7 +10751,7 @@ fn test_the_paused_checks_note_follows_auto_refresh() {
         clouds.enabled = false;
         clouds
     });
-    assert!(schedule_note(&window).is_empty());
+    assert_eq!(schedule_note(&window), "");
 }
 
 /// An edit arms the debounced settings write: one write a second after the

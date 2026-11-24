@@ -48,11 +48,11 @@ pub(super) fn covering_round(
 /// A round as the round line spells it, in UTC — the zone the upstream
 /// names its rounds in: `2026-08-16 09:00`.
 pub(super) fn round_text(round: OffsetDateTime) -> String {
-    let format = time::format_description::parse("[year]-[month]-[day] [hour]:[minute]")
-        .expect("the round text format parses");
     round
         .to_offset(OffsetDateTime::UNIX_EPOCH.offset())
-        .format(&format)
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]"
+        ))
         .unwrap_or_default()
 }
 

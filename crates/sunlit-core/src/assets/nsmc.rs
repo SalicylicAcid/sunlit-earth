@@ -243,11 +243,11 @@ fn parse_round_instant(stamp: &str) -> Option<time::OffsetDateTime> {
 /// the zone the upstream names its rounds in, whatever offset the caller's
 /// scene instant carries.
 fn round_stamp(round: time::OffsetDateTime) -> String {
-    let format = time::format_description::parse("[year][month][day][hour][minute]")
-        .expect("the round stamp format parses");
     round
         .to_offset(time::OffsetDateTime::UNIX_EPOCH.offset())
-        .format(&format)
+        .format(time::macros::format_description!(
+            "[year][month][day][hour][minute]"
+        ))
         .expect("the round stamp formats")
 }
 
@@ -709,8 +709,7 @@ impl NsmcCloudSource {
             round: round.to_owned(),
             fetched_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         };
         let manifest =
             toml::to_string(&manifest).map_err(|e| format!("the raw manifest failed: {e}"))?;
@@ -1046,7 +1045,12 @@ fn decode_alpha_sized(body: &[u8], width: u32, height: u32) -> Result<Vec<u8>, S
         .decode()
         .map_err(|e| format!("the mosaic PNG did not decode: {e}"))?;
     let rgba = img.into_rgba8().into_raw();
-    Ok(rgba.chunks_exact(4).map(|pixel| pixel[3]).collect())
+    Ok(rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| pixel[3])
+        .collect())
 }
 
 /// A round whose alpha carries no information is not a map: the service
@@ -1496,10 +1500,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "unchanged samples and empty sky must be exact"
-    )]
     fn polar_fade_keeps_sparse_clouds_without_copying_them_poleward() {
         let mut alpha = vec![0u8; 8 * 180];
         alpha[15 * 8 + 3] = 100;
@@ -1517,10 +1517,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "full support must keep the exact original value"
-    )]
     fn polar_fade_is_smooth_and_symmetric_over_five_degrees() {
         let mut alpha = vec![0u8; 180];
         alpha[15..165].fill(255);
@@ -1563,10 +1559,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::float_cmp,
-        reason = "missing polar samples must remain exactly zero"
-    )]
     fn polar_fade_never_extends_a_single_observed_row() {
         let mut alpha = vec![0u8; 8 * 180];
         alpha[30 * 8 + 2] = 75;

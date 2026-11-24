@@ -529,8 +529,7 @@ impl CloudUpdater {
                 info!(
                     round = image
                         .round
-                        .map(super::cloud_archive::stamp_of_round)
-                        .unwrap_or_default(),
+                        .map_or_default(super::cloud_archive::stamp_of_round),
                     elapsed_secs = format_args!("{:.1}", start.elapsed().as_secs_f64()),
                     "the historical round is fetched"
                 );
