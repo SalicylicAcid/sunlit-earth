@@ -45,12 +45,6 @@ fn init() {
     INITIALIZED.with(|flag| {
         if !*flag.borrow() {
             i_slint_backend_testing::init_no_event_loop();
-            // An edit arms a debounced settings write whose default lands in
-            // the developer's own config file, which this process must never
-            // do. Every test thread's write is inert unless its case installs
-            // an action of its own.
-            let inert: sunlit_earth::ui_callbacks::SettingsSaveAction = Rc::new(|_, _| {});
-            ui_callbacks::set_settings_save_action(Some(inert));
             *flag.borrow_mut() = true;
         }
     });
@@ -10067,6 +10061,9 @@ struct SourceWindow {
 }
 
 fn create_source_window() -> SourceWindow {
+    // The action callbacks registered below save the config, which is the
+    // user's file: the test thread holds a scratch one for it.
+    scratch_user_state();
     let window = create_window();
     // The Clouds group is part of the Advanced section, whose rows the
     // testing backend materializes only while it is open.
