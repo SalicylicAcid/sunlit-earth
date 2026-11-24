@@ -233,6 +233,10 @@ fn init_ui(
 
     ui_callbacks::register_color_text(window);
     ui_callbacks::apply_config_to_window(window, config);
+    // The Advanced section's open state belongs to the window a session starts
+    // with, not to the scene: Load Defaults and Revert to Saved reset what is
+    // drawn and leave the panel as the person left it.
+    window.set_advanced_open(config.advanced_open);
     ui_callbacks::set_combobox_indices(
         &window.as_weak(),
         ui_callbacks::ComboIndices::of(
@@ -271,6 +275,19 @@ fn register_auto_refresh_callback(
     let engine = link.clone();
     let prev_enabled = std::cell::Cell::new(config.auto_refresh_enabled);
     let settled = std::rc::Rc::clone(&save_timer);
+    // The Advanced section's open state is a setting of the window, so it is
+    // written as it changes rather than with the next save of anything else.
+    let advanced_window = window.as_weak();
+    let advanced_engine = link.clone();
+    window.on_advanced_toggled(move || {
+        let Some(win) = advanced_window.upgrade() else {
+            return;
+        };
+        config::save_config(&ui_callbacks::read_config_from_window(
+            &win,
+            &advanced_engine,
+        ));
+    });
     window.on_auto_refresh_changed(move || {
         let Some(win) = window_weak.upgrade() else {
             return;

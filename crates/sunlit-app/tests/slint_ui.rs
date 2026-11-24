@@ -1284,6 +1284,20 @@ fn test_the_advanced_controls_are_in_the_tree_only_while_it_is_open() {
     }
 }
 
+/// The Advanced section's open state is a setting of the window: the config
+/// carries it, and the window's state is what a save reads back.
+#[test]
+fn a_save_reads_the_sections_open_state() {
+    let (window, _sent) = wired_window();
+    assert!(!AppConfig::default().advanced_open, "the default is closed");
+    for open in [true, false, true] {
+        window.set_advanced_open(open);
+        let read =
+            ui_callbacks::read_config_from_window_onto(&window, &[], &AppConfig::default(), false);
+        assert_eq!(read.advanced_open, open, "a save reads the section's state");
+    }
+}
+
 /// The Advanced toggle's indicator is a drawn triangle, not a spelled glyph:
 /// Segoe UI, which the 1.19 text stack sets on Windows, has the down-pointing
 /// character and not the right-pointing one, so the closed state drew a hollow

@@ -327,6 +327,8 @@ export component MainWindow inherits Window {
     // switch, not a draft of one.
     callback cloud-source-selected();
     callback refresh-clouds();
+    /// The Advanced section was opened or closed, which the config keeps.
+    callback advanced-toggled();
     callback abort-clouds();
     callback cloud-history-changed();
     callback cloud-cache-changed();
@@ -1253,7 +1255,10 @@ export component MainWindow inherits Window {
 
                     TouchArea {
                         height: 24px;
-                        clicked => { root.advanced-open = !root.advanced-open; }
+                        clicked => {
+                            root.advanced-open = !root.advanced-open;
+                            root.advanced-toggled();
+                        }
 
                         HorizontalLayout {
                             spacing: 4px;
@@ -1263,7 +1268,9 @@ export component MainWindow inherits Window {
                             // right-pointing one, a text rotation does not
                             // render here, and the software backend ignores
                             // one besides. A path is the same shape on every
-                            // backend and in every font.
+                            // backend and in every font. The box it sits in is
+                            // the whole row, so the path centres on the same
+                            // line as the label.
                             Rectangle {
                                 width: 9px;
                                 height: 24px;

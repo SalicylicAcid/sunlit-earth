@@ -1860,6 +1860,7 @@ pub fn read_config_from_window_onto(
         auto_refresh_interval_minutes: slider_u32(window.get_auto_refresh_interval()),
         overlays_hidden: window.get_overlays_hidden(),
         time_bar_pinned: window.get_time_bar_pinned(),
+        advanced_open: window.get_advanced_open(),
         time_zone: if window.get_time_zone_utc() {
             config::TimeZoneChoice::Utc
         } else {

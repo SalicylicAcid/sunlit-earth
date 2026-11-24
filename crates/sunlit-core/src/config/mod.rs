@@ -464,6 +464,9 @@ pub struct AppConfig {
     /// Whether the time bar stays open and at full strength wherever the
     /// pointer is.
     pub time_bar_pinned: bool,
+    /// Whether the settings panel's Advanced section is open. A setting of the
+    /// window, not of what is drawn.
+    pub advanced_open: bool,
 
     // Window geometry (None on first launch — let the OS place the window)
     pub window_x: Option<i32>,
@@ -688,6 +691,7 @@ impl Default for AppConfig {
             overlays_hidden: false,
             time_zone: TimeZoneChoice::Local,
             time_bar_pinned: false,
+            advanced_open: false,
             window_x: None,
             window_y: None,
             window_width: None,
@@ -1259,6 +1263,7 @@ mod tests {
             overlays_hidden: true,
             time_zone: TimeZoneChoice::Utc,
             time_bar_pinned: true,
+            advanced_open: true,
             window_x: Some(100),
             window_y: Some(200),
             window_width: Some(1024),
@@ -1548,6 +1553,7 @@ sky_fov = 111.0
             overlays_hidden: true,
             time_zone: TimeZoneChoice::Utc,
             time_bar_pinned: true,
+            advanced_open: true,
             window_x: Some(50),
             window_y: Some(75),
             window_width: Some(800),
