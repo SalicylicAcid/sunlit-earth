@@ -1257,10 +1257,29 @@ export component MainWindow inherits Window {
 
                         HorizontalLayout {
                             spacing: 4px;
-                            Text {
-                                text: root.advanced-open ? "\u{25bc}" : "\u{25b6}";
-                                vertical-alignment: center;
-                                font-size: 11px;
+                            // The disclosure triangle is drawn, not spelled:
+                            // Segoe UI, which the 1.19 text stack sets on
+                            // Windows, has the down-pointing glyph and not the
+                            // right-pointing one, a text rotation does not
+                            // render here, and the software backend ignores
+                            // one besides. A path is the same shape on every
+                            // backend and in every font.
+                            Rectangle {
+                                width: 9px;
+                                height: 24px;
+
+                                Path {
+                                    x: 0;
+                                    y: (parent.height - 9px) / 2;
+                                    width: 9px;
+                                    height: 9px;
+                                    viewbox-width: 10;
+                                    viewbox-height: 10;
+                                    fill: Palette.foreground;
+                                    commands: root.advanced-open
+                                        ? "M1 3 L9 3 L5 8.5 Z"
+                                        : "M2.5 1 L8.5 5 L2.5 9 Z";
+                                }
                             }
                             Text {
                                 text: "Advanced";

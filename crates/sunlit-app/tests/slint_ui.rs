@@ -1284,6 +1284,36 @@ fn test_the_advanced_controls_are_in_the_tree_only_while_it_is_open() {
     }
 }
 
+/// The Advanced toggle's indicator is a drawn triangle, not a spelled glyph:
+/// Segoe UI, which the 1.19 text stack sets on Windows, has the down-pointing
+/// character and not the right-pointing one, so the closed state drew a hollow
+/// box. Read from the source, because the harness cannot see which shape
+/// reached the screen and the point is that no font is asked for one.
+#[test]
+fn the_advanced_toggle_draws_its_triangle() {
+    const MAIN: &str = include_str!("../../sunlit-ui/ui/main.slint");
+    let start = MAIN
+        .find("// --- Advanced toggle ---")
+        .expect("main.slint has the Advanced toggle");
+    let end = MAIN[start..]
+        .find("// --- Collapsible advanced section ---")
+        .expect("the toggle ends where the section begins")
+        + start;
+    let block = &MAIN[start..end];
+    assert!(
+        !block.contains("\\u{25b6}"),
+        "the toggle spells no glyph the font lacks: {block}"
+    );
+    assert!(
+        block.contains("Path {") && block.contains("commands:"),
+        "the indicator is drawn from a path: {block}"
+    );
+    assert!(
+        !block.contains("transform-rotation"),
+        "the shape does not rely on a text rotation: {block}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Conditional visibility for the atmosphere
 // ---------------------------------------------------------------------------
