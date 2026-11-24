@@ -1262,6 +1262,12 @@ export component MainWindow inherits Window {
 
                         HorizontalLayout {
                             spacing: 4px;
+                            // The row is a pair, not a filled Text: two empty
+                            // columns take the slack so the triangle and the
+                            // label sit centred like the Presets heading above,
+                            // while the box around the path keeps them on one
+                            // line.
+                            Rectangle { horizontal-stretch: 1; }
                             // The disclosure triangle is drawn, not spelled:
                             // Segoe UI, which the 1.19 text stack sets on
                             // Windows, has the down-pointing glyph and not the
@@ -1293,6 +1299,7 @@ export component MainWindow inherits Window {
                                 vertical-alignment: center;
                                 font-weight: 700;
                             }
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
 
