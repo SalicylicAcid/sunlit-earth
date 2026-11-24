@@ -394,7 +394,7 @@ mod tests {
             assert_eq!(
                 capped > 0,
                 capped_somewhere,
-                "at {sky_fov} degrees of sky the coarse gain capped the fine one                  at {capped} of 1001 zooms"
+                "at {sky_fov} degrees of sky the coarse gain capped the fine one at {capped} of 1001 zooms"
             );
         }
     }

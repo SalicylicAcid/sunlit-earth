@@ -1200,7 +1200,7 @@ fn every_golden_case_is_distinguishable() {
             );
             assert!(
                 mean > MEAN_TOLERANCE || outliers > OUTLIER_FRACTION,
-                "{} and {} compare equal (mean {mean:.2}, outliers {:.2}%): either the                  tolerance is too loose or the cases overlap",
+                "{} and {} compare equal (mean {mean:.2}, outliers {:.2}%): either the tolerance is too loose or the cases overlap",
                 names[i],
                 names[j],
                 outliers * 100.0

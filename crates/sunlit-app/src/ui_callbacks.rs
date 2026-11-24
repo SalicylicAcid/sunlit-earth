@@ -633,6 +633,66 @@ pub fn register_change_callbacks(window: &MainWindow, link: &EngineLink) {
     });
 }
 
+/// Register the archive's four setting callbacks: each sends its command
+/// at once (a combo is a commit) and arms the debounced settings write.
+fn register_cloud_setting_callbacks(window: &MainWindow, link: &EngineLink) {
+    {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
+        window.on_cloud_history_changed(move || {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            let hours = config_cloud_history_at(win.get_cloud_history_index());
+            engine.set_cloud_history_hours(hours);
+            arm_settings_save(&win, &engine);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
+        window.on_cloud_cache_changed(move || {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            let mode = sunlit_core::config::CloudCacheMode::at(
+                usize::try_from(win.get_cloud_cache_index().max(0)).unwrap_or(0),
+            );
+            engine.set_cloud_cache_mode(mode);
+            arm_settings_save(&win, &engine);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
+        window.on_cloud_budget_changed(move || {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            let budget = config_cloud_budget_at(win.get_cloud_budget_index());
+            engine.set_cloud_archive_budget(budget);
+            arm_settings_save(&win, &engine);
+        });
+    }
+
+    {
+        let window_weak = window.as_weak();
+        let engine = link.clone();
+        window.on_cloud_backfill_changed(move || {
+            let Some(win) = window_weak.upgrade() else {
+                return;
+            };
+            let policy = sunlit_core::config::CloudBackfillPolicy::at(
+                usize::try_from(win.get_cloud_backfill_index().max(0)).unwrap_or(0),
+            );
+            engine.set_cloud_backfill_policy(policy);
+            arm_settings_save(&win, &engine);
+        });
+    }
+}
+
 /// Register action callbacks: set wallpaper, load defaults, reset.
 ///
 /// `screens` is the shared monitor list the Displays group is built from, read
@@ -666,6 +726,8 @@ pub fn register_action_callbacks(
             cloud_source_selected(&win, &engine);
         });
     }
+
+    register_cloud_setting_callbacks(window, link);
 
     {
         let engine = link.clone();
@@ -932,6 +994,29 @@ pub fn apply_config_to_window(window: &MainWindow, config: &AppConfig) {
     let poll_default = config::AppConfig::default().cloud_poll_mins as i32;
     window.set_cloud_poll_defaults(poll_default);
 
+    // The archive's four settings, seeded from the config and from the
+    // defaults the group's reset goes back to.
+    let history_index = config_cloud_history_index(config.cloud_history_hours);
+    window.set_cloud_history_index(history_index);
+    window.set_cloud_history_default_index(config_cloud_history_index(
+        config::AppConfig::default().cloud_history_hours,
+    ));
+    let cache_index = combo_index(config.cloud_cache_mode.index_of());
+    window.set_cloud_cache_index(cache_index);
+    window.set_cloud_cache_default_index(combo_index(
+        sunlit_core::config::CloudCacheMode::default().index_of(),
+    ));
+    let budget_index = config_cloud_budget_index(config.cloud_archive_budget_mb);
+    window.set_cloud_budget_index(budget_index);
+    window.set_cloud_budget_default_index(config_cloud_budget_index(
+        config::AppConfig::default().cloud_archive_budget_mb,
+    ));
+    let backfill_index = combo_index(config.cloud_backfill.index_of());
+    window.set_cloud_backfill_index(backfill_index);
+    window.set_cloud_backfill_default_index(combo_index(
+        sunlit_core::config::CloudBackfillPolicy::default().index_of(),
+    ));
+
     update_datetime_labels(window);
 }
 
@@ -1021,6 +1106,46 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
     }
 }
 
+/// How long a switch's or an Apply's confirmation holds the cloud status
+/// line before the round line takes it back. A validation error stays: it
+/// waits to be fixed, not to time out.
+const CLOUD_FEEDBACK_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+thread_local! {
+    /// The one pending feedback clear. Slint timers run on the event loop's
+    /// thread, which is where every write here happens.
+    static CLOUD_FEEDBACK_CLEAR: RefCell<Option<slint::Timer>> = const { RefCell::new(None) };
+}
+
+/// Put `text` in the Clouds group's one status line, in place of the round
+/// line. A confirmation is taken back out after [`CLOUD_FEEDBACK_LINGER`],
+/// so the line returns to the round state; an error stays until the next
+/// switch, Apply, or reset clears it. A late timer compares the text it
+/// wrote, so it can never wipe a newer message.
+fn show_cloud_feedback(win: &MainWindow, text: &str, transient: bool) {
+    win.set_cloud_source_status(text.into());
+    if !transient {
+        return;
+    }
+    let expected = text.to_owned();
+    let weak = win.as_weak();
+    CLOUD_FEEDBACK_CLEAR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let timer = slot.get_or_insert_with(slint::Timer::default);
+        timer.start(
+            slint::TimerMode::SingleShot,
+            CLOUD_FEEDBACK_LINGER,
+            move || {
+                if let Some(win) = weak.upgrade()
+                    && win.get_cloud_source_status().as_str() == expected
+                {
+                    win.set_cloud_source_status("".into());
+                }
+            },
+        );
+    });
+}
+
 /// The Apply button: validate the draft as one, then switch the engine,
 /// save, and put the applied value back. An invalid draft says so and
 /// touches nothing. The export gate is cleared here, so the sheet can never
@@ -1028,9 +1153,10 @@ fn cloud_source_config_from(settings: &CloudSourceSettings) -> config::CloudSour
 fn apply_cloud_source(win: &MainWindow, engine: &EngineLink, draft: &CloudSourceSettings) {
     let source = cloud_source_config_from(draft);
     if !source.is_valid() {
-        win.set_cloud_source_status(
-            "The source is not valid: the URL must be HTTP or HTTPS without embedded              credentials, 0 <= floor < ceiling <= 255, gamma in [0.1, 4], blur in              [0, 10], and the NSMC peak in [0.3, 1]. Nothing was applied."
-                .into(),
+        show_cloud_feedback(
+            win,
+            "The source is not valid: the URL must be HTTP or HTTPS without embedded credentials, 0 <= floor < ceiling <= 255, gamma in [0.1, 4], blur in [0, 10], and the NSMC peak in [0.3, 1]. Nothing was applied.",
+            false,
         );
         return;
     }
@@ -1067,7 +1193,7 @@ fn switch_cloud_source(
     set_session_curves(saved.cloud_curves);
     push_cloud_curve_to_window(win, &saved);
     engine.push_params(win);
-    win.set_cloud_source_status(status.into());
+    show_cloud_feedback(win, status, true);
     write_settings(win, engine, || saved);
 }
 
@@ -1103,6 +1229,74 @@ fn push_cloud_curve_to_window(win: &MainWindow, config: &AppConfig) {
     win.set_defaults(scene_settings(&SceneParams::from_config(
         &AppConfig::defaults_for(config.cloud_source.mode),
     )));
+}
+
+/// The i32 the combo properties take, from the usize the config vocabulary
+/// numbers its modes with.
+#[expect(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "combo indices 0..=5 are far inside the i32 the property takes"
+)]
+fn combo_index(index: usize) -> i32 {
+    index as i32
+}
+
+/// The retention hours the Keep history combo's index names: a day, three
+/// days, a week, a month, a year, unlimited.
+pub(crate) fn config_cloud_history_at(index: i32) -> Option<u32> {
+    match index {
+        0 => Some(24),
+        1 => Some(72),
+        2 => Some(168),
+        3 => Some(720),
+        4 => Some(8_760),
+        _ => None,
+    }
+}
+
+/// The combo's index for a retention window, `None` (unlimited) last.
+pub(crate) fn config_cloud_history_index(hours: Option<u32>) -> i32 {
+    match hours {
+        Some(24) => 0,
+        Some(72) => 1,
+        Some(168) => 2,
+        Some(720) => 3,
+        Some(8_760) => 4,
+        _ => 5,
+    }
+}
+
+/// The megabytes the Archive size limit combo's index names: unlimited, 1,
+/// 5, 20, 50 GB.
+pub(crate) fn config_cloud_budget_at(index: i32) -> Option<u32> {
+    match index {
+        1 => Some(1_024),
+        2 => Some(5_120),
+        3 => Some(20_480),
+        4 => Some(51_200),
+        _ => None,
+    }
+}
+
+/// The combo's index for a budget, `None` (unlimited) first.
+pub(crate) fn config_cloud_budget_index(budget: Option<u32>) -> i32 {
+    match budget {
+        Some(1_024) => 1,
+        Some(5_120) => 2,
+        Some(20_480) => 3,
+        Some(51_200) => 4,
+        _ => 0,
+    }
+}
+
+/// The engine's cloud round line, handed to the window on the UI thread.
+pub fn cloud_round_to_ui(window: slint::Weak<MainWindow>, text: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(win) = window.upgrade() {
+            win.set_cloud_round_text(text.into());
+        }
+    });
 }
 
 /// The engine's cloud status line, handed to the window on the UI thread.
@@ -1686,6 +1880,14 @@ pub fn read_config_from_window_onto(
     config.cloud_source = cloud_source_config_from(&window.get_cloud_source());
     let poll_mins = u32::try_from(window.get_cloud_poll_mins().clamp(5, 1440)).unwrap_or(60);
     config.cloud_poll_mins = poll_mins;
+    config.cloud_history_hours = config_cloud_history_at(window.get_cloud_history_index());
+    config.cloud_cache_mode = sunlit_core::config::CloudCacheMode::at(
+        usize::try_from(window.get_cloud_cache_index().max(0)).unwrap_or(0),
+    );
+    config.cloud_archive_budget_mb = config_cloud_budget_at(window.get_cloud_budget_index());
+    config.cloud_backfill = sunlit_core::config::CloudBackfillPolicy::at(
+        usize::try_from(window.get_cloud_backfill_index().max(0)).unwrap_or(0),
+    );
     config
 }
 

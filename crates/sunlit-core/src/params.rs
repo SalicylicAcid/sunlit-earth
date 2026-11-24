@@ -398,6 +398,12 @@ impl std::ops::Deref for OutputParams {
     }
 }
 
+impl std::ops::DerefMut for OutputParams {
+    fn deref_mut(&mut self) -> &mut SceneParams {
+        &mut self.0
+    }
+}
+
 /// Quantize a float to integer thousandths.
 #[expect(
     clippy::cast_possible_truncation,

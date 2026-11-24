@@ -51,6 +51,15 @@ pub struct EngineConfig {
     /// case, and the default for tests that do not care about clouds).
     pub cloud: Option<Arc<dyn CloudSource>>,
     pub cloud_poll_interval: Duration,
+    /// How many hours of cloud history the per-round archive keeps; `None`
+    /// unlimited. `None` here also, with `cache_dir`, is the archive default.
+    pub cloud_history_hours: Option<u32>,
+    /// What the archive keeps per round.
+    pub cloud_cache_mode: crate::config::CloudCacheMode,
+    /// The archive's disk budget in megabytes; `None` unlimited.
+    pub cloud_archive_budget_mb: Option<u32>,
+    /// What the layer does outside the archive's span.
+    pub cloud_backfill: crate::config::CloudBackfillPolicy,
     /// The app's data directory, holding the cloud image cache and the tile
     /// packs. `None` disables both, and with them the cube surface.
     pub cache_dir: Option<PathBuf>,
@@ -127,6 +136,10 @@ impl EngineConfig {
             clock: Arc::new(SystemClock::new()),
             cloud: None,
             cloud_poll_interval: Duration::from_hours(1),
+            cloud_history_hours: None,
+            cloud_cache_mode: crate::config::CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: crate::config::CloudBackfillPolicy::default(),
             cache_dir: None,
             auto_refresh: None,
             wallpaper: Arc::new(wallpaper_sink::SystemWallpaper),
@@ -204,10 +217,30 @@ impl EngineHandle {
     }
 
     /// Set the minutes between checks of the cloud source, in place of the
-    /// one-hour default. The source's own gate still decides whether a
-    /// check downloads anything.
+    /// one-hour default. The source's own gate still decides whether a check
+    /// downloads anything.
     pub fn set_cloud_poll_interval(&self, mins: u32) {
         self.send(EngineCommand::SetCloudPollInterval(mins));
+    }
+
+    /// Set how many hours of cloud history the per-round archive keeps.
+    pub fn set_cloud_history_hours(&self, hours: Option<u32>) {
+        self.send(EngineCommand::SetCloudHistoryLimit(hours));
+    }
+
+    /// Set what the archive caches per round.
+    pub fn set_cloud_cache_mode(&self, mode: crate::config::CloudCacheMode) {
+        self.send(EngineCommand::SetCloudCacheMode(mode));
+    }
+
+    /// Set the archive's disk budget in megabytes.
+    pub fn set_cloud_archive_budget(&self, budget: Option<u32>) {
+        self.send(EngineCommand::SetCloudArchiveBudget(budget));
+    }
+
+    /// Set what the layer does outside the archive's span.
+    pub fn set_cloud_backfill_policy(&self, policy: crate::config::CloudBackfillPolicy) {
+        self.send(EngineCommand::SetCloudBackfillPolicy(policy));
     }
 
     /// Description of the selected GPU adapter, for the UI's renderer label.
@@ -274,6 +307,19 @@ impl EngineHandle {
         let (reply, replies) = bounded(1);
         self.tx
             .send(EngineCommand::ReportTiles { reply })
+            .map_err(|_| "engine has stopped".to_owned())?;
+        replies
+            .recv()
+            .map_err(|_| "engine stopped before answering".to_owned())
+    }
+
+    /// The rounds the cloud cache holds on the GPU, for the soak and cache
+    /// tests: a prefetched neighbour reads here before the time bar reaches
+    /// it.
+    pub fn cloud_cache_rounds(&self) -> Result<Vec<Option<time::OffsetDateTime>>, String> {
+        let (reply, replies) = bounded(1);
+        self.tx
+            .send(EngineCommand::ReportCloudCache { reply })
             .map_err(|_| "engine has stopped".to_owned())?;
         replies
             .recv()

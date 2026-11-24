@@ -97,6 +97,26 @@ impl EngineLink {
         self.send(EngineCommand::SetCloudSource(Box::new(config)));
     }
 
+    /// Set how many hours of cloud history the per-round archive keeps.
+    pub fn set_cloud_history_hours(&self, hours: Option<u32>) {
+        self.send(EngineCommand::SetCloudHistoryLimit(hours));
+    }
+
+    /// Set what the archive caches per round.
+    pub fn set_cloud_cache_mode(&self, mode: sunlit_core::config::CloudCacheMode) {
+        self.send(EngineCommand::SetCloudCacheMode(mode));
+    }
+
+    /// Set the archive's disk budget in megabytes.
+    pub fn set_cloud_archive_budget(&self, budget: Option<u32>) {
+        self.send(EngineCommand::SetCloudArchiveBudget(budget));
+    }
+
+    /// Set what the layer does outside the archive's span.
+    pub fn set_cloud_backfill_policy(&self, policy: sunlit_core::config::CloudBackfillPolicy) {
+        self.send(EngineCommand::SetCloudBackfillPolicy(policy));
+    }
+
     /// Tell the engine whether anyone is looking at the preview.
     ///
     /// A hidden window costs a full readback plus a `SharedPixelBuffer` copy
@@ -289,9 +309,14 @@ pub fn event_forwarder(
             crate::export::CLOUDS.drawn.store(drawn, Ordering::Relaxed);
             let _ = slint::invoke_from_event_loop(crate::export::clouds_settled);
         }
-        EngineEvent::CloudStatus(status) => {
-            crate::ui_callbacks::cloud_status_to_ui(weak.clone(), status);
+        EngineEvent::CloudRound { text } => {
+            crate::ui_callbacks::cloud_round_to_ui(weak.clone(), text);
         }
+        // The engine's cloud status is the round line's business now: its
+        // actionable lines fold into CloudRound, and the window's status row
+        // carries only the Apply/switch feedback the UI itself writes. The
+        // one-shot commands still read this event for their own reporting.
+        EngineEvent::CloudStatus(_) => {}
         EngineEvent::CloudBusy(busy) => {
             crate::ui_callbacks::cloud_busy_to_ui(weak.clone(), busy);
         }

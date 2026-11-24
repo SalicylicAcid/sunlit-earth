@@ -10083,6 +10083,15 @@ fn url_row(window: &MainWindow) -> bool {
     param_row_present(window, "MainWindow::cloud-url")
 }
 
+/// The schedule note's text, which is empty while the layer is off.
+fn schedule_note(window: &MainWindow) -> String {
+    ElementHandle::find_by_element_id(window, "MainWindow::cloud-schedule-note")
+        .next()
+        .and_then(|element| element.accessible_label())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Whether one of the section's parameter rows is in the tree, which is how
 /// the conditional `if` blocks show and hide them.
 fn param_row_present(window: &MainWindow, id: &str) -> bool {
@@ -10597,6 +10606,7 @@ fn every_slider_producible_draft_applies_inside_the_domain() {
 #[test]
 fn test_native_clouds_show_their_publication_schedule_instead_of_a_poll_interval() {
     let SourceWindow { window, .. } = create_source_window();
+    window.set_auto_refresh_enabled(true);
     for mode in [0, 1, 2] {
         let mut draft = window.get_cloud_source_draft();
         draft.mode = mode;
@@ -10605,20 +10615,19 @@ fn test_native_clouds_show_their_publication_schedule_instead_of_a_poll_interval
             param_row_present(&window, "MainWindow::cloud-poll-spinbox"),
             mode == 2
         );
-        assert_eq!(
-            param_row_present(&window, "MainWindow::cloud-publication-note"),
-            mode != 2
-        );
+        let note = schedule_note(&window);
+        match mode {
+            0 => assert!(note.contains("3-hour"), "{note}"),
+            1 => assert!(note.contains("hourly"), "{note}"),
+            _ => assert!(note.contains("minutes"), "{note}"),
+        }
     }
     window.set_cloud_source_override(true);
     let mut draft = window.get_cloud_source_draft();
     draft.mode = 0;
     window.set_cloud_source_draft(draft);
     assert!(param_row_present(&window, "MainWindow::cloud-poll-spinbox"));
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-publication-note"
-    ));
+    assert!(schedule_note(&window).contains("SUNLIT_EARTH_CLOUD_URL"));
 }
 
 #[test]
@@ -10679,10 +10688,7 @@ fn test_show_clouds_hides_the_whole_source_section() {
         clouds
     });
     assert!(param_row_present(&window, "MainWindow::cloud-source-combo"));
-    assert!(param_row_present(
-        &window,
-        "MainWindow::cloud-publication-note"
-    ));
+    assert!(!schedule_note(&window).is_empty());
     assert!(!param_row_present(
         &window,
         "MainWindow::cloud-poll-spinbox"
@@ -10706,6 +10712,10 @@ fn test_show_clouds_hides_the_whole_source_section() {
         &window,
         "MainWindow::cloud-floor-slider"
     ));
+    assert!(
+        schedule_note(&window).is_empty(),
+        "the note goes with the layer"
+    );
 
     window.set_clouds({
         let mut clouds = window.get_clouds();
@@ -10726,28 +10736,22 @@ fn test_the_paused_checks_note_follows_auto_refresh() {
         clouds
     });
     window.set_auto_refresh_enabled(false);
-    assert!(param_row_present(
-        &window,
-        "MainWindow::cloud-checks-paused-note"
-    ));
+    assert!(schedule_note(&window).contains("paused"));
 
     window.set_auto_refresh_enabled(true);
     assert!(
-        !param_row_present(&window, "MainWindow::cloud-checks-paused-note"),
+        !schedule_note(&window).contains("paused"),
         "the timer is on, so the checks are not paused"
     );
 
-    // With the layer off the whole section is hidden, note included.
+    // With the layer off the note goes with the rest of the section.
     window.set_auto_refresh_enabled(false);
     window.set_clouds({
         let mut clouds = window.get_clouds();
         clouds.enabled = false;
         clouds
     });
-    assert!(!param_row_present(
-        &window,
-        "MainWindow::cloud-checks-paused-note"
-    ));
+    assert!(schedule_note(&window).is_empty());
 }
 
 /// An edit arms the debounced settings write: one write a second after the

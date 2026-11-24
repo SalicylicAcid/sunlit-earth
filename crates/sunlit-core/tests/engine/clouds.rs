@@ -242,11 +242,11 @@ fn an_opacity_at_zero_switches_off_only_its_own_hemisphere() {
 
     assert!(
         day_only > deck + 40.0,
-        "with the night opacity at zero the night side reads {day_only:.1}, which is the deck          at {deck:.1} rather than the lit ground under it"
+        "with the night opacity at zero the night side reads {day_only:.1}, which is the deck at {deck:.1} rather than the lit ground under it"
     );
     assert!(
         (night_only - deck).abs() < 2.0,
-        "with only the night opacity up the night side reads {night_only:.1} rather than the          deck's {deck:.1}, so the layer is not drawing when the day slider is zero"
+        "with only the night opacity up the night side reads {night_only:.1} rather than the deck's {deck:.1}, so the layer is not drawing when the day slider is zero"
     );
 }
 
@@ -295,20 +295,20 @@ fn the_night_opacity_reaches_full_cover() {
     let covered = read(1.0);
     let deck = f64::from(base.cloud_night) * 255.0;
     println!(
-        "night opacity 0 reads {uncovered:.1}, default reads {partly:.1}, 1 reads {covered:.1},          the deck alone would read {deck:.1}"
+        "night opacity 0 reads {uncovered:.1}, default reads {partly:.1}, 1 reads {covered:.1}, the deck alone would read {deck:.1}"
     );
 
     assert!(
         (covered - deck).abs() < 2.0,
-        "at full night opacity the window reads {covered:.1} where the deck alone is {deck:.1},          so the ground under it is still showing through"
+        "at full night opacity the window reads {covered:.1} where the deck alone is {deck:.1}, so the ground under it is still showing through"
     );
     assert!(
         uncovered > covered + 40.0,
-        "the window reads {uncovered:.1} with the deck switched off and {covered:.1} with it          covering, which is not the lit ground this case needs under the deck"
+        "the window reads {uncovered:.1} with the deck switched off and {covered:.1} with it covering, which is not the lit ground this case needs under the deck"
     );
     assert!(
         partly > covered + 5.0 && partly < uncovered - 5.0,
-        "the default night opacity reads {partly:.1}, which is not between the {covered:.1} of          full cover and the {uncovered:.1} of none, so the slider is not doing the covering"
+        "the default night opacity reads {partly:.1}, which is not between the {covered:.1} of full cover and the {uncovered:.1} of none, so the slider is not doing the covering"
     );
 }
 
@@ -368,6 +368,16 @@ impl CountingClouds {
 }
 
 impl CloudSource for CountingClouds {
+    /// The historical fetch these cases are not about: the upstream holds
+    /// nothing, which the timeline learns once and never asks again.
+    fn fetch_round_at(
+        &self,
+        _round: time::OffsetDateTime,
+        _resolution: u32,
+    ) -> Result<Option<CloudImage>, String> {
+        Ok(None)
+    }
+
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
         if self.offline.load(Ordering::SeqCst) {
@@ -528,7 +538,12 @@ fn native_cloud_checks_follow_utc_rounds_and_wait_for_publication() {
         time::macros::datetime!(2026-11-18 05:59:30 UTC),
     ));
     let harness = Harness::start(|config| {
-        config.params = switched(true);
+        // Live time, as the press and the schedule this case counts are the
+        // live poll's; a fixed instant's press fetches its round instead.
+        config.params = SceneParams {
+            time: SceneTime::Live,
+            ..switched(true)
+        };
         config.cloud = Some(Arc::clone(&source) as Arc<dyn CloudSource>);
         config.clock = Arc::clone(&clock) as Arc<dyn sunlit_core::engine::clock::Clock>;
         config.cloud_poll_interval = Duration::from_hours(24);
@@ -590,7 +605,13 @@ fn scheduled_cloud_checks_follow_auto_refresh() {
     let source = Arc::new(CountingClouds::new(false));
     let clock = Arc::new(MockClock::new(time::OffsetDateTime::UNIX_EPOCH));
     let harness = Harness::start(|config| {
-        config.params = switched(true);
+        // Live time: this case is about the poll schedule, which the manual
+        // press drives only there — at a fixed instant the press fetches the
+        // covering round instead.
+        config.params = SceneParams {
+            time: SceneTime::Live,
+            ..switched(true)
+        };
         config.cloud = Some(Arc::clone(&source) as Arc<dyn CloudSource>);
         config.clock = Arc::clone(&clock) as Arc<dyn sunlit_core::engine::clock::Clock>;
         config.cloud_poll_interval = POLL;
@@ -809,6 +830,15 @@ impl HeldClouds {
 }
 
 impl CloudSource for HeldClouds {
+    /// As its poll's: these cases are not about history.
+    fn fetch_round_at(
+        &self,
+        _round: time::OffsetDateTime,
+        _resolution: u32,
+    ) -> Result<Option<CloudImage>, String> {
+        Ok(None)
+    }
+
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String> {
         self.entered.fetch_add(1, Ordering::SeqCst);
         let mut held = self.held.lock().expect("the hold");

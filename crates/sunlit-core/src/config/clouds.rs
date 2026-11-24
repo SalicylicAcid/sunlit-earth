@@ -407,6 +407,71 @@ fn valid_remote_url(raw: &str, template: bool) -> bool {
         })
 }
 
+/// What the archive keeps per round: the raw imagery always, and the rendered
+/// map beside it in [`CloudCacheMode::RawWithDerived`], the default, so a
+/// visited round serves without another derivation. `RawOnly` saves the map's
+/// space and re-derives — or refetches, where a source cannot — on serve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudCacheMode {
+    #[default]
+    #[serde(rename = "raw-with-derived")]
+    RawWithDerived,
+    #[serde(rename = "raw-only")]
+    RawOnly,
+}
+
+impl CloudCacheMode {
+    /// The mode the combo's index names.
+    pub fn at(index: usize) -> Self {
+        match index {
+            1 => Self::RawOnly,
+            _ => Self::RawWithDerived,
+        }
+    }
+
+    /// The combo's index for this mode.
+    pub fn index_of(self) -> usize {
+        match self {
+            Self::RawWithDerived => 0,
+            Self::RawOnly => 1,
+        }
+    }
+}
+
+/// What the layer does when the scene time lands outside the archive's span:
+/// fetch the covering round from the upstream, fetch it only on an explicit
+/// press, or wear nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudBackfillPolicy {
+    #[default]
+    #[serde(rename = "automatic")]
+    Automatic,
+    #[serde(rename = "refresh-only")]
+    RefreshOnly,
+    #[serde(rename = "never")]
+    Never,
+}
+
+impl CloudBackfillPolicy {
+    /// The policy the combo's index names.
+    pub fn at(index: usize) -> Self {
+        match index {
+            1 => Self::RefreshOnly,
+            2 => Self::Never,
+            _ => Self::Automatic,
+        }
+    }
+
+    /// The combo's index for this policy.
+    pub fn index_of(self) -> usize {
+        match self {
+            Self::Automatic => 0,
+            Self::RefreshOnly => 1,
+            Self::Never => 2,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

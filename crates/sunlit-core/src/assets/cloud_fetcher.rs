@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::config::{DEFAULT_TEXTURE_RESOLUTION, TEXTURE_RESOLUTIONS};
 
+use super::cloud_archive::CloudArchive;
 use super::cloud_haze;
 use super::cloud_source::{CloudSource, CloudTarget, Download};
 use super::mailbox::{CloudFrame, TextureMailbox};
@@ -236,8 +237,20 @@ pub(crate) enum PollOutcome {
     Abandoned,
 }
 
+/// What one call to [`CloudUpdater::ensure_round`] achieved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnsureOutcome {
+    /// The round's map is decoded and on its way to the mailbox.
+    Served,
+    /// The upstream does not hold the round, learned from its own round
+    /// list. Permanent: the engine marks the round unavailable.
+    Missing,
+    /// The fetch or the decode failed; transport-class, the caller retries.
+    Failed,
+}
+
 /// Turns a [`CloudSource`] into decoded frames in the texture mailbox, keeping
-/// the on-disk cache in step.
+/// the on-disk cache and the per-round archive in step.
 pub(crate) struct CloudUpdater {
     source: Arc<dyn CloudSource>,
     mailbox: TextureMailbox,
@@ -246,7 +259,11 @@ pub(crate) struct CloudUpdater {
     /// time so a pair carries the generation it was made for; the worker bumps
     /// it when the target changes.
     generation: Arc<AtomicU64>,
+    /// The per-round archive every landed round is recorded into.
+    archive: CloudArchive,
     cache_dir: Option<PathBuf>,
+    /// The texture resolution in force, which a historical fetch hands on.
+    resolution: u32,
     /// Avoid preparing the same offered resolution on every worker poll.
     variant: (u32, u32),
     /// The source, not this updater, owns URL resolution and cache identity.
@@ -284,6 +301,7 @@ impl CloudUpdater {
         mailbox: TextureMailbox,
         notify: NotifyFn,
         generation: Arc<AtomicU64>,
+        archive: CloudArchive,
         cache_dir: Option<PathBuf>,
         resolution: u32,
     ) -> Self {
@@ -296,7 +314,9 @@ impl CloudUpdater {
             mailbox,
             notify,
             generation,
+            archive,
             cache_dir,
+            resolution,
             variant,
             target,
             image_path,
@@ -305,6 +325,51 @@ impl CloudUpdater {
             posted: Cell::new(false),
             gate: None,
         }
+    }
+
+    /// Make this updater's entry the archive's active one, and seed the
+    /// archive from the startup cache while at it. The updater is built per
+    /// attempt, so the consumer calls this when it adopts an entry the
+    /// archive has not seen; without it the records land on disk while the
+    /// in-memory index the coverage decision reads stays empty.
+    pub(crate) fn activate_entry(&mut self) {
+        self.archive
+            .set_active(&self.target.cache_key, self.source.settled_round());
+        self.seed_from_cache();
+    }
+
+    /// Seed the archive from the startup cache: the last session's live frame
+    /// enters the index at its own round, from the source's own manifest, so
+    /// the first drag after a restart finds the recent rounds. The rendered
+    /// map is filed as it is on disk; raws are the live pipeline's own and
+    /// stay there.
+    pub fn seed_from_cache(&mut self) {
+        let Some(round) = self.source.settled_round() else {
+            return;
+        };
+        if self.archive.rounds().contains(&round) {
+            return;
+        }
+        let Some(path) = self.image_path.as_ref().filter(|p| p.exists()) else {
+            return;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return;
+        };
+        let (width, height) = self.variant;
+        let identity = format!("{width}x{height}|seeded");
+        self.archive.record(
+            &self.target.cache_key,
+            round,
+            &[],
+            Some((&bytes, &identity, width, height)),
+            false,
+        );
+        self.archive.set_current(Some(round));
+        info!(
+            round = %super::cloud_archive::stamp_of_round(round),
+            "the startup cache seeded the archive"
+        );
     }
 
     /// Follow a change of texture resolution to the cloud variant that goes
@@ -350,6 +415,11 @@ impl CloudUpdater {
         self.image_path = image_path;
         self.meta_path = meta_path;
         self.cached_meta = self.meta_path.as_ref().and_then(|p| load_cache_meta(p));
+        // The archive's index follows the entry in force, so a resolution
+        // switch reads and records the entry that switch lands on.
+        self.archive
+            .set_active(&self.target.cache_key, self.source.settled_round());
+        self.seed_from_cache();
         self.post_cached();
         true
     }
@@ -358,6 +428,12 @@ impl CloudUpdater {
     /// is decoded or anything of it is written.
     pub fn set_gate(&mut self, gate: Arc<AtomicBool>) {
         self.gate = Some(gate);
+    }
+
+    /// The cache entry this updater reads and writes, for a consumer that
+    /// builds updaters per attempt and has to notice an entry switch itself.
+    pub(crate) fn cache_key(&self) -> &str {
+        &self.target.cache_key
     }
 
     /// Whether a map has been posted since construction.
@@ -380,7 +456,7 @@ impl CloudUpdater {
                         path = %path.display(),
                         "loaded cached cloud image"
                     );
-                    self.post(img);
+                    self.post(img, self.source.settled_round());
                     true
                 }
                 Err(e) => {
@@ -391,6 +467,109 @@ impl CloudUpdater {
             Err(e) => {
                 warn!(error = %e, "could not read cached cloud image");
                 false
+            }
+        }
+    }
+
+    /// Serve one historical round from the archive, decode it, and post it.
+    ///
+    /// `false` is "the archive does not answer for this round": no rendered
+    /// map, and no raw imagery this source can re-derive. The caller falls
+    /// back to an upstream fetch.
+    pub fn serve_round(&mut self, round: time::OffsetDateTime) -> bool {
+        if let Some(bytes) = self.archive.load_jpeg(&self.target.cache_key, round) {
+            match decode_cloud_jpeg(&bytes) {
+                Ok(img) => {
+                    info!(
+                        round = %super::cloud_archive::stamp_of_round(round),
+                        "the archive serves the round"
+                    );
+                    self.post(img, Some(round));
+                    return true;
+                }
+                Err(e) => warn!(error = %e, "an archived map did not decode"),
+            }
+        }
+        let raws = self.archive.raw_files(&self.target.cache_key, round);
+        if !raws.is_empty()
+            && let Ok(Some(bytes)) = self.source.derive_from_raw(&raws, self.resolution)
+        {
+            match decode_cloud_jpeg(&bytes) {
+                Ok(img) => {
+                    info!(
+                        round = %super::cloud_archive::stamp_of_round(round),
+                        "the archive's raw imagery was re-derived"
+                    );
+                    self.post(img, Some(round));
+                    return true;
+                }
+                Err(e) => warn!(error = %e, "a re-derived map did not decode"),
+            }
+        }
+        false
+    }
+
+    /// Warm the GPU cache with one archived round: serve it when the archive
+    /// holds it, and never touch the network. A miss is silent; the engine
+    /// only asks for rounds it knows the archive holds.
+    pub fn prefetch_round(&mut self, round: time::OffsetDateTime) {
+        self.serve_round(round);
+    }
+
+    /// Put one historical round on screen: the archive first, then the
+    /// upstream when fetching is allowed. A landed round enters the archive
+    /// pinned — the time bar visited it — before its map is posted.
+    pub fn ensure_round(&mut self, round: time::OffsetDateTime) -> EnsureOutcome {
+        if self.serve_round(round) {
+            return EnsureOutcome::Served;
+        }
+        let start = std::time::Instant::now();
+        match self.source.fetch_round_at(round, self.resolution) {
+            Ok(Some(image)) => {
+                info!(
+                    round = image
+                        .round
+                        .map(super::cloud_archive::stamp_of_round)
+                        .unwrap_or_default(),
+                    elapsed_secs = format_args!("{:.1}", start.elapsed().as_secs_f64()),
+                    "the historical round is fetched"
+                );
+                let round = image.round.unwrap_or(round);
+                let (width, height) = self.variant;
+                let identity = format!("{width}x{height}|fetched");
+                let raws: Vec<(&str, &[u8])> = image
+                    .raws
+                    .iter()
+                    .map(|(name, download)| (*name, &**download))
+                    .collect();
+                self.archive.record(
+                    &self.target.cache_key,
+                    round,
+                    &raws,
+                    Some((&image.bytes, &identity, width, height)),
+                    true,
+                );
+                match decode_cloud_jpeg(&image.bytes) {
+                    Ok(img) => {
+                        self.post(img, Some(round));
+                        EnsureOutcome::Served
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "the fetched historical map did not decode");
+                        EnsureOutcome::Failed
+                    }
+                }
+            }
+            Ok(None) => {
+                info!(
+                    round = %super::cloud_archive::stamp_of_round(round),
+                    "the upstream does not hold this round"
+                );
+                EnsureOutcome::Missing
+            }
+            Err(e) => {
+                warn!(error = %e, "the historical fetch failed");
+                EnsureOutcome::Failed
             }
         }
     }
@@ -474,15 +653,37 @@ impl CloudUpdater {
         // and with no cache directory at all this is the only copy there is.
         self.cached_meta = Some(meta);
 
-        self.post(img);
+        // A round the source names enters the archive unpinned — the live
+        // pipeline fetched it as the newest round — and becomes what the
+        // live clock wears. The sweep follows, so the retention window and
+        // the budget hold without another timer.
+        if let Some(round) = fetched.round {
+            let (width, height) = self.variant;
+            let identity = format!("{width}x{height}|live");
+            let raws: Vec<(&str, &[u8])> = fetched
+                .raws
+                .iter()
+                .map(|(name, download)| (*name, &**download))
+                .collect();
+            self.archive.record(
+                &self.target.cache_key,
+                round,
+                &raws,
+                Some((&fetched.bytes, &identity, width, height)),
+                false,
+            );
+            self.archive.set_current(Some(round));
+            self.archive.prune();
+        }
+
+        self.post(img, fetched.round);
         PollOutcome::Updated
     }
 
-    /// Post a map and its clear-sky background, the background first.
-    ///
-    /// Neither carries a generation: the two slots are never purged, so there
-    /// is nothing for a stamp to protect.
-    fn post(&self, img: DecodedImage) {
+    /// Post a map and its clear-sky background, the background first. The
+    /// frame names the round the imagery speaks for, which the renderer's
+    /// gate checks and the round line reads.
+    fn post(&self, img: DecodedImage, round: Option<time::OffsetDateTime>) {
         let start = std::time::Instant::now();
         let background = cloud_haze::background(&img);
         info!(
@@ -498,6 +699,7 @@ impl CloudUpdater {
             map: img,
             background,
             generation: self.generation.load(Ordering::SeqCst),
+            round,
         });
         self.posted.set(true);
         (self.notify)();
@@ -657,6 +859,7 @@ mod tests {
             mailbox.clone(),
             no_notify(),
             test_generation(),
+            CloudArchive::new(None),
             Some(scratch.path().to_path_buf()),
             8192,
         );
@@ -705,6 +908,7 @@ mod tests {
                 mailbox.clone(),
                 no_notify(),
                 test_generation(),
+                CloudArchive::new(None),
                 Some(scratch.path().to_path_buf()),
                 8192,
             )
@@ -971,6 +1175,8 @@ mod tests {
                 bytes: Download::new(bytes),
                 etag: Some(current),
                 last_modified: None,
+                round: None,
+                raws: Vec::new(),
             }))
         }
 
@@ -1024,6 +1230,7 @@ mod tests {
             mailbox.clone(),
             no_notify(),
             test_generation(),
+            CloudArchive::new(None),
             None,
             DEFAULT_TEXTURE_RESOLUTION,
         )
@@ -1137,6 +1344,7 @@ mod tests {
             mailbox,
             notify,
             test_generation(),
+            CloudArchive::new(None),
             None,
             DEFAULT_TEXTURE_RESOLUTION,
         );
@@ -1214,6 +1422,7 @@ mod tests {
             mailbox.clone(),
             no_notify(),
             test_generation(),
+            CloudArchive::new(None),
             Some(dir.to_path_buf()),
             resolution,
         )
@@ -1232,6 +1441,7 @@ mod tests {
             mailbox,
             no_notify(),
             test_generation(),
+            CloudArchive::new(None),
             None,
             8192,
         );

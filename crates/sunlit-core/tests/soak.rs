@@ -160,6 +160,8 @@ impl CloudSource for FixtureCloud {
             bytes: Download::new(self.jpeg.clone()),
             etag: Some(current),
             last_modified: None,
+            round: None,
+            raws: Vec::new(),
         }))
     }
 

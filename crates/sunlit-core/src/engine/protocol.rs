@@ -72,6 +72,10 @@ pub enum EngineCommand {
     ReportTiles {
         reply: Sender<Option<Box<super::TileReport>>>,
     },
+    /// The rounds the cloud cache holds on the GPU.
+    ReportCloudCache {
+        reply: Sender<Vec<Option<time::OffsetDateTime>>>,
+    },
     /// Turn the unattended wallpaper refresh on or off.
     SetAutoRefresh { enabled: bool, interval: Duration },
     /// Replace the cloud source at runtime, resolved the way the startup one
@@ -80,6 +84,11 @@ pub enum EngineCommand {
     /// cloud worker (the layer switched off by the environment) has nothing to
     /// switch and ignores this.
     SetCloudSource(Box<CloudSourceConfig>),
+    /// The time bar's track was just moved: `date` says the date track, so
+    /// the engine warms the days either side instead of the rounds either
+    /// side. A hint only; the instant itself still travels in
+    /// `UpdateParams`.
+    CloudBrowse { date: bool },
     /// Ask the cloud worker for one poll now, ahead of its schedule. A worker
     /// still busy with the previous poll owes one instead.
     RefreshClouds,
@@ -92,6 +101,23 @@ pub enum EngineCommand {
     /// worker is asked, not what any frame draws. A session with no cloud
     /// worker ignores this.
     SetCloudPollInterval(u32),
+    /// Set how many hours of cloud history the per-round archive keeps;
+    /// `None` is unlimited. Not part of `UpdateParams` either: it decides
+    /// what the archive keeps on disk, not what any frame draws. Pruned to
+    /// the new limit at once, and applied at every later record too.
+    SetCloudHistoryLimit(Option<u32>),
+    /// Set what the archive caches per round: the raw imagery always, and
+    /// the rendered map only in the raw-with-derived mode. Applied at every
+    /// later record and serve; already-rendered files are kept on disk
+    /// either way, and prune sweeps them with their round.
+    SetCloudCacheMode(crate::config::CloudCacheMode),
+    /// Set the archive's disk budget in megabytes; `None` is unlimited.
+    /// Pruned oldest-first to the new budget at once.
+    SetCloudArchiveBudget(Option<u32>),
+    /// Set what the layer does when the scene time lands outside the
+    /// archive's span: fetch the covering round from upstream, fetch it only
+    /// on refresh, or wear nothing.
+    SetCloudBackfillPolicy(crate::config::CloudBackfillPolicy),
     /// Replace the mode and the anchor a wallpaper is planned with.
     ///
     /// Not part of `UpdateParams` for the same reason `SetTextureResolution` is
@@ -233,6 +259,13 @@ pub enum EngineEvent {
     /// What the cloud layer is doing right now. Forwarded when it changes,
     /// which for a long native round is the only movement the UI sees.
     CloudStatus(String),
+    /// The cloud imagery's own line: which round the window wears and what
+    /// the layer is doing about it, recomputed by the engine from its
+    /// timeline every tick and forwarded when it changes. An empty text says
+    /// the line has nothing to show — the layer off, or no source — and the
+    /// UI hides the row. Because it is recomputed rather than appended to,
+    /// it cannot fall behind what the engine is actually doing.
+    CloudRound { text: String },
     /// Whether a cloud fetch run is in flight, the queue wait and the retry
     /// backoff included. Forwarded when it changes; the UI's stop shows
     /// against it.

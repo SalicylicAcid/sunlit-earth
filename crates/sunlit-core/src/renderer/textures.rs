@@ -6,6 +6,8 @@ use tracing::{debug, error, info};
 use crate::assets::mailbox::DecodedTextureMessage;
 use crate::assets::texture_loader;
 
+use super::CachedCloudPair;
+
 /// Descriptor for a texture that can be loaded on demand.
 pub(super) struct TextureSlot {
     /// The GPU bind group, populated on first use.
@@ -93,14 +95,13 @@ pub(super) fn process_decoded_textures(res: &mut super::Renderer) -> bool {
     applied_any
 }
 
-/// Take the parked cloud pair, if any, and upload it whole.
+/// Take the parked cloud pair, if any, and upload it into the round cache.
 ///
-/// The map and its clear-sky background land together and the cloud bind
-/// group is rebuilt once, so a new map is never drawn against the previous
-/// background. A pair from a generation that is no longer in force is dropped
-/// with the previous target's image kept, which is what a switch shows while
-/// the new one loads: the old picture, with `clouds_resident` reading false
-/// until the pair of the generation in force has landed.
+/// The map and its clear-sky background land together. A pair for the round
+/// the gate names is bound at once; a pair for a neighbouring round is kept
+/// for the switch this cache exists for. A pair from a target the session
+/// has left is dropped, the previous target's image kept, and any pair the
+/// cache has no room for leaves the least recently used one behind.
 fn process_cloud_frame(res: &mut super::Renderer) -> bool {
     let Some(frame) = res.texture_mailbox.take_cloud_frame() else {
         return false;
@@ -125,19 +126,39 @@ fn process_cloud_frame(res: &mut super::Renderer) -> bool {
         submission_index: None,
         timeout: None,
     });
-    info!(generation = frame.generation, "the cloud pair is uploaded");
+    info!(generation = frame.generation, round = ?frame.round, "the cloud pair is uploaded");
     crate::memory::log_memory_usage("after cloud pair upload");
-    // Replacing the views before the old textures are dropped, not after:
-    // the bind group being rebuilt may still reference them, and wgpu's own
-    // refcount frees them once nothing does. Destroying is for the purge,
-    // which a cloud switch is not.
-    res.cloud_texture_view = Some(map.create_view(&wgpu::TextureViewDescriptor::default()));
-    res.cloud_background_view =
-        Some(background.create_view(&wgpu::TextureViewDescriptor::default()));
-    res.cloud_map_texture = Some(map);
-    res.cloud_background_texture = Some(background);
-    res.rebuild_cloud_group();
-    res.cloud_generation_drawn = frame.generation;
+    let map_view = map.create_view(&wgpu::TextureViewDescriptor::default());
+    let background_view = background.create_view(&wgpu::TextureViewDescriptor::default());
+    res.cloud_cache_clock += 1;
+    let id = res.cloud_cache_clock;
+    // One pair per round per generation: a newer upload replaces the older.
+    if let Some(index) = res
+        .cloud_cache
+        .iter()
+        .position(|pair| pair.round == frame.round && pair.generation == frame.generation)
+    {
+        let old = res.cloud_cache.remove(index).expect("the located pair");
+        if res.cloud_active_id == Some(old.id) {
+            res.cloud_active_id = None;
+        }
+    }
+    res.cloud_cache.push_back(CachedCloudPair {
+        id,
+        round: frame.round,
+        generation: frame.generation,
+        map,
+        background,
+        map_view,
+        background_view,
+        used: id,
+    });
+    // Bind before trimming: with the cache at one round, the newly arrived
+    // pair is the one the gate wants, and trimming first would evict it as
+    // the least recently used non-active entry — the round would then be
+    // served again and again without ever reaching the screen.
+    res.select_cloud_pair();
+    res.trim_cloud_cache();
     res.texture_dirty = true;
     true
 }

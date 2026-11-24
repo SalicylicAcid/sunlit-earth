@@ -395,8 +395,17 @@ pub(super) fn create_renderer(
         cloud_background_view: None,
         cloud_map_texture: None,
         cloud_background_texture: None,
+        cloud_cache: std::collections::VecDeque::new(),
+        cloud_cache_clock: 0,
+        cloud_active_id: None,
+        cloud_cache_cap: 1,
         cloud_generation,
         cloud_generation_drawn: 0,
+        // Nothing, until the engine's first tick names what the session
+        // wears: a frame that lands before that tick is the previous
+        // session's answer, and the strict binding does not wear it.
+        cloud_gate: super::CloudGate::Nothing,
+        cloud_round_drawn: None,
     }
 }
 

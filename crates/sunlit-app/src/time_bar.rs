@@ -791,6 +791,7 @@ fn register_setting(window: &MainWindow, link: &EngineLink) {
         if let Some(win) = weak.upgrade() {
             let at = track_instant(&win, year_track, fraction);
             set_time(&win, &engine, at);
+            engine.send(EngineCommand::CloudBrowse { date: year_track });
         }
     });
 
@@ -813,6 +814,7 @@ fn register_setting(window: &MainWindow, link: &EngineLink) {
         let (hour, _, _) = sliders_of(local_on_screen(&win, OffsetDateTime::now_utc()), offset_at);
         let at = instant_of_sliders(hour, f32::from(date.ordinal()), date.year(), offset_at);
         set_time(&win, &engine, at);
+        engine.send(EngineCommand::CloudBrowse { date: true });
     });
 
     let weak = window.as_weak();
@@ -829,6 +831,7 @@ fn register_setting(window: &MainWindow, link: &EngineLink) {
             display_offset(utc, at)
         });
         set_time(&win, &engine, at);
+        engine.send(EngineCommand::CloudBrowse { date: false });
     });
 }
 

@@ -87,6 +87,16 @@ pub(crate) fn speed_text(bytes_per_second: f64) -> String {
     }
 }
 
+/// A hemisphere's name with its first letter capitalized, so a progress
+/// sentence starts the way a sentence does.
+fn sentence_name(name: &str) -> &str {
+    match name {
+        "west" => "West",
+        "east" => "East",
+        other => other,
+    }
+}
+
 /// One WMS request at most, however slow the service is today.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// TCP/TLS handshake cap, so a dead endpoint is known in seconds.
@@ -567,7 +577,7 @@ impl EumetsatCloudSource {
         let started = Instant::now();
         let deadline = started + ROUND_BUDGET;
 
-        self.set_phase("checking the round list");
+        self.set_phase("Checking the round list.");
         let latest = self.request_latest_round()?;
         if self.cancelled() {
             return Err(Self::stop_error());
@@ -585,7 +595,7 @@ impl EumetsatCloudSource {
                 self.settle(&latest);
                 return Ok(None);
             }
-            self.set_phase("processing locally");
+            self.set_phase("Processing locally.");
             let west = decode_png(&pair.west, px)?;
             let east = decode_png(&pair.east, px)?;
             let bytes =
@@ -595,6 +605,11 @@ impl EumetsatCloudSource {
                 bytes: Download::new(bytes),
                 etag: None,
                 last_modified: None,
+                round: Self::parse_round(&latest),
+                raws: vec![
+                    ("raw_west.png", Download::new(pair.west.clone())),
+                    ("raw_east.png", Download::new(pair.east.clone())),
+                ],
             }));
         }
 
@@ -602,7 +617,7 @@ impl EumetsatCloudSource {
         // deadline: the two requests share nothing but the budget, so a slow
         // west no longer holds the east's start. Only a complete pair goes on
         // to processing, so no half a map is ever stitched to history.
-        self.set_phase("downloading the two hemispheres");
+        self.set_phase("Downloading the two hemispheres.");
         let (west, east) = std::thread::scope(|scope| {
             let west = scope.spawn(|| {
                 self.fetch_hemisphere(HEMISPHERES[0].0, 0, HEMISPHERES[0].1, px, deadline)
@@ -623,7 +638,7 @@ impl EumetsatCloudSource {
         if self.cancelled() {
             return Err(Self::stop_error());
         }
-        self.set_phase("processing the round");
+        self.set_phase("Processing the round.");
         let west_sha = sha256_hex(&west_body);
         let east_sha = sha256_hex(&east_body);
         self.store_raw_pair(px, &west_body, &east_body, &latest)?;
@@ -642,7 +657,17 @@ impl EumetsatCloudSource {
             bytes: Download::new(bytes),
             etag: None,
             last_modified: None,
+            round: Self::parse_round(&latest),
+            raws: vec![
+                ("raw_west.png", Download::new(west_body)),
+                ("raw_east.png", Download::new(east_body)),
+            ],
         }))
+    }
+
+    /// One round's RFC 3339 instant, as the raw manifests name rounds.
+    fn parse_round(stamp: &str) -> Option<time::OffsetDateTime> {
+        time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339).ok()
     }
 
     pub fn new(settings: EumetsatSettings, cache_dir: Option<std::path::PathBuf>) -> Self {
@@ -825,7 +850,7 @@ impl EumetsatCloudSource {
                                     let done = done.fetch_add(1, Ordering::SeqCst) + 1;
                                     self.set_progress(
                                         index,
-                                        &format!("{name}: {done}/{total} tiles"),
+                                        &format!("{}: {done}/{total} tiles.", sentence_name(name)),
                                     );
                                 }
                                 Err(FetchError::Permanent(message)) => {
@@ -870,7 +895,7 @@ impl EumetsatCloudSource {
             let shortfall = total - done.load(Ordering::SeqCst) - failed.len();
             if shortfall > 0 {
                 return Err(format!(
-                    "EUMETSAT {name} hemisphere: the round budget is spent with                      {shortfall}/{total} tiles unfetched"
+                    "EUMETSAT {name} hemisphere: the round budget is spent with {shortfall}/{total} tiles unfetched"
                 ));
             }
             if pass == 2 {
@@ -984,6 +1009,7 @@ impl EumetsatCloudSource {
         px: u32,
         max_body: u64,
     ) -> Result<(Vec<u8>, GrayMap), FetchError> {
+        let label = sentence_name(name);
         let mut response = self
             .agent
             .get(url)
@@ -1075,14 +1101,14 @@ impl EumetsatCloudSource {
                         )]
                         let total = total as usize;
                         format!(
-                            "{name}: {} of {} ({}) — {:.0}%",
+                            "{label}: {} of {} ({}), {:.0}%.",
                             mib(body.len()),
                             mib(total),
                             speed_text(speed),
                             percent
                         )
                     }
-                    None => format!("{name}: {} ({})", mib(body.len()), speed_text(speed)),
+                    None => format!("{label}: {} ({}).", mib(body.len()), speed_text(speed)),
                 };
                 self.set_progress(index, &line);
             }
@@ -1100,22 +1126,6 @@ impl CloudSource for EumetsatCloudSource {
         })
     }
 
-    fn settled_note(&self) -> Option<String> {
-        self.round
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .map(|round| {
-                format!(
-                    "round {} UTC",
-                    round
-                        .format(time::macros::format_description!(
-                            "[year]-[month]-[day] [hour]:[minute]"
-                        ))
-                        .expect("round format")
-                )
-            })
-    }
-
     fn wait(&self) -> Duration {
         CloudWait::LongFetch.duration()
     }
@@ -1131,9 +1141,9 @@ impl CloudSource for EumetsatCloudSource {
         if parts.is_empty() {
             (!phase.is_empty()).then(|| phase.clone())
         } else if phase.is_empty() {
-            Some(parts.join(" · "))
+            Some(parts.join(" "))
         } else {
-            Some(format!("{phase} — {}", parts.join(" · ")))
+            Some(format!("{phase} {}", parts.join(" ")))
         }
     }
 
@@ -1156,6 +1166,57 @@ impl CloudSource for EumetsatCloudSource {
         // ready, stopped and retrying are.
         self.set_phase("");
         outcome
+    }
+
+    fn settled_round(&self) -> Option<time::OffsetDateTime> {
+        // The raw manifests are named per hemisphere size, and this runs
+        // before a prepare has fixed one: whichever pair is stored names the
+        // round the last session's live pipeline held.
+        let dir = self.cache_dir.as_ref()?;
+        let entries = std::fs::read_dir(dir).ok()?;
+        let meta = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("eumetsat_raw_") && name.ends_with("_meta.toml"))?;
+        let manifest: RawManifest = toml::from_str(&String::from_utf8_lossy(
+            &std::fs::read(dir.join(meta)).ok()?,
+        ))
+        .ok()?;
+        Self::parse_round(&manifest.round)
+    }
+
+    /// One historical round: the tiles are requested with the round's time
+    /// and processed without touching the live pipeline's cache entry.
+    fn fetch_round_at(
+        &self,
+        round: time::OffsetDateTime,
+        _resolution: u32,
+    ) -> Result<Option<CloudImage>, String> {
+        let outcome = self.fetch_round_named(round);
+        self.set_phase("");
+        outcome
+    }
+
+    fn derive_from_raw(
+        &self,
+        raws: &[std::path::PathBuf],
+        _resolution: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        // The archive files a round's pair in west, east order — the order
+        // the fetch recorded them in.
+        let px = self.px();
+        let mut maps: Vec<GrayMap> = Vec::new();
+        for path in raws {
+            let body =
+                std::fs::read(path).map_err(|e| format!("the archived raw read failed: {e}"))?;
+            maps.push(decode_png(&body, px)?);
+        }
+        if maps.len() < 2 {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        let bytes = self.process_map_only(px, &maps[0], &maps[1], started);
+        Ok(Some(bytes))
     }
 
     fn describe(&self) -> String {
@@ -1283,15 +1344,7 @@ impl EumetsatCloudSource {
         east_sha: &str,
         started: Instant,
     ) -> Result<Vec<u8>, String> {
-        let stitched = stitch(west, east);
-        let map = process_map(&stitched, &self.settings);
-        drop(stitched);
-        let bytes = encode_jpeg(&map);
-        info!(
-            bytes = bytes.len(),
-            elapsed = ?started.elapsed(),
-            "the EUMETSAT round is generated"
-        );
+        let bytes = self.process_map_only(px, west, east, started);
         if let Some(dir) = &self.cache_dir {
             let (width, height) = (2 * px, px);
             let meta = DerivedMeta {
@@ -1324,6 +1377,79 @@ impl EumetsatCloudSource {
             }
         }
         Ok(bytes)
+    }
+
+    /// Process one round's two hemisphere maps into the JPEG bytes, without
+    /// touching the live pipeline's cache entry. The historical fetch runs
+    /// through here; the live pipeline wraps it with the store.
+    fn process_map_only(
+        &self,
+        px: u32,
+        west: &GrayMap,
+        east: &GrayMap,
+        started: Instant,
+    ) -> Vec<u8> {
+        let stitched = stitch(west, east);
+        let map = process_map(&stitched, &self.settings);
+        drop(stitched);
+        let bytes = encode_jpeg(&map);
+        info!(
+            bytes = bytes.len(),
+            elapsed = ?started.elapsed(),
+            px,
+            "the EUMETSAT round is generated"
+        );
+        bytes
+    }
+
+    /// One historical round, as [`CloudSource::fetch_round_at`] runs it: the
+    /// tile requests name the round's time, and the processing never touches
+    /// the live pipeline's cache entry.
+    fn fetch_round_named(&self, round: time::OffsetDateTime) -> Result<Option<CloudImage>, String> {
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        let px = self.px();
+        let started = Instant::now();
+        let deadline = started + ROUND_BUDGET;
+        let stamp = round
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("the round did not format: {e}"))?;
+        self.set_phase("Downloading the two hemispheres.");
+        *self
+            .request_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stamp);
+        // Both hemispheres of one round, fetched in parallel over the one
+        // deadline, exactly as the live round's are.
+        let (west, east) = std::thread::scope(|scope| {
+            let west = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[0].0, 0, HEMISPHERES[0].1, px, deadline)
+            });
+            let east = scope.spawn(|| {
+                self.fetch_hemisphere(HEMISPHERES[1].0, 1, HEMISPHERES[1].1, px, deadline)
+            });
+            (west.join(), east.join())
+        });
+        let west = west.map_err(|_| "the west hemisphere's fetch panicked".to_owned())?;
+        let east = east.map_err(|_| "the east hemisphere's fetch panicked".to_owned())?;
+        let (west_body, west) = west?;
+        let (east_body, east) = east?;
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        self.set_phase("Processing the round.");
+        let bytes = self.process_map_only(px, &west, &east, started);
+        Ok(Some(CloudImage {
+            bytes: Download::new(bytes),
+            etag: None,
+            last_modified: None,
+            round: Some(round),
+            raws: vec![
+                ("raw_west.png", Download::new(west_body)),
+                ("raw_east.png", Download::new(east_body)),
+            ],
+        }))
     }
 }
 
@@ -1525,10 +1651,6 @@ mod tests {
         assert_eq!(
             source.publication().unwrap().latest,
             Some(time::macros::datetime!(2026-11-18 06:00 UTC))
-        );
-        assert_eq!(
-            source.settled_note().as_deref(),
-            Some("round 2026-11-18 06:00 UTC")
         );
         assert_eq!(source.status(), None);
     }
@@ -2261,7 +2383,7 @@ mod tests {
         assert_eq!(
             retuned.prepare(2048).cache_key,
             narrow.cache_key,
-            "the parameters are out of the key: one derived file per size,              rewritten by a tuning change"
+            "the parameters are out of the key: one derived file per size, rewritten by a tuning change"
         );
         assert!(
             source
@@ -2709,25 +2831,25 @@ mod tests {
     fn the_status_composes_the_phase_and_the_download_lines() {
         let source = EumetsatCloudSource::new(EumetsatSettings::default(), None);
         assert_eq!(source.status(), None, "an idle source says nothing");
-        source.set_phase("downloading the two hemispheres");
+        source.set_phase("Downloading the two hemispheres.");
         assert_eq!(
             source.status().as_deref(),
-            Some("downloading the two hemispheres")
+            Some("Downloading the two hemispheres.")
         );
-        source.set_progress(0, "west: 1.2 of 2.8 MiB (450 KiB/s) — 43%");
+        source.set_progress(0, "West: 1.2 of 2.8 MiB (450 KiB/s), 43%.");
         assert_eq!(
             source.status().as_deref(),
-            Some("downloading the two hemispheres — west: 1.2 of 2.8 MiB (450 KiB/s) — 43%")
+            Some("Downloading the two hemispheres. West: 1.2 of 2.8 MiB (450 KiB/s), 43%.")
         );
-        source.set_progress(1, "east: 0.3 of 2.8 MiB (120 KiB/s) — 11%");
+        source.set_progress(1, "East: 0.3 of 2.8 MiB (120 KiB/s), 11%.");
         let status = source.status().expect("both lines are up");
-        assert!(status.contains("west: 1.2"), "{status}");
-        assert!(status.contains("east: 0.3"), "{status}");
+        assert!(status.contains("West: 1.2"), "{status}");
+        assert!(status.contains("East: 0.3"), "{status}");
         // A phase change ends the download lines with it.
-        source.set_phase("processing locally");
+        source.set_phase("Processing locally.");
         assert_eq!(
             source.status().as_deref(),
-            Some("processing locally"),
+            Some("Processing locally."),
             "stale download lines must not survive into the next phase"
         );
     }

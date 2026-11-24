@@ -108,6 +108,8 @@ impl sunlit_core::assets::cloud_source::CloudSource for VariantCloud {
             bytes: sunlit_core::assets::cloud_source::Download::new(buf.into_inner()),
             etag: Some(etag),
             last_modified: None,
+            round: None,
+            raws: Vec::new(),
         }))
     }
 

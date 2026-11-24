@@ -352,12 +352,12 @@ fn the_lit_fraction_tracks_the_ephemeris_at_three_phases() {
         let fraction = lit as f32 / (std::f32::consts::PI * disc.radius * disc.radius);
         let expected = illuminated_fraction(doy, hour);
         println!(
-            "day {doy} hour {hour}: disk radius {:.1} px, {lit} lit pixels,              fraction {fraction:.4} against the ephemeris {expected:.4}",
+            "day {doy} hour {hour}: disk radius {:.1} px, {lit} lit pixels, fraction {fraction:.4} against the ephemeris {expected:.4}",
             disc.radius
         );
         assert!(
             (fraction - expected).abs() < 0.04,
-            "day {doy} hour {hour}: the drawn fraction {fraction:.4} is not the              ephemeris {expected:.4}"
+            "day {doy} hour {hour}: the drawn fraction {fraction:.4} is not the ephemeris {expected:.4}"
         );
     }
 }
@@ -398,7 +398,7 @@ fn the_lit_limb_faces_the_sun() {
     let toward_centroid = (centroid - disc.center).normalize_or_zero();
     let separation = toward_centroid.angle_to(toward_light).abs().to_degrees();
     println!(
-        "the lit centroid is {:.1} px from the disk's center, {separation:.1} degrees off          the direction of the Sun",
+        "the lit centroid is {:.1} px from the disk's center, {separation:.1} degrees off the direction of the Sun",
         centroid.distance(disc.center)
     );
     assert!(

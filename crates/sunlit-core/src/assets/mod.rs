@@ -1,6 +1,7 @@
 //! Asset sources: texture files, cloud imagery, and the mailbox that carries
 //! decoded frames from background threads to the consumer.
 
+pub mod cloud_archive;
 pub mod cloud_fetcher;
 pub mod cloud_haze;
 pub mod cloud_source;

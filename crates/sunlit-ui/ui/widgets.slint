@@ -650,10 +650,11 @@ export component SettingHeading inherits Rectangle {
 
 // A titled group of settings, and the reset for everything in it.
 //
-// This is the fluent GroupBox's layout, 16px above the title, 8px under it and
-// 8px under the content, the title semi-bold at the default size and the
-// content with no horizontal padding, with a reset slot beside the title, so
-// the group's reset lines up with its rows'.
+// A compact GroupBox: no padding above the title (the panel's own spacing
+// separates the groups), 8px under it and 8px under the content, the title
+// semi-bold at the default size and the content with no horizontal padding,
+// with a reset slot beside the title, so the group's reset lines up with its
+// rows'.
 export component SettingGroup {
     in property <string> title;
     in property <bool> modified;
@@ -664,7 +665,7 @@ export component SettingGroup {
 
     VerticalLayout {
         spacing: 8px;
-        padding-top: 16px;
+        padding-top: 0px;
         padding-bottom: 8px;
 
         HorizontalLayout {

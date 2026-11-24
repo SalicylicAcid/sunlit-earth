@@ -276,6 +276,18 @@ export component MainWindow inherits Window {
     in-out property <CloudSourceSettings> cloud-source-draft;
     in-out property <string> cloud-source-status;
     in-out property <bool> cloud-source-busy;
+    // The cloud imagery's own line: which round the window wears and what
+    // the layer is doing about it. Empty hides the row.
+    in-out property <string> cloud-round-text;
+    // The archive's four settings, as combo indices beside their defaults.
+    in-out property <int> cloud-history-index;
+    in-out property <int> cloud-history-default-index;
+    in-out property <int> cloud-cache-index;
+    in-out property <int> cloud-cache-default-index;
+    in-out property <int> cloud-budget-index;
+    in-out property <int> cloud-budget-default-index;
+    in-out property <int> cloud-backfill-index;
+    in-out property <int> cloud-backfill-default-index;
     in-out property <bool> cloud-source-override;
     // The minutes between checks of the cloud source, and the reset target
     // for them. The source's own gate still decides whether a check
@@ -316,6 +328,10 @@ export component MainWindow inherits Window {
     callback cloud-source-selected();
     callback refresh-clouds();
     callback abort-clouds();
+    callback cloud-history-changed();
+    callback cloud-cache-changed();
+    callback cloud-budget-changed();
+    callback cloud-backfill-changed();
     callback cloud-poll-changed();
     callback msaa-changed();
     callback texture-changed();
@@ -1570,7 +1586,11 @@ export component MainWindow inherits Window {
                             title: "Clouds";
                             modified: root.clouds != root.defaults.clouds
                                 || root.cloud-source != root.cloud-source-defaults
-                                || root.cloud-poll-mins != root.cloud-poll-defaults;
+                                || root.cloud-poll-mins != root.cloud-poll-defaults
+                                || root.cloud-history-index != root.cloud-history-default-index
+                                || root.cloud-cache-index != root.cloud-cache-default-index
+                                || root.cloud-budget-index != root.cloud-budget-default-index
+                                || root.cloud-backfill-index != root.cloud-backfill-default-index;
                             reset => {
                                 root.clouds = root.defaults.clouds;
                                 // Pure assignments first, so the panel restores
@@ -1578,8 +1598,16 @@ export component MainWindow inherits Window {
                                 root.cloud-source = root.cloud-source-defaults;
                                 root.cloud-source-draft = root.cloud-source-defaults;
                                 root.cloud-poll-mins = root.cloud-poll-defaults;
+                                root.cloud-history-index = root.cloud-history-default-index;
+                                root.cloud-cache-index = root.cloud-cache-default-index;
+                                root.cloud-budget-index = root.cloud-budget-default-index;
+                                root.cloud-backfill-index = root.cloud-backfill-default-index;
                                 root.sliders-changed();
                                 root.cloud-poll-changed();
+                                root.cloud-history-changed();
+                                root.cloud-cache-changed();
+                                root.cloud-budget-changed();
+                                root.cloud-backfill-changed();
                                 root.apply-cloud-source(root.cloud-source-defaults);
                             }
                             VerticalLayout {
@@ -1591,6 +1619,7 @@ export component MainWindow inherits Window {
                                     checked <=> root.clouds.enabled;
                                     toggled => { root.sliders-changed(); }
                                 }
+
 
                                 // The source rows are settings of the layer,
                                 // so the master switch owns them too: off,
@@ -1627,7 +1656,7 @@ export component MainWindow inherits Window {
                                                 root.sliders-changed();
                                             }
                                             Tooltip {
-                                                Hint { text: "Minutes between remote image checks, 5 to 1440, counted from this edit. Scheduled checks require Auto-refresh wallpaper; Refresh now checks immediately. Native sources follow their upstream UTC rounds instead."; }
+                                                Hint { text: "Minutes between remote image checks, 5 to 1440, counted from this edit. Scheduled checks require Auto-refresh wallpaper; Fetch checks immediately. Native sources follow their upstream UTC rounds instead."; }
                                             }
                                         }
 
@@ -1635,13 +1664,6 @@ export component MainWindow inherits Window {
                                             text: "min";
                                             vertical-alignment: center;
                                         }
-                                    }
-
-                                    if !root.auto-refresh-enabled : cloud-checks-paused-note := Text {
-                                        text: "Scheduled checks are paused while Auto-refresh wallpaper is off; Refresh now still checks.";
-                                        wrap: word-wrap;
-                                        font-size: 11px;
-                                        color: Palette.foreground.with-alpha(0.7);
                                     }
 
                                     cloud-source-combo := SettingCombo {
@@ -1657,18 +1679,33 @@ export component MainWindow inherits Window {
                                         selected => { root.cloud-source-selected(); }
                                     }
 
-                                    // The schedule note sits under the row it
-                                    // explains: each native source states its
-                                    // own cadence, the one 5-minute case, and
-                                    // that imagery moves only with a new round.
-                                    if root.cloud-source-draft.mode != 2 && !root.cloud-source-override : cloud-publication-note := Text {
-                                        text: root.cloud-source-draft.mode == 0
-                                            ? "Checks upstream once per 3-hour UTC round (00:00, 03:00, 06:00, ...). If that round has not published yet, it re-checks every 5 minutes until it appears. Imagery is downloaded only for a new round."
-                                            : "Checks upstream once per hourly UTC round. If that round has not published yet, it re-checks every 5 minutes until it appears. Imagery is downloaded only for a new round.";
-                                        wrap: word-wrap;
-                                        font-size: 11px;
-                                        color: Palette.foreground.with-alpha(0.7);
-                                    }
+                                }
+
+                                // One schedule note, outside the source block's
+                                // `if`: a wrapped Text inside it reports one
+                                // line of height. It always has an answer, so
+                                // it never leaves an empty row.
+                                cloud-schedule-note := Text {
+                                    text: root.clouds.enabled
+                                        ? (root.cloud-source-override
+                                            ? "SUNLIT_EARTH_CLOUD_URL overrides the source; edits here are disabled and the environment value is not saved."
+                                            : !root.auto-refresh-enabled
+                                                ? "Scheduled checks are paused while Auto-refresh wallpaper is off; Fetch still checks."
+                                                : root.cloud-source-draft.mode == 2
+                                                    ? "Checks every " + root.cloud-poll-mins + " minutes while Auto-refresh is on; only a new image downloads."
+                                                    : root.cloud-source-draft.mode == 0
+                                                        ? "Checks upstream once per 3-hour UTC round. If it has not published, it re-checks every 5 minutes until it appears; only a new round downloads."
+                                                        : "Checks upstream once per hourly UTC round. If it has not published, it re-checks every 5 minutes until it appears; only a new round downloads.")
+                                        : "";
+                                    wrap: word-wrap;
+                                    min-width: 0;
+                                    font-size: 11px;
+                                    color: Palette.foreground.with-alpha(0.7);
+                                }
+
+                                if root.clouds.enabled :
+                                VerticalLayout {
+                                    spacing: 4px;
 
                                     if root.cloud-source-draft.mode == 2 :
                                     VerticalLayout {
@@ -1809,40 +1846,100 @@ export component MainWindow inherits Window {
                                         }
                                         // The manual side of the same round: ask
                                         // for one now, or stop the one running.
-                                        // The stop exists only while a fetch is
-                                        // in flight, which the engine reports.
+                                        // The label and the action follow the
+                                        // fetch in flight, which the engine reports.
                                         refresh-cloud-button := Button {
-                                            text: "Refresh now";
-                                            clicked => { root.refresh-clouds(); }
+                                            text: root.cloud-source-busy ? "Stop" : "Fetch";
+                                            clicked => {
+                                                if root.cloud-source-busy {
+                                                    root.abort-clouds();
+                                                } else {
+                                                    root.refresh-clouds();
+                                                }
+                                            }
                                             Tooltip {
-                                                Hint { text: "Fetches the current imagery now, ahead of the hourly check. Upstream republishes every 15 minutes, so a fetch that soon after the last one is served from the cache."; }
+                                                Hint {
+                                                    text: root.cloud-source-busy
+                                                        ? "Stops the fetch in flight. Pressing Fetch again, or dragging somewhere else, resumes; the live schedule is untouched."
+                                                        : "Fetches the imagery the time bar points at: live takes the newest round, a fixed time takes the covering round; an archived one is on screen at once. Dragging waits about a second after you stop; this skips the wait.";
+                                                }
                                             }
                                         }
-                                        if root.cloud-source-busy :
-                                        stop-cloud-button := Button {
-                                            text: "Stop";
-                                            clicked => { root.abort-clouds(); }
-                                            Tooltip {
-                                                Hint { text: "Stops the fetch in flight without a retry. The next check is the regular one."; }
-                                            }
+                                    }
+                                }
+
+                                // One status line for the whole section,
+                                // outside the source block's `if`: a wrapped
+                                // Text inside that conditional reports one line
+                                // of height, which used to pull the next group
+                                // over the Clouds group's last row. It wraps at
+                                // the panel's width, so every word shows.
+                                Text {
+                                    text: root.clouds.enabled
+                                        ? (root.cloud-source-status != "" ? root.cloud-source-status : root.cloud-round-text)
+                                        : "";
+                                    wrap: word-wrap;
+                                    min-width: 0;
+                                    font-size: 11px;
+                                    color: Palette.color-scheme == ColorScheme.dark ? #d0d0d0 : #505050;
+                                    Tooltip {
+                                        Hint {
+                                            text: root.clouds.enabled
+                                                ? (root.cloud-source-status != "" ? root.cloud-source-status : root.cloud-round-text)
+                                                : "";
+                                        }
+                                    }
+                                }
+
+                                if root.clouds.enabled :
+                                VerticalLayout {
+                                    spacing: 4px;
+
+                                    SettingCombo {
+                                        label: "Keep history";
+                                        indent: 8px;
+                                        model: ["24 hours", "3 days", "7 days", "30 days", "1 year", "Unlimited"];
+                                        current-index <=> root.cloud-history-index;
+                                        selected => { root.cloud-history-changed(); }
+                                        Tooltip {
+                                            Hint { text: "How long the archive keeps rounds it fetched on its own. Rounds the time bar has visited are pinned and stand outside this window; the size limit takes them last of all."; }
                                         }
                                     }
 
-                                    if root.cloud-source-status != "" :
-                                    Text {
-                                        text: root.cloud-source-status;
-                                        wrap: word-wrap;
-                                        font-size: 11px;
-                                        color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                    SettingCombo {
+                                        label: "Cache imagery";
+                                        indent: 8px;
+                                        model: ["Raw + rendered", "Raw only"];
+                                        current-index <=> root.cloud-cache-index;
+                                        selected => { root.cloud-cache-changed(); }
+                                        Tooltip {
+                                            Hint { text: "Raw only keeps each round's original imagery and re-derives the map on serve; Raw + rendered also keeps the map, so a revisit is instant."; }
+                                        }
                                     }
 
-                                    if root.cloud-source-override :
-                                    Text {
-                                        text: "SUNLIT_EARTH_CLOUD_URL overrides the source; edits here are disabled and the environment value is not saved.";
-                                        wrap: word-wrap;
-                                        font-size: 11px;
-                                        color: Palette.color-scheme == ColorScheme.dark ? #c8c8c8 : #404040;
+                                    SettingCombo {
+                                        label: "Archive size limit";
+                                        indent: 8px;
+                                        model: ["Unlimited", "1 GB", "5 GB", "20 GB", "50 GB"];
+                                        current-index <=> root.cloud-budget-index;
+                                        selected => { root.cloud-budget-changed(); }
+                                        Tooltip {
+                                            Hint { text: "The disk the per-round archive may hold. Swept oldest first, unpinned rounds before pinned ones."; }
+                                        }
                                     }
+
+                                    SettingCombo {
+                                        label: "Missing imagery";
+                                        indent: 8px;
+                                        model: ["Fetch automatically", "Fetch on press", "Show without clouds"];
+                                        current-index <=> root.cloud-backfill-index;
+                                        selected => { root.cloud-backfill-changed(); }
+                                        Tooltip {
+                                            Hint { text: "What the layer does where no archived round covers the time bar: fetch the covering round about a second after you stop, fetch it only on Fetch, or never fetch."; }
+                                        }
+                                    }
+
+
                                 }
 
                                 if root.clouds.enabled :
@@ -2031,15 +2128,6 @@ export component MainWindow inherits Window {
                             }
                             VerticalLayout {
                                 spacing: 4px;
-
-                                SettingHeading {
-                                    text: "Sky";
-                                    modified: root.celestial.sky != root.defaults.celestial.sky;
-                                    reset => {
-                                        root.celestial.sky = root.defaults.celestial.sky;
-                                        root.sliders-changed();
-                                    }
-                                }
 
                                 sky-fov-slider := SettingRow {
                                     label: "Field of view";

@@ -1686,7 +1686,7 @@ fn the_panoramas_reconstruction_inverts_the_projection_it_sits_under() {
                     }
                     assert!(
                         apart < TOLERANCE,
-                        "at {sky_fov} degrees of sky, pan {offset:?}, viewport {viewport:?}:                          {sent:?} came back as {back:?}, {apart} away"
+                        "at {sky_fov} degrees of sky, pan {offset:?}, viewport {viewport:?}: {sent:?} came back as {back:?}, {apart} away"
                     );
                 }
                 println!(

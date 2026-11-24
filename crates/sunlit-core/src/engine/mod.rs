@@ -7,6 +7,7 @@
 //! half-suspend the machinery.
 
 pub mod clock;
+mod cloud_timeline;
 mod cloud_worker;
 pub mod excursion;
 mod handle;
@@ -18,18 +19,22 @@ mod surface;
 mod tile_loader;
 pub mod wallpaper_sink;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, info, warn};
 
+use crate::assets::cloud_archive::CloudArchive;
 use crate::assets::mailbox::TextureMailbox;
 use crate::assets::tiles::TranscoderConfig;
+use crate::config::CloudBackfillPolicy;
 use crate::config::CloudSourceConfig;
 use crate::config::QualityTier;
 use crate::display::layout::{self, Framing};
 use crate::params::{OutputParams, SceneParams};
+use crate::renderer::CloudGate;
 use crate::renderer::residency::{Output, surfaces_for};
 use crate::renderer::{
     RenderOutcome, Renderer, RendererConfig, SlotLayout, SurfaceFormats, resolve_sample_count,
@@ -37,7 +42,9 @@ use crate::renderer::{
 };
 use crate::scene::sky::{self, SkyState};
 
+use crate::assets::cloud_fetcher::EnsureOutcome;
 use clock::Clock;
+use cloud_timeline::{covering_round, floor_for, round_text};
 use cloud_worker::{CloudWorker, FirstAnswer, spawn_cloud_worker};
 use excursion::{Excursion, ExcursionCommand};
 use handle::AdapterReport;
@@ -113,6 +120,108 @@ pub const TILE_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Public because the integration tests step over it.
 pub const CLOUD_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the scene's landing on one round waits before that round is
+/// fetched: the drag's settle. Every pointer move re-floors the instant, and
+/// a fetch started for each of them would supersede itself forever; one
+/// second of stillness is the difference between dragging and having
+/// stopped.
+const CLOUD_SETTLE: Duration = Duration::from_secs(1);
+
+/// How long a historical fetch that came back empty-handed waits before it
+/// is asked again: a transport-class failure, not an upstream refusal.
+const CLOUD_FETCH_RETRY: Duration = Duration::from_secs(2);
+
+/// How long the engine waits before asking again for a neighbour the GPU
+/// cache did not receive: the worker drops a warm while a real request is
+/// in flight.
+const CLOUD_PREFETCH_RETRY: Duration = Duration::from_secs(2);
+
+/// How long after the last time-bar move the session still counts as
+/// browsing history. Past it the cache falls back to the worn round alone.
+const CLOUD_BROWSE_IDLE: Duration = Duration::from_secs(20);
+
+/// Two moves closer together than this are one drag gesture.
+const CLOUD_BROWSE_RAPID: Duration = Duration::from_millis(350);
+
+/// Moves within [`CLOUD_BROWSE_RAPID`] that make a drag fast: fast drags
+/// warm two rounds either side instead of one.
+const CLOUD_BROWSE_RAPID_MOVES: u32 = 4;
+
+/// Which time-bar track the last browse came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloudBrowseKind {
+    Time,
+    Date,
+}
+
+/// The cache span and neighbour rounds one tick's browse activity calls for.
+struct CloudBrowsePlan {
+    cap: usize,
+    neighbours: Vec<time::OffsetDateTime>,
+    /// The browse window has just run out; the caller clears it.
+    expired: bool,
+}
+
+/// What the session's browse state calls for at `now`: one worn round when
+/// quiet, the rounds either side while the time track is in use (two either
+/// side during a fast drag), or the days either side after a date-track move.
+fn cloud_browse_plan(
+    kind: CloudBrowseKind,
+    moves: u32,
+    last: Option<Duration>,
+    until: Option<Duration>,
+    now: Duration,
+    round: time::OffsetDateTime,
+    interval: Duration,
+) -> CloudBrowsePlan {
+    let Some(until) = until else {
+        return CloudBrowsePlan {
+            cap: 1,
+            neighbours: Vec::new(),
+            expired: false,
+        };
+    };
+    if now >= until {
+        return CloudBrowsePlan {
+            cap: 1,
+            neighbours: Vec::new(),
+            expired: true,
+        };
+    }
+    let rapid = last.is_some_and(|last| now.saturating_sub(last) <= CLOUD_BROWSE_RAPID)
+        && moves >= CLOUD_BROWSE_RAPID_MOVES;
+    match kind {
+        CloudBrowseKind::Date => {
+            let day = time::Duration::hours(24);
+            CloudBrowsePlan {
+                cap: 3,
+                neighbours: vec![round - day, round + day],
+                expired: false,
+            }
+        }
+        CloudBrowseKind::Time if rapid => CloudBrowsePlan {
+            cap: 5,
+            neighbours: vec![
+                round - interval,
+                round + interval,
+                round - interval * 2,
+                round + interval * 2,
+            ],
+            expired: false,
+        },
+        CloudBrowseKind::Time => CloudBrowsePlan {
+            cap: 3,
+            neighbours: vec![round - interval, round + interval],
+            expired: false,
+        },
+    }
+}
+
+/// How long a round the upstream has not published yet waits before it is
+/// asked for again: the publication check's own cadence, so a lagging round
+/// is picked up within minutes of its appearing.
+const CLOUD_PUBLICATION_RETRY: Duration = Duration::from_mins(5);
 
 /// The engine's own state, private to its thread.
 ///
@@ -215,6 +324,45 @@ struct Engine {
     /// Whether a cloud fetch run was in flight at the last tick, so the busy
     /// event goes out on changes only.
     cloud_busy: bool,
+    /// The per-round archive, shared with the worker: the engine reads its
+    /// index for coverage and holds its settings; the worker records into it.
+    cloud_archive: CloudArchive,
+    /// What the layer does outside the archive's span.
+    cloud_backfill: CloudBackfillPolicy,
+    /// The historical fetch in flight: dispatched, no result yet.
+    cloud_fetch_in_flight: Option<time::OffsetDateTime>,
+    /// The neighbour rounds asked of the archive to warm the GPU cache, and
+    /// when each ask went out, so a busy worker's drop is retried without
+    /// flooding it.
+    cloud_prefetch: HashMap<time::OffsetDateTime, Duration>,
+    /// Which track the last time-bar move came from, the moves inside the
+    /// current gesture, when the last one landed, and until when the
+    /// session counts as browsing history.
+    cloud_browse_kind: CloudBrowseKind,
+    cloud_browse_moves: u32,
+    cloud_browse_last: Option<Duration>,
+    cloud_browse_until: Option<Duration>,
+    /// The cache span last handed to the renderer.
+    cloud_cache_cap: usize,
+    /// The floor the scene has rested on and since when, the drag's settle.
+    cloud_settle: Option<(time::OffsetDateTime, Duration)>,
+    /// The rounds the upstream does not hold, learned by asking. Uncovered
+    /// for good; the layer wears nothing for them.
+    cloud_unavailable: Vec<time::OffsetDateTime>,
+    /// The rounds newer than the upstream's publication edge, which have
+    /// not published yet and will: retried on the publication cadence, and
+    /// cleared when the edge moves past them.
+    cloud_not_yet: Vec<time::OffsetDateTime>,
+    /// The round a user stop stood down. Cleared when the scene lands
+    /// elsewhere or an explicit press answers for it.
+    cloud_stopped: Option<time::OffsetDateTime>,
+    /// When a failed historical fetch may be asked again.
+    cloud_retry_at: Option<Duration>,
+    /// Whether the next historical dispatch bypasses the settle and a stop,
+    /// which an explicit press asks for.
+    cloud_fetch_forced: bool,
+    /// The round line last forwarded, so the event goes out on changes only.
+    cloud_round_line_sent: String,
     /// Whether the one debug-level memory dump has already been written. It
     /// goes out the first time the textures are ready, which is the first
     /// moment the numbers describe a loaded scene rather than a half-built one.
@@ -266,6 +414,10 @@ impl Engine {
             clock,
             cloud,
             cloud_poll_interval,
+            cloud_history_hours,
+            cloud_cache_mode,
+            cloud_archive_budget_mb,
+            cloud_backfill,
             cache_dir,
             auto_refresh,
             wallpaper,
@@ -362,13 +514,23 @@ impl Engine {
             },
         );
 
+        // The per-round archive: its settings are in force before the worker
+        // exists, so the seed and the first records land under them, and the
+        // sweep runs once at startup against whatever earlier sessions left.
+        let cloud_archive = CloudArchive::new(cache_dir.as_deref());
+        cloud_archive.set_limit(cloud_history_hours);
+        cloud_archive.set_budget(cloud_archive_budget_mb);
+        cloud_archive.set_keep_derived(cloud_cache_mode != crate::config::CloudCacheMode::RawOnly);
+        cloud_archive.prune();
+
         let cloud = cloud.map(|source| {
             spawn_cloud_worker(
-                source,
-                mailbox,
-                notify,
+                &source,
+                &mailbox,
+                &notify,
                 &cloud_generation,
-                cache_dir,
+                &cloud_archive,
+                cache_dir.as_deref(),
                 cloud_poll_interval,
                 now,
                 texture_resolution,
@@ -417,6 +579,22 @@ impl Engine {
             clouds_settled_for: None,
             cloud_status: None,
             cloud_busy: false,
+            cloud_archive,
+            cloud_backfill,
+            cloud_fetch_in_flight: None,
+            cloud_prefetch: HashMap::new(),
+            cloud_browse_kind: CloudBrowseKind::Time,
+            cloud_browse_moves: 0,
+            cloud_browse_last: None,
+            cloud_browse_until: None,
+            cloud_cache_cap: 1,
+            cloud_settle: None,
+            cloud_unavailable: Vec::new(),
+            cloud_not_yet: Vec::new(),
+            cloud_stopped: None,
+            cloud_retry_at: None,
+            cloud_fetch_forced: false,
+            cloud_round_line_sent: String::new(),
             memory_dumped: false,
             last_status: String::new(),
             drain: Schedule::new(DRAIN_INTERVAL, now),
@@ -481,11 +659,16 @@ impl Engine {
     }
 
     /// Apply one command. Returns `false` when the engine should stop.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per command, each short; the length is the routing table"
+    )]
     fn handle(&mut self, cmd: EngineCommand) -> bool {
         match cmd {
             EngineCommand::UpdateParams(params) => {
                 if params.time != self.params.time {
                     self.set_excursion(None);
+                    self.note_cloud_browse(CloudBrowseKind::Time);
                 }
                 self.params = *params;
                 self.resolve_requested_sample_count();
@@ -547,13 +730,27 @@ impl Engine {
                     .map(|surface| surface.tile_report(&self.renderer));
                 let _ = reply.send(report.map(Box::new));
             }
+            EngineCommand::ReportCloudCache { reply } => {
+                let _ = reply.send(self.renderer.cloud_cached_rounds());
+            }
             EngineCommand::SetAutoRefresh { enabled, interval } => {
                 self.set_auto_refresh(enabled, interval);
             }
             EngineCommand::SetCloudSource(config) => self.set_cloud_source(config.as_ref()),
+            EngineCommand::CloudBrowse { date } => {
+                self.note_cloud_browse(if date {
+                    CloudBrowseKind::Date
+                } else {
+                    CloudBrowseKind::Time
+                });
+            }
             EngineCommand::RefreshClouds => self.refresh_clouds(),
             EngineCommand::AbortClouds => self.abort_clouds(),
             EngineCommand::SetCloudPollInterval(mins) => self.set_cloud_poll_interval(mins),
+            EngineCommand::SetCloudHistoryLimit(hours) => self.set_cloud_history_limit(hours),
+            EngineCommand::SetCloudCacheMode(mode) => self.set_cloud_cache_mode(mode),
+            EngineCommand::SetCloudArchiveBudget(budget) => self.set_cloud_archive_budget(budget),
+            EngineCommand::SetCloudBackfillPolicy(policy) => self.cloud_backfill = policy,
             EngineCommand::DisplaysChanged => {
                 // Trailing rather than leading: every hint pushes the deadline
                 // out, so a burst is one query at the end of it.
@@ -763,35 +960,64 @@ impl Engine {
         );
     }
 
-    /// Replace the cloud source the worker fetches from.
-    ///
-    /// Resolved exactly like the startup one — the environment override
-    /// forces a fixed remote URL, and the saved mode picks the native or the
-    /// remote source otherwise — so a runtime switch and a startup cannot
-    /// disagree about what a configuration means. A session with no cloud
-    /// worker was started with the layer switched off by the environment;
-    /// there is nothing to switch and the apply is refused with a log line
-    /// rather than started.
-    /// One poll now, ahead of the schedule; a busy worker owes one instead,
-    /// and the tick retries it.
+    /// Ask the worker for one poll now, ahead of the schedule — at live
+    /// time. At a fixed instant the press means "fetch the round this
+    /// instant calls for": it bypasses the drag's settle and stands any stop
+    /// down, because the user pressed it just now, on purpose.
     fn refresh_clouds(&mut self) {
+        let live = self.params.time.is_live() && self.excursion.is_none() && self.held.is_none();
+        let interval = self
+            .cloud
+            .as_ref()
+            .and_then(cloud_worker::CloudWorker::publication_interval);
+        let instant = self.preview_instant();
         let Some(cloud) = self.cloud.as_mut() else {
             return;
         };
-        if !cloud.request() {
-            cloud.owed = true;
+        if live {
+            if !cloud.request() {
+                cloud.owed = true;
+            }
+            return;
         }
+        let Some(interval) = interval else {
+            // A source without dated imagery: the poll is the only upstream
+            // action there is, and its map is what every instant wears.
+            if !cloud.request() {
+                cloud.owed = true;
+            }
+            return;
+        };
+        let floor = floor_for(instant, interval);
+        let Some(floor) = floor else {
+            return;
+        };
+        self.cloud_unavailable.retain(|round| *round != floor);
+        self.cloud_stopped = None;
+        self.cloud_settle = None;
+        self.cloud_retry_at = None;
+        self.cloud_fetch_forced = false;
+        info!(round = %round_text(floor), "the historical round is pressed for");
+        cloud.fetch(floor);
+        self.cloud_fetch_in_flight = Some(floor);
     }
 
-    /// Stop the cloud fetch in flight, if there is one, and keep the tick
-    /// from re-asking for it: a stop means "no more work for now", so what
-    /// the schedule was owed is dropped. The next check is the regular one.
+    /// Stop the cloud fetch in flight: the attempt's own stop is raised, so
+    /// its source unwinds at its next check point and commits nothing. What
+    /// was in flight stands down — the scene wears nothing there until a
+    /// drag lands elsewhere or the press answers for it — and the tick stops
+    /// re-asking. The next check of the live schedule is the regular one.
     fn abort_clouds(&mut self) {
         let Some(cloud) = self.cloud.as_mut() else {
             return;
         };
         cloud.abort();
         cloud.owed = false;
+        if let Some(round) = self.cloud_fetch_in_flight.take() {
+            self.cloud_stopped = Some(round);
+        }
+        self.cloud_settle = None;
+        self.cloud_fetch_forced = false;
         info!("the cloud fetch was asked to stop");
     }
 
@@ -807,6 +1033,29 @@ impl Engine {
         info!(mins, "the cloud check interval was set");
     }
 
+    /// Set how many hours of cloud history the archive keeps, and sweep to
+    /// it at once.
+    fn set_cloud_history_limit(&mut self, hours: Option<u32>) {
+        self.cloud_archive.set_limit(hours);
+        self.cloud_archive.prune();
+        info!(?hours, "the cloud history limit was set");
+    }
+
+    /// Set what the archive keeps per round. Already-rendered files stand
+    /// until their round is swept.
+    fn set_cloud_cache_mode(&mut self, mode: crate::config::CloudCacheMode) {
+        self.cloud_archive
+            .set_keep_derived(mode != crate::config::CloudCacheMode::RawOnly);
+        info!(?mode, "the cloud cache mode was set");
+    }
+
+    /// Set the archive's disk budget, and sweep to it at once.
+    fn set_cloud_archive_budget(&mut self, budget: Option<u32>) {
+        self.cloud_archive.set_budget(budget);
+        self.cloud_archive.prune();
+        info!(?budget, "the cloud archive budget was set");
+    }
+
     fn set_cloud_source(&mut self, config: &CloudSourceConfig) {
         let Some(cloud) = self.cloud.as_mut() else {
             info!("a cloud source arrived for a session without one, ignoring it");
@@ -819,11 +1068,28 @@ impl Engine {
         );
         info!(source = %source.describe(), "the cloud source is switching");
         cloud.set_source(source);
+        // The timeline's memory belongs to the source that taught it: what
+        // the old upstream did not hold says nothing about the new one.
+        self.cloud_unavailable.clear();
+        self.cloud_stopped = None;
+        self.cloud_fetch_in_flight = None;
+        self.cloud_settle = None;
+        self.cloud_retry_at = None;
+        self.cloud_prefetch.clear();
         // Worth a poll as soon as the worker can take one, ahead of schedule.
         cloud.owed = true;
+        self.cloud_browse_until = None;
+        if self.cloud_cache_cap != 1 {
+            self.cloud_cache_cap = 1;
+            self.renderer.set_cloud_cache_cap(1);
+        }
     }
 
     /// Run everything the schedule says is due, then render if anything changed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scheduled concern after another in the order they were added; splitting it would scatter the tick's ordering invariants"
+    )]
     fn tick(&mut self) {
         let now = self.clock.elapsed();
 
@@ -883,6 +1149,8 @@ impl Engine {
                 self.emit(EngineEvent::CloudBusy(busy));
             }
         }
+        self.sync_cloud_timeline(now);
+        self.note_cloud_round();
 
         // Live time keeps moving even when nothing else changes, so the
         // terminator and the sky have to be recomputed on a schedule of their
@@ -1109,7 +1377,13 @@ impl Engine {
         } else {
             self.want_tiles(&self.sky_state());
         }
-        let (output, short_edge) = self.preview_output();
+        let (mut output, short_edge) = self.preview_output();
+        // The strict binding's visible half: a fixed instant wears only its
+        // covering round, and nothing at all where no round covers — not a
+        // neighbouring era's imagery standing in.
+        if !self.clouds_visible_at(at) {
+            output.clouds_enabled = false;
+        }
         let outcome = self.renderer.render(&output, &sky);
         self.drawn_instant = at;
         self.drawn_short_edge = short_edge;
@@ -1389,6 +1663,368 @@ impl Engine {
         }
         self.cloud_status = Some(status.clone());
         self.emit(EngineEvent::CloudStatus(status));
+    }
+
+    /// The cloud timeline's one step, on every tick.
+    ///
+    /// Results first: what the last historical attempt landed on clears the
+    /// in-flight mark and teaches the timeline what the upstream holds.
+    /// Then the scene's own answer: live time wears the newest round and
+    /// leaves the worker alone; a fixed instant wears its covering round,
+    /// dispatching the covering round's fetch where there is none — under
+    /// the drag's settle, the policy in force, and any stop the user asked
+    /// for. The renderer's gate follows the same answer, so a frame the
+    /// session is no longer wearing never replaces what the GPU holds.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the results, the live branch and the fixed-instant dispatch read as one sequence of the same state machine"
+    )]
+    fn sync_cloud_timeline(&mut self, now: Duration) {
+        let Some(cloud) = &self.cloud else {
+            return;
+        };
+        if let Some(result) = cloud.take_fetch_result() {
+            if self.cloud_fetch_in_flight == Some(result.round) {
+                self.cloud_fetch_in_flight = None;
+            }
+            match result.outcome {
+                EnsureOutcome::Served => {}
+                EnsureOutcome::Missing => {
+                    // A round newer than the upstream's own publication edge
+                    // is not missing — it has not published yet, and it will:
+                    // the upstream lags wall-clock by hours. It retries on
+                    // the publication cadence instead of standing down for
+                    // good; the line says which.
+                    let not_yet = self
+                        .cloud
+                        .as_ref()
+                        .and_then(CloudWorker::publication_latest)
+                        .is_none_or(|latest| result.round > latest);
+                    if not_yet {
+                        info!(
+                            round = %round_text(result.round),
+                            "the upstream has not published the round yet"
+                        );
+                        self.cloud_not_yet.push(result.round);
+                        self.cloud_retry_at = Some(now + CLOUD_PUBLICATION_RETRY);
+                    } else {
+                        info!(
+                            round = %round_text(result.round),
+                            "the upstream does not hold the round"
+                        );
+                        if !self.cloud_unavailable.contains(&result.round) {
+                            self.cloud_unavailable.push(result.round);
+                        }
+                    }
+                }
+                EnsureOutcome::Failed => {
+                    if result.stopped {
+                        self.cloud_stopped = Some(result.round);
+                    } else {
+                        self.cloud_retry_at = Some(now + CLOUD_FETCH_RETRY);
+                    }
+                }
+            }
+        }
+        let live = self.params.time.is_live() && self.excursion.is_none() && self.held.is_none();
+        if live {
+            self.renderer.set_cloud_gate(CloudGate::Live {
+                drawn: self.renderer.cloud_round_drawn(),
+            });
+            // Live is the current interval: no neighbours are worth keeping.
+            if self.cloud_cache_cap != 1 {
+                self.cloud_cache_cap = 1;
+                self.renderer.set_cloud_cache_cap(1);
+            }
+            return;
+        }
+        if !self.params.clouds_enabled {
+            self.renderer.set_cloud_gate(CloudGate::Nothing);
+            return;
+        }
+        let Some(interval) = cloud.publication_interval() else {
+            // A source without dated imagery: there is no round to bind to,
+            // so its one image wears at every instant as at live time.
+            self.renderer.set_cloud_gate(CloudGate::Live {
+                drawn: self.renderer.cloud_round_drawn(),
+            });
+            return;
+        };
+        let at = self.preview_instant();
+        let rounds = self.cloud_archive.rounds();
+        let covered = covering_round(&rounds, at, interval);
+        if let Some(round) = covered {
+            self.renderer.set_cloud_gate(CloudGate::Round(round));
+            // The covering round is on its way whenever what is drawn is not
+            // it: the archive answers in a fraction of a second, so this
+            // waits for no settle.
+            let drawn = self.renderer.cloud_round_drawn();
+            if drawn != Some(round) && self.cloud_fetch_in_flight != Some(round) {
+                info!(round = %round_text(round), "the covering round is served");
+                cloud.fetch(round);
+                self.cloud_fetch_in_flight = Some(round);
+                self.cloud_settle = None;
+                self.cloud_retry_at = None;
+            }
+            let plan = cloud_browse_plan(
+                self.cloud_browse_kind,
+                self.cloud_browse_moves,
+                self.cloud_browse_last,
+                self.cloud_browse_until,
+                now,
+                round,
+                interval,
+            );
+            if plan.expired {
+                self.cloud_browse_until = None;
+            }
+            if plan.cap != self.cloud_cache_cap {
+                self.cloud_cache_cap = plan.cap;
+                self.renderer.set_cloud_cache_cap(plan.cap);
+            }
+            if !plan.neighbours.is_empty() {
+                Self::prefetch_rounds(
+                    cloud,
+                    &self.cloud_archive,
+                    &self.renderer,
+                    &mut self.cloud_prefetch,
+                    &plan.neighbours,
+                    now,
+                );
+            }
+            return;
+        }
+        self.renderer.set_cloud_gate(CloudGate::Nothing);
+        // Nothing covers the instant: the floor is what would, and fetching
+        // it is the policy's to allow.
+        let Some(floor) = floor_for(at, interval) else {
+            return;
+        };
+        // A stop stands down one round, not the timeline: the scene landing
+        // elsewhere is a new ask.
+        if self.cloud_stopped.is_some_and(|round| round != floor) {
+            self.cloud_stopped = None;
+        }
+        // A round the upstream has since published is fetchable again: the
+        // not-yet mark outlives only the lag, not the session.
+        let published_edge = self
+            .cloud
+            .as_ref()
+            .and_then(CloudWorker::publication_latest);
+        self.cloud_not_yet
+            .retain(|round| published_edge.is_none_or(|latest| *round > latest));
+        let fetchable = match self.cloud_backfill {
+            CloudBackfillPolicy::Never => false,
+            CloudBackfillPolicy::RefreshOnly => self.cloud_fetch_forced,
+            CloudBackfillPolicy::Automatic => true,
+        };
+        // Arm the settle for the floor the scene has landed on, so a fetch
+        // starts once the drag has stopped, not for every move along the
+        // way. A press bypasses the wait; a stop stands the round down.
+        if self
+            .cloud_settle
+            .is_none_or(|(settle_floor, _)| settle_floor != floor)
+        {
+            self.cloud_settle = Some((floor, now));
+        }
+        let now_utc = self.clock.now_utc();
+        let dispatch = fetchable
+            && !self.cloud_unavailable.contains(&floor)
+            && !self.cloud_not_yet.contains(&floor)
+            && self.cloud_stopped != Some(floor)
+            && self.cloud_fetch_in_flight != Some(floor)
+            && self.cloud_retry_at.is_none_or(|due| now >= due)
+            && floor <= now_utc;
+        let settling = !self.cloud_fetch_forced
+            && self.cloud_settle.is_some_and(|(settle_floor, since)| {
+                settle_floor == floor && now.checked_sub(since).unwrap() < CLOUD_SETTLE
+            });
+        if !dispatch || settling {
+            return;
+        }
+        info!(round = %round_text(floor), "the covering round is fetched");
+        cloud.fetch(floor);
+        self.cloud_fetch_in_flight = Some(floor);
+        self.cloud_settle = None;
+        self.cloud_retry_at = None;
+        self.cloud_fetch_forced = false;
+    }
+
+    /// Record one time-bar move, from the UI's own hint or from a changed
+    /// instant in `UpdateParams`, and keep the session in browsing mode for
+    /// a while after it.
+    fn note_cloud_browse(&mut self, kind: CloudBrowseKind) {
+        let now = self.clock.elapsed();
+        let rapid = self
+            .cloud_browse_last
+            .is_some_and(|last| now.saturating_sub(last) <= CLOUD_BROWSE_RAPID);
+        self.cloud_browse_moves = if rapid {
+            self.cloud_browse_moves.saturating_add(1)
+        } else {
+            1
+        };
+        self.cloud_browse_last = Some(now);
+        self.cloud_browse_kind = kind;
+        self.cloud_browse_until = Some(now + CLOUD_BROWSE_IDLE);
+    }
+
+    /// Ask the archive for `neighbours`, so the GPU cache holds them before
+    /// the time bar crosses a boundary. Only rounds already in the archive
+    /// are asked for: a warm never touches the network, and a miss costs a
+    /// retry after [`CLOUD_PREFETCH_RETRY`] at most.
+    fn prefetch_rounds(
+        cloud: &CloudWorker,
+        archive: &CloudArchive,
+        renderer: &crate::renderer::Renderer,
+        asked: &mut HashMap<time::OffsetDateTime, Duration>,
+        neighbours: &[time::OffsetDateTime],
+        now: Duration,
+    ) {
+        let rounds = archive.rounds();
+        for &neighbor in neighbours {
+            if !rounds.contains(&neighbor) {
+                asked.remove(&neighbor);
+                continue;
+            }
+            if renderer.cloud_round_cached(Some(neighbor)) {
+                asked.remove(&neighbor);
+                continue;
+            }
+            if asked
+                .get(&neighbor)
+                .is_some_and(|at| now.saturating_sub(*at) < CLOUD_PREFETCH_RETRY)
+            {
+                continue;
+            }
+            cloud.prefetch(neighbor);
+            asked.insert(neighbor, now);
+        }
+        // A warm the worker never took must not be remembered for the whole
+        // session: after this window it is asked for from scratch.
+        let horizon = CLOUD_PREFETCH_RETRY * 16;
+        asked.retain(|_, at| now.saturating_sub(*at) < horizon);
+    }
+
+    /// Whether the draw at `at` wears clouds: at live time, whatever is
+    /// resident; at a fixed instant, exactly its covering round — and
+    /// nothing where no round covers. This is the strict binding's visible
+    /// half: imagery from another era never stands in for this instant's.
+    fn clouds_visible_at(&self, at: time::OffsetDateTime) -> bool {
+        let live = self.params.time.is_live() && self.excursion.is_none() && self.held.is_none();
+        if live {
+            return true;
+        }
+        let Some(cloud) = &self.cloud else {
+            return true;
+        };
+        let Some(interval) = cloud.publication_interval() else {
+            // No dated imagery: the source's one image wears everywhere.
+            return true;
+        };
+        let rounds = self.cloud_archive.rounds();
+        covering_round(&rounds, at, interval)
+            .is_some_and(|round| self.renderer.cloud_round_drawn() == Some(round))
+    }
+
+    /// The cloud imagery's own line, recomputed from the timeline every tick
+    /// and forwarded when it changes. Recomputed is the point: there is no
+    /// second message stream to fall behind what the engine is doing. The
+    /// worker's actionable note — a download's progress, a failed check —
+    /// follows as its own sentence, so the panel carries ONE cloud line.
+    fn note_cloud_round(&mut self) {
+        let line = self.cloud_round_line();
+        let note = self
+            .cloud
+            .as_ref()
+            .and_then(CloudWorker::note)
+            // A stopped landing has its own line below; the worker's stop
+            // note would only say it a second time.
+            .filter(|_| self.cloud_stopped.is_none());
+        let line = match note {
+            Some(note) if !line.is_empty() => format!("{line} {note}"),
+            _ => line,
+        };
+        if self.cloud_round_line_sent == line {
+            return;
+        }
+        self.cloud_round_line_sent.clone_from(&line);
+        self.emit(EngineEvent::CloudRound { text: line });
+    }
+
+    /// What the round line says now.
+    fn cloud_round_line(&self) -> String {
+        let Some(cloud) = &self.cloud else {
+            return String::new();
+        };
+        if !self.params.clouds_enabled {
+            return String::new();
+        }
+        let live = self.params.time.is_live() && self.excursion.is_none() && self.held.is_none();
+        let rounds = self.cloud_archive.rounds();
+        if live {
+            let round = self
+                .cloud_archive
+                .current()
+                .or_else(|| rounds.last().copied());
+            return round.map_or_else(
+                || "The layer is waiting for its first round.".to_owned(),
+                |round| {
+                    // The live clock wears the newest round the source holds,
+                    // which may be hours behind the clock when the upstream
+                    // stalls. Say the age, so a stale map does not read as a
+                    // current one.
+                    let behind = (self.clock.now_utc() - round).whole_hours();
+                    if behind >= 1 {
+                        format!("Live round is {} UTC, {behind} h old.", round_text(round))
+                    } else {
+                        format!("Live round is {} UTC.", round_text(round))
+                    }
+                },
+            );
+        }
+        let Some(interval) = cloud.publication_interval() else {
+            return "This source carries no dated imagery.".to_owned();
+        };
+        let at = self.preview_instant();
+        if let Some(round) = covering_round(&rounds, at, interval) {
+            return format!("Historical round is {} UTC.", round_text(round));
+        }
+        let Some(floor) = floor_for(at, interval) else {
+            return "This source carries no dated imagery.".to_owned();
+        };
+        if floor > self.clock.now_utc() {
+            return format!("Round {} UTC is not published yet.", round_text(floor));
+        }
+        if self.cloud_fetch_in_flight == Some(floor) {
+            return format!("Fetching round {} UTC.", round_text(floor));
+        }
+        let published_edge = self
+            .cloud
+            .as_ref()
+            .and_then(CloudWorker::publication_latest);
+        if published_edge.is_none_or(|latest| floor > latest) {
+            return format!("Round {} UTC is not published yet.", round_text(floor));
+        }
+        if self.cloud_unavailable.contains(&floor) {
+            return format!("The upstream does not hold {} UTC.", round_text(floor));
+        }
+        if self.cloud_stopped == Some(floor) {
+            return "The fetch was stopped. Drag again or press Fetch.".to_owned();
+        }
+        if self.cloud_retry_at.is_some() {
+            return format!("Round {} UTC failed to fetch; retrying.", round_text(floor));
+        }
+        match self.cloud_backfill {
+            CloudBackfillPolicy::Never => {
+                format!("Fetching is off for round {} UTC.", round_text(floor))
+            }
+            CloudBackfillPolicy::RefreshOnly => {
+                format!("Press Fetch for round {} UTC.", round_text(floor))
+            }
+            CloudBackfillPolicy::Automatic => {
+                format!("Fetching round {} UTC.", round_text(floor))
+            }
+        }
     }
 
     fn emit(&self, event: EngineEvent) {
@@ -1697,5 +2333,103 @@ mod tests {
             "an excursion counts as a fixed time"
         );
         assert_eq!(sky_interval(&live, false, 0.0, true), SKY_INTERVAL);
+    }
+
+    /// A quiet bar keeps the worn round alone; a move wakes the neighbours,
+    /// and the window closing puts the cache back to one.
+    #[test]
+    fn a_quiet_time_bar_keeps_only_the_worn_round() {
+        let round = time::OffsetDateTime::UNIX_EPOCH;
+        let interval = Duration::from_hours(1);
+        let quiet = cloud_browse_plan(
+            CloudBrowseKind::Time,
+            0,
+            None,
+            None,
+            Duration::ZERO,
+            round,
+            interval,
+        );
+        assert_eq!(quiet.cap, 1);
+        assert!(quiet.neighbours.is_empty());
+
+        let moved = cloud_browse_plan(
+            CloudBrowseKind::Time,
+            1,
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(20)),
+            Duration::from_secs(1),
+            round,
+            interval,
+        );
+        assert_eq!(moved.cap, 3);
+        assert_eq!(
+            moved.neighbours,
+            vec![
+                round - time::Duration::hours(1),
+                round + time::Duration::hours(1)
+            ]
+        );
+
+        let expired = cloud_browse_plan(
+            CloudBrowseKind::Time,
+            1,
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(20)),
+            Duration::from_secs(21),
+            round,
+            interval,
+        );
+        assert!(expired.expired);
+        assert_eq!(expired.cap, 1);
+        assert!(expired.neighbours.is_empty());
+    }
+
+    /// A fast time drag widens the span to two rounds either side.
+    #[test]
+    fn a_fast_time_drag_warms_two_rounds_either_side() {
+        let round = time::OffsetDateTime::UNIX_EPOCH;
+        let plan = cloud_browse_plan(
+            CloudBrowseKind::Time,
+            CLOUD_BROWSE_RAPID_MOVES,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_secs(20)),
+            Duration::from_millis(200),
+            round,
+            Duration::from_hours(1),
+        );
+        assert_eq!(plan.cap, 5);
+        assert_eq!(
+            plan.neighbours,
+            vec![
+                round - time::Duration::hours(1),
+                round + time::Duration::hours(1),
+                round - time::Duration::hours(2),
+                round + time::Duration::hours(2)
+            ]
+        );
+    }
+
+    /// A date drag warms the day either side, not the rounds either side.
+    #[test]
+    fn a_date_drag_warms_the_days_either_side() {
+        let round = time::OffsetDateTime::UNIX_EPOCH;
+        let plan = cloud_browse_plan(
+            CloudBrowseKind::Date,
+            1,
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(20)),
+            Duration::from_secs(1),
+            round,
+            Duration::from_hours(1),
+        );
+        assert_eq!(plan.cap, 3);
+        assert_eq!(
+            plan.neighbours,
+            vec![
+                round - time::Duration::hours(24),
+                round + time::Duration::hours(24)
+            ]
+        );
     }
 }

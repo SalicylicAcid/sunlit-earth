@@ -102,6 +102,14 @@ const REST_SLICE: Duration = Duration::from_millis(100);
 /// metadata. Bump when the math changes, so stale derivations are
 /// recomputed rather than served.
 const ALGORITHM_VERSION: u32 = 3;
+/// The round-list range a historical fetch asks for: about 416 days of
+/// hourly entries, the widest window the service answers.
+const HISTORY_HOURS_RANGE: u32 = 10000;
+/// How long a held wide list is trusted before a miss refreshes it. The
+/// upstream publishes with a lag of hours, and a list taken at session
+/// start misses every hour that publishes after it — exactly the recent
+/// rounds a user drags to.
+const LIST_STALE_REFRESH: Duration = Duration::from_secs(120);
 
 /// The `GetMap` request for one round, at the fixed raw size. The service's
 /// own parameter spelling is lowercase, and the bbox is longitude,latitude
@@ -181,6 +189,68 @@ fn parse_latest(body: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "the round list holds no usable rounds".to_owned())
 }
 
+/// Every usable round a round-list body names, as instants, sorted.
+///
+/// The same flat scan [`parse_latest`] runs, collecting instead of reducing.
+/// An entry with its fields in the other order, or a value that is not the
+/// digits the product promises, is skipped rather than guessed at.
+fn parse_all_rounds(body: &[u8]) -> Vec<time::OffsetDateTime> {
+    let body = String::from_utf8_lossy(body);
+    let mut rounds = Vec::new();
+    let mut rest = body.as_ref();
+    while let Some((date, after)) = quoted_value(rest, "dataDate") {
+        let tail = &rest[after..];
+        let time = tail.find("\"dataTime\":\"").and_then(|at| {
+            let (value, _) = quoted_value(&tail[at..], "dataTime")?;
+            (tail.find("\"dataDate\":\"").is_none_or(|next| next > at)).then_some(value)
+        });
+        if let Some(time) = time
+            && usable_round(&date, &time)
+            && let Some(round) = parse_round_instant(&format!("{date}{}", &time[..4]))
+        {
+            rounds.push(round);
+        }
+        rest = tail;
+    }
+    rounds.sort();
+    rounds.dedup();
+    rounds
+}
+
+/// One `YYYYMMDDhhmm` round stamp, as an instant.
+fn parse_round_instant(stamp: &str) -> Option<time::OffsetDateTime> {
+    if stamp.len() != 12 {
+        return None;
+    }
+    let at = |range: std::ops::Range<usize>| stamp.get(range);
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute)) =
+        (at(0..4), at(4..6), at(6..8), at(8..10), at(10..12))
+    else {
+        return None;
+    };
+    time::Date::from_calendar_date(
+        year.parse().ok()?,
+        time::Month::try_from(month.parse::<u8>().ok()?).ok()?,
+        day.parse().ok()?,
+    )
+    .ok()?
+    .with_hms(hour.parse().ok()?, minute.parse().ok()?, 0)
+    .ok()
+    .map(time::PrimitiveDateTime::assume_utc)
+}
+
+/// The `YYYYMMDDhhmm` stamp a compose request names a round by, in UTC —
+/// the zone the upstream names its rounds in, whatever offset the caller's
+/// scene instant carries.
+fn round_stamp(round: time::OffsetDateTime) -> String {
+    let format = time::format_description::parse("[year][month][day][hour][minute]")
+        .expect("the round stamp format parses");
+    round
+        .to_offset(time::OffsetDateTime::UNIX_EPOCH.offset())
+        .format(&format)
+        .expect("the round stamp formats")
+}
+
 /// The stored raw mosaic, its bytes and what its manifest named. The
 /// manifest also records the fetch time, which nothing gates on — the round
 /// comparison is the gate — so it is not carried here.
@@ -246,6 +316,13 @@ pub struct NsmcCloudSource {
     /// the idle status line. Only a round whose map is in hand is written
     /// here, so a failed attempt leaves the previous one in place.
     round: Mutex<Option<String>>,
+    /// The wide round list a historical fetch consults, held for the session.
+    /// `None` is "unknown", which the next fetchable attempt fills; a held
+    /// list is never retired by a miss.
+    known: Mutex<Option<Vec<time::OffsetDateTime>>>,
+    /// When the last wide-list attempt was made, so an unusable answer holds
+    /// the next one off instead of hammering the service.
+    list_fetched_at: Mutex<Option<Instant>>,
     /// The user stop the fetch worker hands over: set while a running round
     /// is wanted gone, checked between rounds, inside every chunk read and
     /// between the derivation's stages. Behind a lock so
@@ -278,6 +355,8 @@ impl NsmcCloudSource {
             phase: Mutex::new(String::new()),
             progress: Mutex::new(None),
             round: Mutex::new(None),
+            known: Mutex::new(None),
+            list_fetched_at: Mutex::new(None),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             agent,
         }
@@ -511,14 +590,14 @@ impl NsmcCloudSource {
                         )]
                         let total = total as usize;
                         format!(
-                            "mosaic: {} of {} ({}) — {:.0}%",
+                            "Mosaic: {} of {} ({}), {:.0}%.",
                             mib(body.len()),
                             mib(total),
                             speed_text(speed),
                             percent
                         )
                     }
-                    None => format!("mosaic: {} ({})", mib(body.len()), speed_text(speed)),
+                    None => format!("Mosaic: {} ({}).", mib(body.len()), speed_text(speed)),
                 };
                 self.set_progress(&line);
             }
@@ -537,7 +616,7 @@ impl NsmcCloudSource {
         let started = Instant::now();
         let deadline = started + ROUND_BUDGET;
         let (width, height) = self.size();
-        self.set_phase("checking the round list");
+        self.set_phase("Checking the round list.");
         let latest = self.with_attempts(deadline, "round list", || {
             self.request_round_list()
                 .and_then(|body| parse_latest(&body).map_err(FetchError::Permanent))
@@ -554,7 +633,7 @@ impl NsmcCloudSource {
                 self.settle(&latest);
                 return Ok(None);
             }
-            self.set_phase("processing locally");
+            self.set_phase("Processing locally.");
             info!(
                 round = %latest,
                 "reprocessing the stored raw mosaic without downloading it again"
@@ -567,9 +646,11 @@ impl NsmcCloudSource {
                 bytes: Download::new(bytes),
                 etag: None,
                 last_modified: None,
+                round: parse_round_instant(&latest),
+                raws: vec![("raw.png", Download::new(raw.bytes.clone()))],
             }));
         }
-        self.set_phase("downloading the mosaic");
+        self.set_phase("Downloading the mosaic.");
         let (body, alpha) =
             self.with_attempts(deadline, "mosaic", || self.request_mosaic(&latest))?;
         info!(elapsed = ?started.elapsed(), round = %latest, "the mosaic arrived");
@@ -578,7 +659,7 @@ impl NsmcCloudSource {
         if self.cancelled() {
             return Err(Self::stop_error());
         }
-        self.set_phase("processing the round");
+        self.set_phase("Processing the round.");
         let sha = sha256_hex(&body);
         self.store_raw(&body, &latest)?;
         // Upstream unchanged and the derivation current: nothing to report,
@@ -598,6 +679,8 @@ impl NsmcCloudSource {
             bytes: Download::new(bytes),
             etag: None,
             last_modified: None,
+            round: parse_round_instant(&latest),
+            raws: vec![("raw.png", Download::new(body))],
         }))
     }
 
@@ -688,13 +771,15 @@ impl NsmcCloudSource {
             && meta.sha256 == sha256
     }
 
-    /// Derive the resized coverage, blur it, fade missing polar edges, and cache the JPEG.
-    fn derive_store_and_encode(
+    /// Derive the resized coverage, blur it, fade missing polar edges, and
+    /// return the JPEG bytes, without touching the live cache. The
+    /// historical fetches and the archive's re-derivations run through here;
+    /// the live pipeline wraps it with the store.
+    fn derive_encode(
         &self,
         alpha: &[u8],
         width: u32,
         height: u32,
-        sha256: &str,
         started: Instant,
     ) -> Result<Vec<u8>, String> {
         if self.cancelled() {
@@ -726,6 +811,21 @@ impl NsmcCloudSource {
             elapsed = ?started.elapsed(),
             "the NSMC round is generated"
         );
+        Ok(bytes)
+    }
+
+    /// Derive one round's map and cache it as the live pipeline's map. Only
+    /// the live poll runs this: a historical round must not overwrite the
+    /// entry the live pipeline's freshness check reads.
+    fn derive_store_and_encode(
+        &self,
+        alpha: &[u8],
+        width: u32,
+        height: u32,
+        sha256: &str,
+        started: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let bytes = self.derive_encode(alpha, width, height, started)?;
         if let Some(dir) = &self.cache_dir {
             let meta = DerivedMeta {
                 version: 1,
@@ -752,6 +852,133 @@ impl NsmcCloudSource {
                 // this round its image.
                 warn!(error = %e, "the derived map could not be cached");
             }
+        }
+        Ok(bytes)
+    }
+
+    /// One historical round, as [`CloudSource::fetch_round_at`] runs it: the
+    /// wide list says whether the hour is held, the compose request renders
+    /// it, and the derivation never touches the live pipeline's cache entry.
+    fn fetch_round_named(&self, round: time::OffsetDateTime) -> Result<Option<CloudImage>, String> {
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        let started = Instant::now();
+        let deadline = started + ROUND_BUDGET;
+        let (width, height) = self.size();
+        let stamp = round_stamp(round);
+        let (listed, _latest) = self.round_is_listed(round, deadline)?;
+        if !listed {
+            info!(round = %Self::round_text(&stamp), "the upstream does not hold this round");
+            return Ok(None);
+        }
+        self.set_phase(&format!(
+            "Downloading the map for {}.",
+            Self::round_text(&stamp)
+        ));
+        let (body, alpha) =
+            self.with_attempts(deadline, "mosaic", || self.request_mosaic(&stamp))?;
+        info!(elapsed = ?started.elapsed(), round = %Self::round_text(&stamp), "the historical mosaic arrived");
+        if self.cancelled() {
+            return Err(Self::stop_error());
+        }
+        self.set_phase("Processing the round.");
+        let bytes = self.derive_encode(&alpha, width, height, started)?;
+        Ok(Some(CloudImage {
+            bytes: Download::new(bytes),
+            etag: None,
+            last_modified: None,
+            round: Some(round),
+            raws: vec![("raw.png", Download::new(body))],
+        }))
+    }
+
+    /// Whether the wide round list names `round`, and the newest hour the
+    /// list holds.
+    ///
+    /// The list is held for the session, but a held list goes stale while
+    /// the session runs: an hour that publishes after it was taken misses
+    /// forever, which reads as "the upstream does not hold it" for exactly
+    /// the recent rounds a user drags to. So a miss against a list older
+    /// than [`LIST_STALE_REFRESH`] refreshes it once — the cooldown still
+    /// bounds the traffic — before the miss is believed. A held list is
+    /// never retired by a miss: one unnamed hour must not turn the hours it
+    /// does name unavailable for the session.
+    fn round_is_listed(
+        &self,
+        round: time::OffsetDateTime,
+        deadline: Instant,
+    ) -> Result<(bool, Option<time::OffsetDateTime>), String> {
+        let held_recently = self
+            .list_fetched_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|at| at.elapsed() < LIST_STALE_REFRESH);
+        if !held_recently {
+            self.set_phase("Checking the round list.");
+            let body =
+                self.with_attempts(deadline, "round list", || self.request_round_list_wide())?;
+            let rounds = parse_all_rounds(&body);
+            if rounds.is_empty() {
+                // An unusable body is not "holds nothing": stamp the attempt
+                // and keep whatever the previous list said.
+                *self
+                    .list_fetched_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+            } else {
+                info!(
+                    list_len = rounds.len(),
+                    "the wide round list is held for the session"
+                );
+                *self.known.lock().unwrap_or_else(PoisonError::into_inner) = Some(rounds);
+                *self
+                    .list_fetched_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+            }
+        }
+        let known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(known) = known.as_ref() else {
+            return Err("NSMC: the round list is unavailable".to_owned());
+        };
+        Ok((known.binary_search(&round).is_ok(), known.last().copied()))
+    }
+
+    /// The wide round list request: about 416 days of hourly entries, a few
+    /// hundred kilobytes, held for the session once it parses.
+    fn request_round_list_wide(&self) -> Result<Vec<u8>, FetchError> {
+        use std::io::Read as _;
+        let url = format!("{TIMES_URL}?dataCode={DATA_CODE}&hourRange={HISTORY_HOURS_RANGE}");
+        let mut response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|e| FetchError::Transient(format!("transport: {e}"), None))?;
+        classify_status(response.status().as_u16(), response.headers())?;
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .with_config()
+            .limit(LIST_BODY_BYTES)
+            .reader()
+            .read_to_end(&mut body)
+            .map_err(|e| FetchError::Transient(format!("round list read: {e}"), None))?;
+        Ok(body)
+    }
+
+    /// Re-derive one archived round's map from its raw files, for the
+    /// raw-only cache mode where no rendered map is kept. The derivation
+    /// applies the settings in force now.
+    fn serve_from_raw(&self, raws: &[std::path::PathBuf]) -> Result<Option<Vec<u8>>, String> {
+        let (width, height) = self.size();
+        let started = Instant::now();
+        let mut bytes = None;
+        for path in raws {
+            let body =
+                std::fs::read(path).map_err(|e| format!("the archived raw read failed: {e}"))?;
+            let alpha = decode_alpha(&body)?;
+            bytes = Some(self.derive_encode(&alpha, width, height, started)?);
         }
         Ok(bytes)
     }
@@ -973,19 +1200,8 @@ impl CloudSource for NsmcCloudSource {
             (true, None) => None,
             (true, Some(line)) => Some(line.to_owned()),
             (false, None) => Some(phase.clone()),
-            (false, Some(line)) => Some(format!("{phase} — {line}")),
+            (false, Some(line)) => Some(format!("{phase} {line}")),
         }
-    }
-
-    /// The round last settled on, so the idle line says which hour is drawn.
-    /// Nothing here is cleared on a failure: what the window shows when an
-    /// attempt fails is precisely that older round.
-    fn settled_note(&self) -> Option<String> {
-        self.round
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_deref()
-            .map(|round| format!("round {}", Self::round_text(round)))
     }
 
     fn prepare(&self, resolution: u32) -> CloudTarget {
@@ -1006,6 +1222,33 @@ impl CloudSource for NsmcCloudSource {
         // what ready, stopped and retrying are.
         self.set_phase("");
         outcome
+    }
+
+    fn settled_round(&self) -> Option<time::OffsetDateTime> {
+        self.load_raw()
+            .map(|raw| raw.round)
+            .and_then(|round| parse_round_instant(&round))
+    }
+
+    /// One historical round: the wide round list names what the service
+    /// holds, the compose request renders the named hour, and the derivation
+    /// runs without touching the live pipeline's cache entry.
+    fn fetch_round_at(
+        &self,
+        round: time::OffsetDateTime,
+        _resolution: u32,
+    ) -> Result<Option<CloudImage>, String> {
+        let outcome = self.fetch_round_named(round);
+        self.set_phase("");
+        outcome
+    }
+
+    fn derive_from_raw(
+        &self,
+        raws: &[std::path::PathBuf],
+        _resolution: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.serve_from_raw(raws)
     }
 
     fn describe(&self) -> String {
@@ -1545,8 +1788,6 @@ mod tests {
         for odd in ["", "2026111", "2026-11-16", "20261116050x", "2026111605000"] {
             assert_eq!(NsmcCloudSource::round_text(odd), odd);
         }
-        let source = NsmcCloudSource::new(NsmcSettings::default(), None);
-        assert_eq!(source.settled_note(), None);
     }
 
     #[test]
@@ -1585,23 +1826,23 @@ mod tests {
     fn the_status_composes_the_phase_and_the_progress_line() {
         let source = NsmcCloudSource::new(NsmcSettings::default(), None);
         assert_eq!(source.status(), None);
-        source.set_phase("downloading the mosaic");
-        assert_eq!(source.status().as_deref(), Some("downloading the mosaic"));
-        source.set_progress("mosaic: 1.2 of 5.0 MiB — 24%");
+        source.set_phase("Downloading the mosaic.");
+        assert_eq!(source.status().as_deref(), Some("Downloading the mosaic."));
+        source.set_progress("Mosaic: 1.2 of 5.0 MiB, 24%.");
         assert_eq!(
             source.status().as_deref(),
-            Some("downloading the mosaic — mosaic: 1.2 of 5.0 MiB — 24%")
+            Some("Downloading the mosaic. Mosaic: 1.2 of 5.0 MiB, 24%.")
         );
         // A new phase takes the progress line with it, and an empty phase
         // clears the whole status; a line set while idle stands alone.
-        source.set_phase("checking the round list");
-        assert_eq!(source.status().as_deref(), Some("checking the round list"));
+        source.set_phase("Checking the round list.");
+        assert_eq!(source.status().as_deref(), Some("Checking the round list."));
         source.set_phase("");
         assert_eq!(source.status(), None);
-        source.set_progress("mosaic: 5.0 of 5.0 MiB — 100%");
+        source.set_progress("Mosaic: 5.0 of 5.0 MiB, 100%.");
         assert_eq!(
             source.status().as_deref(),
-            Some("mosaic: 5.0 of 5.0 MiB — 100%")
+            Some("Mosaic: 5.0 of 5.0 MiB, 100%.")
         );
     }
 
@@ -1642,19 +1883,19 @@ mod tests {
         ] {
             assert!(scratch.join(name).exists(), "{name} missing");
         }
-        // The status line can name the hour it is drawing from here on, and a
-        // poll that changes nothing keeps naming it.
+        // The settled round is the hour drawn, and a poll that changes
+        // nothing keeps it.
         assert_eq!(
-            source.settled_note().as_deref(),
-            Some("round 2026-11-14 23:00 UTC")
+            source.round.lock().expect("the settled round").as_deref(),
+            Some("202611142300")
         );
         // The second poll names the same round: one list request, no
         // mosaic, no image.
         assert!(source.fetch_if_changed(None).unwrap().is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 3, "list only");
         assert_eq!(
-            source.settled_note().as_deref(),
-            Some("round 2026-11-14 23:00 UTC")
+            source.round.lock().expect("the settled round").as_deref(),
+            Some("202611142300")
         );
     }
 
@@ -1891,5 +2132,91 @@ mod tests {
             image::load_from_memory(&image.bytes).unwrap().dimensions(),
             (2048, 1024)
         );
+    }
+
+    /// A miss against a stale held list refreshes it once before the miss is
+    /// believed: an hour that publishes after the list was taken is exactly
+    /// the recent round a user drags to, and it must not read as "the
+    /// upstream does not hold it" for the rest of the session.
+    #[test]
+    fn a_miss_against_a_stale_list_refreshes_it_once() {
+        let bodies = Arc::new(Mutex::new(vec![round_list_body()]));
+        let bodies_for_agent = Arc::clone(&bodies);
+        let agent = stub_agent(move |_, _| {
+            let index = bodies_for_agent
+                .lock()
+                .expect("the bodies")
+                .last()
+                .expect("a body")
+                .clone();
+            Ok(list_response(&index))
+        })
+        .0;
+        let source = test_source(NsmcSettings::default(), None, agent);
+        let round = parse_round_instant("202611142300").expect("the fixture round");
+        let deadline = Instant::now() + ROUND_BUDGET;
+
+        // First ask: the wide list is fetched and names the round.
+        let (listed, latest) = source.round_is_listed(round, deadline).expect("listed");
+        assert!(listed, "the held list names the round");
+        assert_eq!(latest, Some(round), "the list's latest is the round itself");
+
+        // The list goes stale and the upstream publishes the next hour.
+        *source.list_fetched_at.lock().expect("the stamp") = Some(
+            Instant::now()
+                .checked_sub(LIST_STALE_REFRESH + Duration::from_secs(1))
+                .expect("the process has run longer than the staleness window"),
+        );
+        bodies
+            .lock()
+            .expect("the bodies")
+            .push(round_list_body_with("202611150000"));
+
+        let next = parse_round_instant("202611150000").expect("the next round");
+        let (listed, latest) = source.round_is_listed(next, deadline).expect("refreshed");
+        assert!(listed, "the refreshed list names the hour that published");
+        assert_eq!(latest, Some(next), "the refreshed list's latest moved up");
+    }
+
+    /// A miss against a FRESH list is believed without a refresh: the
+    /// staleness window's whole point is not hammering the service for
+    /// hours it genuinely does not hold.
+    #[test]
+    fn a_miss_against_a_fresh_list_is_believed_without_a_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_agent = Arc::clone(&calls);
+        let agent = stub_agent(move |_, _| {
+            calls_for_agent.fetch_add(1, Ordering::SeqCst);
+            Ok(list_response(&round_list_body()))
+        })
+        .0;
+        let source = test_source(NsmcSettings::default(), None, agent);
+        let deadline = Instant::now() + ROUND_BUDGET;
+
+        let held = parse_round_instant("202611140700").expect("the held round");
+        let (listed, _) = source.round_is_listed(held, deadline).expect("listed");
+        assert!(listed);
+
+        let missing = parse_round_instant("202611150000").expect("an unheld hour");
+        let (listed, _) = source.round_is_listed(missing, deadline).expect("asked");
+        assert!(!listed, "the fresh list's miss is the answer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no refresh on a fresh miss"
+        );
+    }
+
+    /// The wide-list body with one more entry appended, for the refresh test.
+    fn round_list_body_with(extra: &str) -> String {
+        let (date, time) = extra.split_at(8);
+        format!(
+            r#"{{"returnCode":0,"ds":[
+            {{"dataDate":"20261113","dataTime":"230000","endTime":""}},
+            {{"dataDate":"20261114","dataTime":"070000","endTime":""}},
+            {{"dataDate":"20261114","dataTime":"230000","endTime":""}},
+            {{"dataDate":"{date}","dataTime":"{time}","endTime":""}}
+        ]}}"#
+        )
     }
 }

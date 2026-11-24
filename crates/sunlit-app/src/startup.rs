@@ -137,6 +137,10 @@ pub(crate) fn engine_config(
         clock: Arc::new(SystemClock::new()),
         cloud,
         cloud_poll_interval: cloud_fetcher::poll_interval(config.cloud_poll_mins),
+        cloud_history_hours: config.cloud_history_hours,
+        cloud_cache_mode: config.cloud_cache_mode,
+        cloud_archive_budget_mb: config.cloud_archive_budget_mb,
+        cloud_backfill: config.cloud_backfill,
         cache_dir: cloud_fetcher::cache_dir(),
         auto_refresh: config
             .auto_refresh_enabled

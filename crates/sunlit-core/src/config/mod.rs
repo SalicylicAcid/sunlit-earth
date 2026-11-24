@@ -15,7 +15,8 @@ pub mod clouds;
 mod migrate;
 
 pub use clouds::{
-    CloudCurve, CloudCurves, CloudSourceConfig, CloudSourceMode, EumetsatSettings, NsmcSettings,
+    CloudBackfillPolicy, CloudCacheMode, CloudCurve, CloudCurves, CloudSourceConfig,
+    CloudSourceMode, EumetsatSettings, NsmcSettings,
 };
 mod window_geometry;
 
@@ -282,6 +283,24 @@ pub struct AppConfig {
     /// downloads anything, so a small value here costs small requests, not
     /// imagery downloads.
     pub cloud_poll_mins: u32,
+    /// How many hours of cloud history the per-round archive keeps; `None` is
+    /// unlimited. Rounds the time bar has visited are pinned and stand
+    /// outside the window on purpose.
+    #[serde(default = "default_cloud_history_hours")]
+    pub cloud_history_hours: Option<u32>,
+    /// What the archive keeps per round: the raw imagery always, the rendered
+    /// map beside it in the default mode.
+    #[serde(default)]
+    pub cloud_cache_mode: CloudCacheMode,
+    /// The archive's disk budget in megabytes; `None` is unlimited. Pinned
+    /// rounds are taken last, when nothing else fits.
+    #[serde(default)]
+    pub cloud_archive_budget_mb: Option<u32>,
+    /// What the layer does when the scene time lands outside the archive's
+    /// span: fetch the covering round, fetch it only on an explicit press, or
+    /// wear nothing.
+    #[serde(default)]
+    pub cloud_backfill: CloudBackfillPolicy,
     pub cloud_opacity: f32,
     pub cloud_opacity_night: f32,
     pub cloud_haze_latitude: f32,
@@ -565,6 +584,16 @@ impl AppConfig {
     }
 }
 
+/// The archive's default retention window: a week of history, which an
+/// hourly source holds in about three quarters of a gigabyte.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the serde default's type is the field's: an Option the file may override to None"
+)]
+fn default_cloud_history_hours() -> Option<u32> {
+    Some(168)
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let cam = CameraParams::default();
@@ -595,6 +624,10 @@ impl Default for AppConfig {
             cloud_source: CloudSourceConfig::default(),
             clouds_enabled: true,
             cloud_poll_mins: 60,
+            cloud_history_hours: default_cloud_history_hours(),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             cloud_opacity: 0.85,
             cloud_opacity_night: 0.45,
             cloud_haze_latitude: 55.0,
@@ -1120,6 +1153,10 @@ mod tests {
     )]
     fn serde_round_trip_non_default() {
         let config = AppConfig {
+            cloud_history_hours: Some(168),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             longitude: 42.5,
             latitude: -15.0,
             zoom: 0.8,
@@ -1259,6 +1296,10 @@ mod tests {
         let scratch = ScratchDir::new("config_ocean_colors");
         let path = scratch.join("config.toml");
         let config = AppConfig {
+            cloud_history_hours: Some(168),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             day_ocean_color: Rgb8::new(0x12, 0xab, 0xff),
             night_ocean_color: Rgb8::new(0, 0, 1),
             ..AppConfig::default()
@@ -1403,6 +1444,10 @@ sky_fov = 111.0
             QualityTier::High
         };
         let config = AppConfig {
+            cloud_history_hours: Some(168),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             longitude: 99.0,
             latitude: -45.0,
             zoom: 0.6,
@@ -1584,6 +1629,10 @@ sky_fov = 111.0
     #[test]
     fn serde_window_geometry_round_trip() {
         let config = AppConfig {
+            cloud_history_hours: Some(168),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             window_x: Some(100),
             window_y: Some(200),
             window_width: Some(1920),
@@ -1892,6 +1941,10 @@ sky_fov = 111.0
     #[test]
     fn quality_tier_serializes_lowercase() {
         let config = AppConfig {
+            cloud_history_hours: Some(168),
+            cloud_cache_mode: CloudCacheMode::default(),
+            cloud_archive_budget_mb: None,
+            cloud_backfill: CloudBackfillPolicy::default(),
             quality_tier: QualityTier::Medium,
             ..AppConfig::default()
         };
@@ -1907,6 +1960,10 @@ sky_fov = 111.0
     fn quality_tier_round_trips_for_every_variant() {
         for tier in [QualityTier::Low, QualityTier::Medium, QualityTier::High] {
             let config = AppConfig {
+                cloud_history_hours: Some(168),
+                cloud_cache_mode: CloudCacheMode::default(),
+                cloud_archive_budget_mb: None,
+                cloud_backfill: CloudBackfillPolicy::default(),
                 quality_tier: tier,
                 ..AppConfig::default()
             };

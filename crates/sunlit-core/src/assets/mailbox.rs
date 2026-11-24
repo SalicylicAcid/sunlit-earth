@@ -142,10 +142,13 @@ impl TextureMailbox {
 /// two slot messages cross. The generation is what the consumer checks
 /// against the generation in force: a frame made for a target the session
 /// has already left is dropped with the previous GPU image kept on show.
+/// `round` names the imagery when the source dates it, and is what the
+/// renderer's gate admits by and the engine's round line reads.
 pub struct CloudFrame {
     pub map: texture_loader::DecodedImage,
     pub background: texture_loader::DecodedImage,
     pub generation: u64,
+    pub round: Option<time::OffsetDateTime>,
 }
 
 /// Whether what is already parked is from a newer generation than what is
@@ -308,6 +311,7 @@ mod tests {
             map: image(map_width),
             background: image(map_width / 2),
             generation,
+            round: None,
         }
     }
 

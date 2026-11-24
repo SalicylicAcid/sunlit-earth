@@ -17,10 +17,16 @@ use crate::config::CloudSourceMode;
 use crate::config::clouds::{DEFAULT_REMOTE_URL, ENV_CLOUD_URL, RemoteCloudUrl};
 
 /// One fetched cloud image plus the freshness metadata that came with it.
+///
+/// `round` names the imagery when the source dates it: the live poll's newest
+/// round, or the historical round a `fetch_round_at` was asked for. `raws`
+/// carries the raw files the archive files beside the round.
 pub struct CloudImage {
     pub bytes: Download,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    pub round: Option<time::OffsetDateTime>,
+    pub raws: Vec<(&'static str, Download)>,
 }
 
 /// The downloaded cloud images of this process, as [`downloads`] counts them.
@@ -238,19 +244,44 @@ pub trait CloudSource: Send + Sync {
         None
     }
 
-    /// Which imagery the last settled fetch left on screen, when the source
-    /// names it. Appended to the worker's coarse status, so the idle line says
-    /// what is drawn rather than only that something is: a source that
-    /// publishes one dated round an hour needs it, since a stale map and a
-    /// current one look exactly alike otherwise.
-    fn settled_note(&self) -> Option<String> {
-        None
-    }
-
     /// Fetch the current image if it differs from `known_etag`.
     ///
     /// Returns `Ok(None)` when the source is unchanged.
     fn fetch_if_changed(&self, known_etag: Option<&str>) -> Result<Option<CloudImage>, String>;
+
+    /// Fetch the imagery of one historical round.
+    ///
+    /// `Ok(None)` means the upstream does not hold the round — learned from
+    /// its own round list, where it keeps one — and is permanent. `Err` is a
+    /// transport-class failure the caller may retry. The default refuses,
+    /// which only a source without dated imagery reaches; the engine never
+    /// dispatches a historical fetch to one.
+    fn fetch_round_at(
+        &self,
+        _round: time::OffsetDateTime,
+        _resolution: u32,
+    ) -> Result<Option<CloudImage>, String> {
+        Err("this source does not hold dated imagery".to_owned())
+    }
+
+    /// The round the source's own startup cache holds, when it names one.
+    ///
+    /// The archive seeds from this: the last session's live frame enters the
+    /// index at its own round, not at a file timestamp's.
+    fn settled_round(&self) -> Option<time::OffsetDateTime> {
+        None
+    }
+
+    /// Re-derive one archived round's rendered map from its raw files, for
+    /// the raw-only cache mode where no rendered map is kept. `Ok(None)`
+    /// means this source cannot; the caller falls back to an upstream fetch.
+    fn derive_from_raw(
+        &self,
+        _raws: &[std::path::PathBuf],
+        _resolution: u32,
+    ) -> Result<Option<Vec<u8>>, String> {
+        Err("this source cannot re-derive from archived raw imagery".to_owned())
+    }
 
     /// Hand the source the flag a user stop reads: set while a running fetch
     /// is wanted gone, and the source unwinds to its nearest check point.
@@ -399,6 +430,8 @@ impl HttpCloudSource {
             bytes: Download::new(bytes),
             etag,
             last_modified,
+            round: None,
+            raws: Vec::new(),
         })
     }
 }

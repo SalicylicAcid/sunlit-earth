@@ -25,6 +25,7 @@ pub use surface::surface_sampler_descriptor;
 pub(crate) use sizing::resolve_sample_count;
 pub(crate) use surface::{SurfaceFormats, SurfaceLayer};
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -172,6 +173,18 @@ pub(crate) struct Renderer {
     /// allocation at a known moment rather than whenever the last view drops.
     cloud_map_texture: Option<wgpu::Texture>,
     cloud_background_texture: Option<wgpu::Texture>,
+    /// Decoded round pairs kept on the GPU. A drag across a round boundary
+    /// then draws the next round from here in the next frame instead of
+    /// blanking while it loads from the archive.
+    cloud_cache: VecDeque<CachedCloudPair>,
+    /// Monotone stamp for cache ids and least-recently-used order.
+    cloud_cache_clock: u64,
+    /// The id of the cache entry the active views came from.
+    cloud_active_id: Option<u64>,
+    /// How many round pairs the cache keeps right now, between one and
+    /// [`CLOUD_ROUND_CACHE_MAX`]. The engine lowers it when the time bar
+    /// goes quiet and raises it while a drag is under way.
+    cloud_cache_cap: usize,
     /// The cloud generation in force, shared with the fetch worker, which
     /// bumps it whenever the effective target changes.
     cloud_generation: Arc<std::sync::atomic::AtomicU64>,
@@ -180,7 +193,46 @@ pub(crate) struct Renderer {
     /// the GPU keeps the previous target's image, which `clouds_resident`
     /// reports as not resident for the current target.
     cloud_generation_drawn: u64,
+    /// What a frame must name to be admitted onto the overlay, set by the
+    /// engine's timeline every tick.
+    cloud_gate: CloudGate,
+    /// The round of the pair on the GPU, when the imagery names one.
+    cloud_round_drawn: Option<time::OffsetDateTime>,
 }
+
+/// What the cloud overlay wears, set by the engine's timeline every tick.
+/// `select_cloud_pair` binds the cached pair the gate names, so a round the
+/// GPU already holds is worn without another upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloudGate {
+    /// Live time: the newest imagery. The newest cached pair is drawn.
+    Live { drawn: Option<time::OffsetDateTime> },
+    /// A fixed instant's covering round: that round's pair is drawn when the
+    /// cache holds it; until then the overlay keeps what it had and the
+    /// engine hides it.
+    Round(time::OffsetDateTime),
+    /// A fixed instant with no covering round: the overlay keeps whatever it
+    /// held, and the draw hides it.
+    Nothing,
+}
+
+/// One decoded cloud pair the GPU keeps for instant round switches. The map
+/// and its clear-sky background stay together, as they are drawn.
+struct CachedCloudPair {
+    id: u64,
+    round: Option<time::OffsetDateTime>,
+    generation: u64,
+    map: wgpu::Texture,
+    background: wgpu::Texture,
+    map_view: wgpu::TextureView,
+    background_view: wgpu::TextureView,
+    used: u64,
+}
+
+/// The most decoded rounds the GPU may keep while a drag is under way: the
+/// worn round, two either side. A quiet session keeps one; the engine sets
+/// the span from how the time bar is being used.
+const CLOUD_ROUND_CACHE_MAX: usize = 5;
 
 impl Renderer {
     /// Create the pipeline, the sphere mesh, the grid texture, and the
@@ -303,6 +355,16 @@ impl Renderer {
         }
         if let Some(background) = &self.cloud_background_texture {
             expected.push(held("cloud_background_texture".to_owned(), background));
+        }
+        for pair in &self.cloud_cache {
+            if Some(pair.id) == self.cloud_active_id {
+                continue;
+            }
+            expected.push(held(format!("cloud_cache_{}_map", pair.id), &pair.map));
+            expected.push(held(
+                format!("cloud_cache_{}_background", pair.id),
+                &pair.background,
+            ));
         }
         if let Some(surface) = &self.surface {
             expected.extend(
@@ -688,6 +750,144 @@ impl Renderer {
         self.cloud_texture_view.is_some()
             && self.cloud_background_view.is_some()
             && self.cloud_generation_drawn == self.cloud_generation.load(Ordering::SeqCst)
+    }
+
+    /// Set what a frame must name to be admitted onto the overlay. Called by
+    /// the engine's tick from the timeline's answer.
+    pub(crate) fn set_cloud_gate(&mut self, gate: CloudGate) {
+        self.cloud_gate = gate;
+        self.select_cloud_pair();
+    }
+
+    /// The round of the cloud pair on the GPU, when the imagery names one.
+    pub(crate) fn cloud_round_drawn(&self) -> Option<time::OffsetDateTime> {
+        self.cloud_round_drawn
+    }
+
+    /// The rounds the cloud cache holds for the generation in force.
+    pub(crate) fn cloud_cached_rounds(&self) -> Vec<Option<time::OffsetDateTime>> {
+        let current = self.cloud_generation.load(Ordering::SeqCst);
+        self.cloud_cache
+            .iter()
+            .filter(|pair| pair.generation == current)
+            .map(|pair| pair.round)
+            .collect()
+    }
+
+    /// Whether the round's pair is on the GPU for the generation in force.
+    pub(crate) fn cloud_round_cached(&self, round: Option<time::OffsetDateTime>) -> bool {
+        let current = self.cloud_generation.load(Ordering::SeqCst);
+        self.cloud_cache
+            .iter()
+            .any(|pair| pair.round == round && pair.generation == current)
+    }
+
+    /// Set how many round pairs the cache may keep. Shrinking evicts the
+    /// least recently used pairs at once; the worn pair is never evicted.
+    pub(crate) fn set_cloud_cache_cap(&mut self, cap: usize) {
+        let cap = cap.clamp(1, CLOUD_ROUND_CACHE_MAX);
+        if cap == self.cloud_cache_cap {
+            return;
+        }
+        self.cloud_cache_cap = cap;
+        self.trim_cloud_cache();
+    }
+
+    /// Evict least recently used pairs beyond the cap, never the worn one.
+    fn trim_cloud_cache(&mut self) {
+        while self.cloud_cache.len() > self.cloud_cache_cap {
+            let active = self.cloud_active_id;
+            let Some(index) = self
+                .cloud_cache
+                .iter()
+                .enumerate()
+                .filter(|(_, pair)| Some(pair.id) != active)
+                .min_by_key(|(_, pair)| pair.used)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            let old = self.cloud_cache.remove(index).expect("the located pair");
+            if self.cloud_active_id == Some(old.id) {
+                self.cloud_active_id = None;
+            }
+        }
+    }
+
+    /// Bind the pair the gate names, when the cache holds it, so a round
+    /// already on the GPU draws without another upload. The engine reads
+    /// `cloud_round_drawn` before drawing: a covered round that is cached
+    /// reads as worn at once, which is what makes the cross-boundary switch
+    /// seamless.
+    fn select_cloud_pair(&mut self) {
+        let current = self.cloud_generation.load(Ordering::SeqCst);
+        if self
+            .cloud_cache
+            .iter()
+            .any(|pair| pair.generation != current)
+        {
+            self.cloud_cache.retain(|pair| pair.generation == current);
+            if self
+                .cloud_active_id
+                .is_some_and(|id| !self.cloud_cache.iter().any(|pair| pair.id == id))
+            {
+                self.cloud_active_id = None;
+            }
+        }
+        let wanted = match self.cloud_gate {
+            CloudGate::Round(round) => Some(Some(round)),
+            CloudGate::Live { .. } => {
+                if self.cloud_cache.iter().any(|pair| pair.round.is_none()) {
+                    Some(None)
+                } else {
+                    self.cloud_cache
+                        .iter()
+                        .filter_map(|pair| pair.round)
+                        .max()
+                        .map(Some)
+                }
+            }
+            CloudGate::Nothing => None,
+        };
+        let Some(wanted) = wanted else {
+            return;
+        };
+        let Some(index) = self
+            .cloud_cache
+            .iter()
+            .position(|pair| pair.round == wanted && pair.generation == current)
+        else {
+            return;
+        };
+        let (id, id_clash) = {
+            let pair = &mut self.cloud_cache[index];
+            self.cloud_cache_clock += 1;
+            pair.used = self.cloud_cache_clock;
+            (pair.id, self.cloud_active_id == Some(pair.id))
+        };
+        if id_clash {
+            return;
+        }
+        let (map_view, background_view, map, background, round, generation) = {
+            let pair = &self.cloud_cache[index];
+            (
+                pair.map_view.clone(),
+                pair.background_view.clone(),
+                pair.map.clone(),
+                pair.background.clone(),
+                pair.round,
+                pair.generation,
+            )
+        };
+        self.cloud_texture_view = Some(map_view);
+        self.cloud_background_view = Some(background_view);
+        self.cloud_map_texture = Some(map);
+        self.cloud_background_texture = Some(background);
+        self.cloud_active_id = Some(id);
+        self.rebuild_cloud_group();
+        self.cloud_generation_drawn = generation;
+        self.cloud_round_drawn = round;
+        self.texture_dirty = true;
     }
 
     /// A bind group of one flat texture.

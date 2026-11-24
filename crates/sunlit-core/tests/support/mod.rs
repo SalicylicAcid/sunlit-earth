@@ -361,6 +361,8 @@ impl sunlit_core::assets::cloud_source::CloudSource for FixtureClouds {
             bytes: sunlit_core::assets::cloud_source::Download::new(served.bytes.clone()),
             etag: Some(served.etag.clone()),
             last_modified: None,
+            round: None,
+            raws: Vec::new(),
         }))
     }
 
