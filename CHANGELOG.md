@@ -2,18 +2,6 @@
 
 Notable changes to Sunlit Earth, for people who use it. The GitHub release pages list every merged pull request.
 
-## [Unreleased]
-
-- New cloud source: NSMC. The app fetches the National Satellite Meteorological Center's global geostationary infrared mosaic (`GEOS_IRX`, hourly, the interface documented at [www.nsmc.org.cn/nsmc/cn/image/wms.html](http://www.nsmc.org.cn/nsmc/cn/image/wms.html)) and processes it into the cloud layer on this machine, with its own coverage curve. The imagery requires attribution to NSMC (CMA); see the About window.
-- Bugfix: cloud over land was nearly invisible, and the NSMC source drew almost none at all, from two causes. The mosaic's alpha is far darker than the infrared brightness map the layer's floor and gamma were tuned on, so most of the planet fell under the floor; and the land contrast curve squared what the haze removal left, so only the densest tops came through. The source's default curve now maps the mosaic onto the EUMETSAT map's scale, and the land gamma is linear: over one November round the median land pixel of eastern China goes from 0.05 to 0.20 of full white. Config files still holding either old default are migrated.
-- The cloud source's status line names the hour it is drawing, for example `the cloud map is ready — round 2026-11-16 05:00 UTC` (UTC, as the service publishes it), so an hour-old map cannot pass for a current one.
-- The cloud layer's render curve — haze removal, land and ocean floor and gamma — is stored per source, with defaults that suit each: a brightness map needs a floor under its cold-ground veil, and NSMC's alpha needs only a noise gate, so its land floor starts at 5 percent rather than 25. Applying a source switches the curve with it, and switching back finds the tuning again. Config files are migrated.
-- The NSMC source draws the thickest cloud at a settable peak instead of full white, so a typhoon core keeps its shape rather than flattening into a blob; the new "Peak" row sets it, 1 by default, which is no shoulder at all.
-- Bugfix: a saved window geometry larger than its monitor no longer reopens the window as a tall narrow strip hanging off the screen. The size is capped to the monitor's work area at startup; the saved position is kept.
-- The tray menu's two refresh entries are now named for what they update: "Update Wallpaper Now" and "Update Clouds Now".
-- The cloud check interval is a setting: the Clouds group's "Check every" field, whole minutes from five to a day around the hourly default, typed or stepped rather than dragged, reaching the running engine without a restart. The source controls show only while Show clouds is on, and the Source list reads EUMETSAT, NSMC, Remote image.
-- Scheduled cloud checks now follow Auto-refresh wallpaper: with the timer off there is no next wallpaper a new map would reach, so the checks pause (the Clouds group says so) and turning the timer on checks at once. The startup check and Refresh now are unaffected.
-
 ## [0.5.0] - 2026-10-25
 
 - Camera and time controls directly in the scene preview. It's now easier to discover how camera controls work and all keyboard shortcuts are documented. Time controls allow you to control time. Try it, it's fun! ([#82](https://github.com/sunlit-earth/sunlit-earth/pull/82))
