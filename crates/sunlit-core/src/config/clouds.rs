@@ -121,6 +121,16 @@ impl CloudCurve {
     }
 }
 
+/// The native source's infrared brightness to coverage curve.
+///
+/// The defaults are fitted to the remote map the app shipped with before
+/// 0.6.0, which is the same EUMETSAT layer through Matteason's own levels:
+/// over the 03:00 UTC round of 2026-11-26, that image's median brightness
+/// against the IR layer is 25 at 65 of 255, 135 at 85, 209 at 105 and 237 at
+/// 125, and `74 / 140 / 0.31` follows it at a correlation of 0.963, against
+/// 0.66 for the raw layer. The old `60 / 180 / 0.8` left the derived map at
+/// half the reference's brightness, which the layer drew as haze rather than
+/// cloud. `docs/usage.md` has the comparison.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EumetsatSettings {
@@ -133,9 +143,9 @@ pub struct EumetsatSettings {
 impl Default for EumetsatSettings {
     fn default() -> Self {
         Self {
-            floor: 60,
-            ceiling: 180,
-            gamma: 0.8,
+            floor: 74,
+            ceiling: 140,
+            gamma: 0.31,
             blur: 0.0,
         }
     }
@@ -148,18 +158,27 @@ impl Default for EumetsatSettings {
 /// *brightness* map, where clear tropical ocean reads near zero and clear
 /// mid-latitude land around 0.8, so a land pixel under 0.25 of full scale is
 /// discarded outright (`docs/rendering.md`, the haze removal). The mosaic's
-/// alpha is an overlay opacity instead, and a low one: over one round, 39% of
-/// its pixels are exactly zero, the median is 10 of 255 and the ninetieth
-/// percentile 97. Passed through unchanged, nearly four fifths of the globe
+/// alpha is an overlay opacity instead, and a low one: over one round, 41% of
+/// its pixels are exactly zero, the median is 8 of 255 and the ninetieth
+/// percentile 96. Passed through unchanged, nearly four fifths of the globe
 /// sits under that floor and no cloud is drawn at all, which is what the
 /// source shipped with and what the sliders are for.
 ///
-/// The defaults below map the alpha's usable range onto the whole scale:
-/// `ceiling` 165 is where the mosaic's deep convection begins to saturate, and
-/// `gamma` 0.30 lifts the thin end clear of the floor. Measured against a
-/// round of the same hour, the resulting map's percentiles are 110, 217 and
-/// 255 at the 50th, 90th and 99th, against the EUMETSAT map's 121, 217 and
-/// 255, so the two sources render at comparable weight.
+/// The defaults target the *rendered* density of the remote map, because the
+/// two sources' derived maps are different quantities: matching their
+/// percentiles, as the first calibration did, no longer matches what the
+/// shader draws once the brightness source's curve became the steep one the
+/// remote image carries. Against the 06:00 UTC round of 2026-11-26, `floor` 2,
+/// `ceiling` 185 and `gamma` 0.30 give 0, 0.25, 0.55 and 0.76 at the 25th,
+/// 50th, 75th and 90th percentiles, with a mean of 0.299 over the observed
+/// band, against the remote image's 0, 0.21, 0.60, 0.75 and 0.298, and a
+/// cloud-covered share of 59% against 60%. The
+/// floor is a noise gate for the mosaic's faintest alpha rather than a veil
+/// remover, the ceiling compresses a top that otherwise saturates, and the
+/// gamma lifts the thin end clear of the shader's floor. The two images are
+/// three hours apart, so the match is a tone match, not a pixel one; the same
+/// hour's EUMETSAT render has a mean of 0.327, which is the spread this
+/// comparison carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NsmcSettings {
@@ -179,8 +198,8 @@ pub struct NsmcSettings {
 impl Default for NsmcSettings {
     fn default() -> Self {
         Self {
-            floor: 0,
-            ceiling: 165,
+            floor: 2,
+            ceiling: 185,
             gamma: 0.3,
             blur: 0.0,
             cap: 1.0,

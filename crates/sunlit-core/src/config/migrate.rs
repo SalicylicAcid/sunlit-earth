@@ -13,8 +13,8 @@ use crate::scene::scene_time::{SceneTime, instant_of_override};
 /// One step from the version at its index in [`MIGRATIONS`] to the next.
 type Migration = fn(&mut Table, &mut ChangeLog);
 
-const MIGRATIONS: [Migration; 7] = [
-    v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7,
+const MIGRATIONS: [Migration; 8] = [
+    v0_to_v1, v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8,
 ];
 
 /// The version this build writes, and the one a file reaches after loading.
@@ -280,6 +280,64 @@ fn v6_to_v7(earth: &mut Table, log: &mut ChangeLog) {
     if let Value::Table(curves) = curves {
         log.record("cloud_curves", None, Some(Value::Table(curve.clone())));
         curves.insert(mode, Value::Table(curve));
+    }
+}
+
+/// The source derivation curves version 8 replaced: the key, the value version
+/// 7 shipped and the value this build ships.
+///
+/// EUMETSAT's curve was fitted to the map the app shipped before 0.6.0, which
+/// is the same layer through Matteason's own levels: over the 2026-11-26
+/// 03:00 UTC round, `74 / 140 / 0.31` follows that image's medians at a
+/// correlation of 0.963, where `60 / 180 / 0.8` left the derived map at half
+/// its brightness. NSMC's moves with it because the shader now draws a much
+/// brighter brightness map: the rendered density it was calibrated against
+/// belongs to the old curve, and `2 / 185 / 0.30` puts it back on the remote
+/// image's tone.
+const EUMETSAT_CURVE_V8: [(&str, f64, f64); 3] = [
+    ("floor", 60.0, 74.0),
+    ("ceiling", 180.0, 140.0),
+    ("gamma", 0.8, 0.31),
+];
+const NSMC_CURVE_V8: [(&str, f64, f64); 3] = [
+    ("floor", 0.0, 2.0),
+    ("ceiling", 165.0, 185.0),
+    ("gamma", 0.3, 0.3),
+];
+
+/// Each source's derivation curve moves to the measured one, for a file that
+/// still holds the previous defaults.
+///
+/// The three keys move together or not at all. A file whose `floor`, `ceiling`
+/// or `gamma` has moved keeps all of it: the keys are one curve, and half of
+/// it taken to the new numbers would change a picture its owner chose. A file
+/// with no `cloud_source` table, or no entry for a source, takes the new
+/// defaults through serde and needs no step.
+fn v7_to_v8(earth: &mut Table, log: &mut ChangeLog) {
+    let Some(Value::Table(source)) = earth.get_mut("cloud_source") else {
+        return;
+    };
+    retune_source(source, "eumetsat", &EUMETSAT_CURVE_V8, log);
+    retune_source(source, "nsmc", &NSMC_CURVE_V8, log);
+}
+
+/// Move one source's curve when every one of its keys still holds the value
+/// version 7 shipped.
+fn retune_source(source: &mut Table, name: &str, curve: &[(&str, f64, f64)], log: &mut ChangeLog) {
+    let Some(Value::Table(table)) = source.get_mut(name) else {
+        return;
+    };
+    let untouched = curve.iter().all(|&(key, old, _)| {
+        table
+            .get(key)
+            .and_then(number_of)
+            .is_some_and(|value| (value - old).abs() <= f64::EPSILON)
+    });
+    if !untouched {
+        return;
+    }
+    for &(key, _, new) in curve {
+        set_number(table, key, new, &format!("cloud_source.{name}.{key}"), log);
     }
 }
 
@@ -933,7 +991,17 @@ cloud_haze_band = 25.0"
 
         let (table, _) = nsmc_curve("floor = 0\nceiling = 255\ngamma = 1.0\nblur = 0.0\n");
         let config: CloudSourceConfig = table["cloud_source"].clone().try_into().unwrap();
-        assert_eq!(config.nsmc, NsmcSettings::default());
+        assert_eq!(
+            config.nsmc,
+            NsmcSettings {
+                floor: 0,
+                ceiling: 165,
+                gamma: 0.3,
+                blur: 0.0,
+                cap: 1.0,
+            },
+            "the version 5 curve, not today's default, is what this step writes"
+        );
     }
 
     #[test]
@@ -1051,6 +1119,52 @@ cloud_gamma_ocean = 0.75",
         let mut table = earth("longitude = 42.0");
         assert_eq!(apply(v6_to_v7, &mut table), Vec::<Change>::new());
         assert!(!table.contains_key("cloud_curves"));
+    }
+
+    // --- v7_to_v8 ---
+
+    #[test]
+    fn the_shipped_source_curves_move_to_the_measured_ones() {
+        let mut table = earth(
+            "cloud_source = { eumetsat = { floor = 60, ceiling = 180, gamma = 0.8, blur = 0.0 }, \
+             nsmc = { floor = 0, ceiling = 165, gamma = 0.3, blur = 0.0, cap = 1.0 } }",
+        );
+        apply(v7_to_v8, &mut table);
+        let eumetsat = &table["cloud_source"]["eumetsat"];
+        assert_eq!(eumetsat["floor"], Value::Integer(74));
+        assert_eq!(eumetsat["ceiling"], Value::Integer(140));
+        assert_eq!(eumetsat["gamma"], Value::Float(0.31));
+        assert_eq!(eumetsat["blur"], Value::Float(0.0));
+        let nsmc = &table["cloud_source"]["nsmc"];
+        assert_eq!(nsmc["floor"], Value::Integer(2));
+        assert_eq!(nsmc["ceiling"], Value::Integer(185));
+        assert_eq!(nsmc["gamma"], Value::Float(0.3));
+        assert_eq!(nsmc["cap"], Value::Float(1.0));
+    }
+
+    #[test]
+    fn a_tuned_or_partial_source_curve_keeps_all_of_itself() {
+        for source in [
+            "eumetsat = { floor = 70, ceiling = 180, gamma = 0.8 }",
+            "eumetsat = { floor = 60, ceiling = 200, gamma = 0.8 }",
+            "eumetsat = { floor = 60 }",
+            "nsmc = { floor = 0, ceiling = 165, gamma = 0.35 }",
+        ] {
+            let mut table = earth(&format!("cloud_source = {{ {source} }}"));
+            let before = table.clone();
+            assert_eq!(
+                apply(v7_to_v8, &mut table),
+                Vec::<Change>::new(),
+                "{source}"
+            );
+            assert_eq!(table, before, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_source_table_takes_no_curve_step() {
+        let mut table = earth("longitude = 42.0");
+        assert_eq!(apply(v7_to_v8, &mut table), Vec::<Change>::new());
     }
 
     // --- versions ---

@@ -1810,7 +1810,7 @@ export component MainWindow inherits Window {
 
                                         nsmc-floor-slider := SettingRow {
                                             label: "IR floor";
-                                            hint: "Coverage at or below this counts as clear sky. The mosaic's alpha already is a cloud fraction, so 0 keeps it as served.";
+                                            hint: "Coverage at or below this counts as clear sky. The mosaic's alpha already is a cloud fraction; 0 keeps it as served, and the default's small gate drops only the faintest antialiasing.";
                                             indent: 8px;
                                             minimum: 0;
                                             maximum: 254;

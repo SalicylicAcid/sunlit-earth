@@ -10163,12 +10163,12 @@ fn test_cloud_source_section_pushes_the_saved_config() {
         defaults.remote_url,
         "the URL is the built-in service until it is changed"
     );
-    approx::assert_relative_eq!(applied.floor, 60.0);
-    approx::assert_relative_eq!(applied.ceiling, 180.0);
-    approx::assert_relative_eq!(applied.gamma, 80.0);
+    approx::assert_relative_eq!(applied.floor, 74.0);
+    approx::assert_relative_eq!(applied.ceiling, 140.0);
+    approx::assert_relative_eq!(applied.gamma, 31.0);
     approx::assert_relative_eq!(applied.blur, 0.0);
-    approx::assert_relative_eq!(applied.nsmc_floor, 0.0);
-    approx::assert_relative_eq!(applied.nsmc_ceiling, 165.0);
+    approx::assert_relative_eq!(applied.nsmc_floor, 2.0);
+    approx::assert_relative_eq!(applied.nsmc_ceiling, 185.0);
     approx::assert_relative_eq!(applied.nsmc_gamma, 30.0);
     approx::assert_relative_eq!(applied.nsmc_blur, 0.0);
     assert_eq!(
@@ -10232,10 +10232,10 @@ fn test_the_draft_never_reaches_the_applied_or_the_save() {
     draft.floor = 61.0;
     window.set_cloud_source_draft(draft);
     // The applied value is untouched by a draft edit.
-    approx::assert_relative_eq!(window.get_cloud_source().floor, 60.0);
+    approx::assert_relative_eq!(window.get_cloud_source().floor, 74.0);
     let config = ui_callbacks::read_config_from_window(&window, &link);
     assert_eq!(
-        config.cloud_source.eumetsat.floor, 60,
+        config.cloud_source.eumetsat.floor, 74,
         "a save reads the applied value, never the draft"
     );
     assert!(
@@ -10269,7 +10269,7 @@ fn test_an_invalid_draft_is_refused_entirely() {
         window.get_cloud_source_status()
     );
     // The applied value survives a refused apply.
-    approx::assert_relative_eq!(window.get_cloud_source().floor, 60.0);
+    approx::assert_relative_eq!(window.get_cloud_source().floor, 74.0);
     // The draft survives too: refusing is not editing behind the user's back.
     approx::assert_relative_eq!(window.get_cloud_source_draft().floor, 200.0);
 }

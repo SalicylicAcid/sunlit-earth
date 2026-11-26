@@ -598,6 +598,10 @@ fn default_cloud_history_hours() -> Option<u32> {
 }
 
 impl Default for AppConfig {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "every persisted default, one field per line, so a missing one is visible"
+    )]
     fn default() -> Self {
         let cam = CameraParams::default();
         Self {
@@ -928,7 +932,7 @@ mod tests {
             saved["cloud_source"]["remote_url"].as_str(),
             Some("https://clouds.matteason.co.uk/images/{size}/clouds.jpg")
         );
-        assert_eq!(CONFIG_VERSION, 7);
+        assert_eq!(CONFIG_VERSION, 8);
         // The step ran and kept the file's bytes; the section it never had
         // still comes from the source's own defaults.
         assert!(backup_path(&path, CONFIG_VERSION - 1).exists());
