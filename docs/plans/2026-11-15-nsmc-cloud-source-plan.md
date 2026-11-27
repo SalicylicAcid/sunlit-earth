@@ -5,7 +5,7 @@
 
 ## Why
 
-The cloud source evaluation ([2026-03-19-cloud-data-sources.md](2026-03-19-cloud-data-sources.md)) settled on the app's own EUMETSAT pipeline after Matteason stopped publishing (2026-11). A third institutional source was wanted as a hedge and for regional preference. The National Satellite Meteorological Center (NSMC, 国家卫星气象中心) of the China Meteorological Administration publishes a WMS-style imagery interface, officially documented at [www.nsmc.org.cn/nsmc/cn/image/wms.html](http://www.nsmc.org.cn/nsmc/cn/image/wms.html) ("WMS卫星影像接口说明", service name `FYWMS` in the GetCapabilities, `Fees=none`), and hands out its capability document at
+The cloud source evaluation ([2026-03-19-cloud-data-sources.md](2026-03-19-cloud-data-sources.md)) settled on the app's own EUMETSAT pipeline after Matteason stopped publishing (2026-11). A third institutional source was wanted as a hedge and for regional preference. The National Satellite Meteorological Center (NSMC) of the China Meteorological Administration publishes a WMS-style imagery interface, officially documented at [www.nsmc.org.cn/nsmc/cn/image/wms.html](http://www.nsmc.org.cn/nsmc/cn/image/wms.html) ("WMS卫星影像接口说明", service name `FYWMS` in the GetCapabilities, `Fees=none`), and hands out its capability document at
 `https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/ability?request=GetCapabilities`.
 
 ## What was measured, hands-on, 2026-11-15
